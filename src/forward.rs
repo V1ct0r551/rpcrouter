@@ -1,12 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, bail};
-use reqwest::{Client, StatusCode, header::CONTENT_TYPE};
+use anyhow::{Context, Result};
+use reqwest::{Client, header::CONTENT_TYPE};
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout};
 use tracing::debug;
 
-use crate::{config::Config, registry::Registry};
+use crate::{
+    config::Config,
+    registry::Registry,
+    signals::{FailureSignal, FaultKind, ResponseClassification, classify_response},
+};
 
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -14,6 +18,7 @@ pub struct Forwarder {
     registry: Arc<Registry>,
     client: Client,
     request_timeout: Duration,
+    slow_threshold: Duration,
     deadline: Duration,
     max_attempts: usize,
 }
@@ -28,6 +33,7 @@ impl Forwarder {
             registry,
             client,
             request_timeout: Duration::from_millis(config.upstream.request_timeout_ms),
+            slow_threshold: Duration::from_millis(config.upstream.slow_threshold_ms),
             deadline: Duration::from_millis(config.upstream.deadline_ms),
             max_attempts: config.upstream.max_attempts,
         })
@@ -39,7 +45,7 @@ impl Forwarder {
             Ok(body) => body,
             Err(error) => {
                 debug!(chain_id, error = %error, "JSON-RPC request serialization failed");
-                return all_endpoints_exhausted(chain_id, request_id);
+                return self.exhausted(chain_id, request_id);
             }
         };
         let expires_at = Instant::now() + self.deadline;
@@ -57,74 +63,114 @@ impl Forwarder {
                 continue;
             };
             attempts += 1;
+            let started = Instant::now();
             let attempt_timeout = self.request_timeout.min(remaining);
             let result = timeout(
                 attempt_timeout,
-                self.send_attempt(lease.endpoint().url(), &body, &request_id),
+                self.send_attempt(lease.endpoint().url(), &body, &request_id, started),
             )
             .await;
+            let finished = Instant::now();
+            let latency = finished.saturating_duration_since(started);
 
             match result {
-                Ok(Ok(response)) => return response,
-                Ok(Err(error)) => debug!(
-                    chain_id,
-                    endpoint = lease.endpoint().url(),
-                    attempt = attempts,
-                    error = %error,
-                    "upstream attempt failed"
-                ),
-                Err(_) => debug!(
-                    chain_id,
-                    endpoint = lease.endpoint().url(),
-                    attempt = attempts,
-                    "upstream attempt timed out"
-                ),
+                Ok(AttemptResult::Valid(response)) => {
+                    endpoint.record_success(finished, latency, false);
+                    return response;
+                }
+                Ok(AttemptResult::Degraded { response, fault }) => {
+                    endpoint.record_degraded(finished, latency, fault);
+                    return response;
+                }
+                Ok(AttemptResult::Failure(signal)) => {
+                    endpoint.record_failure(finished, signal.clone());
+                    debug!(
+                        chain_id,
+                        endpoint = endpoint.url(),
+                        attempt = attempts,
+                        fault = ?signal.kind,
+                        "upstream attempt failed"
+                    );
+                }
+                Err(_) => {
+                    endpoint.record_failure(finished, FailureSignal::new(FaultKind::Timeout));
+                    debug!(
+                        chain_id,
+                        endpoint = endpoint.url(),
+                        attempt = attempts,
+                        "upstream attempt timed out"
+                    );
+                }
             }
         }
 
-        all_endpoints_exhausted(chain_id, request_id)
+        self.exhausted(chain_id, request_id)
     }
 
-    async fn send_attempt(&self, url: &str, body: &[u8], request_id: &Value) -> Result<Value> {
-        let mut response = self
+    async fn send_attempt(
+        &self,
+        url: &str,
+        body: &[u8],
+        request_id: &Value,
+        started: Instant,
+    ) -> AttemptResult {
+        let mut response = match self
             .client
             .post(url)
             .header(CONTENT_TYPE, "application/json")
             .body(body.to_vec())
             .send()
             .await
-            .context("upstream request failed")?;
-        let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            bail!("upstream returned HTTP {status}");
-        }
-
-        let mut response_body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .context("failed to read upstream response")?
         {
+            Ok(response) => response,
+            Err(_) => {
+                return AttemptResult::Failure(FailureSignal::new(FaultKind::Transport));
+            }
+        };
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut response_body = Vec::new();
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    return AttemptResult::Failure(FailureSignal::new(FaultKind::Transport));
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             if response_body.len().saturating_add(chunk.len()) > MAX_UPSTREAM_RESPONSE_BYTES {
-                bail!("upstream response exceeds size limit");
+                return AttemptResult::Failure(FailureSignal::new(FaultKind::InvalidResponse));
             }
             response_body.extend_from_slice(&chunk);
         }
-        let value: Value =
-            serde_json::from_slice(&response_body).context("upstream returned non-JSON body")?;
-        if !is_single_jsonrpc_response(&value, request_id) {
-            bail!("upstream returned an invalid JSON-RPC response");
+        match classify_response(
+            status,
+            &headers,
+            &response_body,
+            started.elapsed(),
+            request_id,
+            self.slow_threshold,
+        ) {
+            ResponseClassification::Valid(response) => AttemptResult::Valid(response),
+            ResponseClassification::Degraded { response, fault } => {
+                AttemptResult::Degraded { response, fault }
+            }
+            ResponseClassification::Failure(signal) => AttemptResult::Failure(signal),
         }
-        Ok(value)
+    }
+
+    fn exhausted(&self, chain_id: u64, request_id: Value) -> Value {
+        self.registry.record_user_visible_error();
+        all_endpoints_exhausted(chain_id, request_id)
     }
 }
 
-fn is_single_jsonrpc_response(value: &Value, request_id: &Value) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    (object.contains_key("result") || object.contains_key("error"))
-        && object.get("id").is_some_and(|id| id == request_id)
+enum AttemptResult {
+    Valid(Value),
+    Degraded { response: Value, fault: FaultKind },
+    Failure(FailureSignal),
 }
 
 pub fn all_endpoints_exhausted(chain_id: u64, request_id: Value) -> Value {
@@ -136,22 +182,4 @@ pub fn all_endpoints_exhausted(chain_id: u64, request_id: Value) -> Value {
             "message": format!("rpcrouter: all upstream endpoints exhausted for chain {chain_id}")
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_single_response_id() {
-        assert!(is_single_jsonrpc_response(
-            &json!({"jsonrpc":"2.0", "id":7, "result":"0x1"}),
-            &json!(7)
-        ));
-        assert!(!is_single_jsonrpc_response(
-            &json!({"jsonrpc":"2.0", "id":8, "result":"0x1"}),
-            &json!(7)
-        ));
-        assert!(!is_single_jsonrpc_response(&json!([{"id":7}]), &json!(7)));
-    }
 }
