@@ -38,6 +38,18 @@ pub struct Metrics {
     hedge_totals: DashMap<u64, Arc<HedgeTotals>>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChainMetricsSnapshot {
+    pub ingress: u64,
+    pub cache_lookups: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub coalesced: u64,
+    pub upstream: u64,
+    pub user_visible_errors: u64,
+    pub hedges: u64,
+}
+
 #[derive(Default)]
 struct HedgeTotals {
     upstream: AtomicU64,
@@ -298,6 +310,21 @@ impl Metrics {
         self.failover_depth
             .with_label_values(&[&chain_id.to_string()])
             .observe(depth as f64);
+    }
+
+    pub fn chain_snapshot(&self, chain_id: u64) -> ChainMetricsSnapshot {
+        let chain = chain_id.to_string();
+        let hedge_totals = self.hedge_totals(chain_id);
+        ChainMetricsSnapshot {
+            ingress: self.ingress.with_label_values(&[&chain]).get(),
+            cache_lookups: self.cache_lookups.with_label_values(&[&chain]).get(),
+            cache_hits: self.cache_hits.with_label_values(&[&chain]).get(),
+            cache_misses: self.cache_misses.with_label_values(&[&chain]).get(),
+            coalesced: self.coalesced.with_label_values(&[&chain]).get(),
+            upstream: hedge_totals.upstream.load(Ordering::Relaxed),
+            user_visible_errors: self.user_visible_errors.with_label_values(&[&chain]).get(),
+            hedges: hedge_totals.hedges.load(Ordering::Relaxed),
+        }
     }
 
     pub async fn encode(&self, rpc_registry: &Registry) -> prometheus::Result<String> {

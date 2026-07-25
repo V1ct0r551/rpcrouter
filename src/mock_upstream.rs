@@ -2,6 +2,7 @@ use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
 };
+use std::time::Instant;
 
 use axum::{
     Json, Router,
@@ -59,6 +60,37 @@ struct MockInner {
     status_5xx: AtomicU16,
     execution_reverted: AtomicBool,
     requests: AtomicU64,
+    rate_stats: Mutex<RateStats>,
+}
+
+struct RateStats {
+    started: Instant,
+    second: u64,
+    current: u64,
+    maximum: u64,
+}
+
+impl Default for RateStats {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            second: 0,
+            current: 0,
+            maximum: 0,
+        }
+    }
+}
+
+impl RateStats {
+    fn record(&mut self) {
+        let second = self.started.elapsed().as_secs();
+        if second != self.second {
+            self.second = second;
+            self.current = 0;
+        }
+        self.current = self.current.saturating_add(1);
+        self.maximum = self.maximum.max(self.current);
+    }
 }
 
 #[derive(Clone)]
@@ -83,6 +115,7 @@ impl MockController {
                 status_5xx: AtomicU16::new(behavior.status_5xx.unwrap_or(0)),
                 execution_reverted: AtomicBool::new(behavior.execution_reverted),
                 requests: AtomicU64::new(0),
+                rate_stats: Mutex::new(RateStats::default()),
             }),
         }
     }
@@ -93,6 +126,11 @@ impl MockController {
 
     pub fn reset_request_count(&self) {
         self.inner.requests.store(0, Ordering::SeqCst);
+        *lock(&self.inner.rate_stats) = RateStats::default();
+    }
+
+    pub fn max_requests_per_second(&self) -> u64 {
+        lock(&self.inner.rate_stats).maximum
     }
 
     pub fn set_rate_limit_after(&self, after: Option<u64>) {
@@ -148,6 +186,7 @@ pub fn router(controller: MockController) -> Router {
 
 async fn handle_rpc(State(controller): State<MockController>, body: Bytes) -> Response {
     let request_number = controller.inner.requests.fetch_add(1, Ordering::SeqCst) + 1;
+    lock(&controller.inner.rate_stats).record();
     let delay_ms = controller.inner.delay_ms.load(Ordering::SeqCst);
     if delay_ms != 0 {
         sleep(Duration::from_millis(delay_ms)).await;
