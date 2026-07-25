@@ -47,7 +47,7 @@ rpcrouter 是一个 Rust 实现的区块链节点 RPC 路由网关：聚合 [cha
 ## 当前状态
 
 - [x] 仓库治理初始化（本文件、git）
-- [ ] Grok 调研：开源复用评估 / chainlist 数据方案
-- [ ] DESIGN.md / TASKS.md
-- [ ] Codex 分阶段实现
+- [x] Grok 调研：开源复用评估 / chainlist 数据方案（docs/research/）
+- [x] DESIGN.md / TASKS.md
+- [ ] Codex 分阶段实现（Phase 1 → 3，见 docs/TASKS.md）
 - [ ] ETH + Monad 全流程验证、10k QPS 压测
