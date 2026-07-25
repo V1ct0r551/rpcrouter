@@ -1,5 +1,5 @@
 listen = "0.0.0.0:8545"
-metrics_enabled = false
+metrics_enabled = true
 chains = [1, 143]
 
 [server]
@@ -28,6 +28,7 @@ max_block_lag = 5
 
 [cache]
 max_bytes = 536870912
+immutable_ttl_seconds = 3600
 
 [hedging]
 enabled = true

@@ -1,4 +1,6 @@
+pub mod cache;
 pub mod chainlist;
+pub mod classify;
 pub mod config;
 pub mod forward;
 pub mod mock_upstream;

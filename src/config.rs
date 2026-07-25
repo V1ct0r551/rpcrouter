@@ -98,6 +98,9 @@ impl Config {
         if self.probe.max_concurrency == 0 || self.probe.request_timeout_ms == 0 {
             bail!("probe concurrency and timeout must be greater than zero");
         }
+        if self.cache.max_bytes == 0 || self.cache.immutable_ttl_seconds < 60 * 60 {
+            bail!("cache capacity must be nonzero and immutable TTL must be at least one hour");
+        }
         for chain in &self.chain_overrides {
             if !unique_chains.contains(&chain.chain_id) {
                 bail!(
@@ -138,6 +141,28 @@ impl Config {
         self.chain_override(chain_id)
             .and_then(|chain| chain.max_block_lag)
             .unwrap_or(self.probe.max_block_lag)
+    }
+
+    pub fn confirmation_depth(&self, chain_id: u64) -> u64 {
+        self.chain_override(chain_id)
+            .and_then(|chain| chain.confirmation_depth)
+            .unwrap_or(64)
+    }
+
+    pub fn block_time_ms(&self, chain_id: u64) -> u64 {
+        self.chain_override(chain_id)
+            .and_then(|chain| chain.block_time_ms)
+            .unwrap_or(match chain_id {
+                1 => 12_000,
+                143 => 400,
+                _ => 2_000,
+            })
+    }
+
+    pub fn tip_ttl_ms(&self, chain_id: u64) -> u64 {
+        self.chain_override(chain_id)
+            .and_then(|chain| chain.tip_ttl_ms)
+            .unwrap_or_else(|| self.block_time_ms(chain_id).min(2_000))
     }
 }
 
@@ -245,12 +270,14 @@ impl Default for ProbeConfig {
 #[serde(default)]
 pub struct CacheConfig {
     pub max_bytes: u64,
+    pub immutable_ttl_seconds: u64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_bytes: 512 * 1024 * 1024,
+            immutable_ttl_seconds: 60 * 60,
         }
     }
 }
