@@ -210,6 +210,10 @@ impl ResponseCache {
     pub fn weighted_size(&self) -> u64 {
         self.entries.weighted_size()
     }
+
+    pub async fn sync(&self) {
+        self.entries.run_pending_tasks().await;
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

@@ -543,6 +543,15 @@ impl Registry {
         state.endpoints.read().await.clone()
     }
 
+    pub async fn healthy_for_hedging(&self, chain_id: u64, minimum_active: usize) -> bool {
+        let endpoints = self.all_endpoints(chain_id).await;
+        let active = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.is_active())
+            .count();
+        active >= minimum_active && active.saturating_mul(2) >= endpoints.len()
+    }
+
     pub async fn endpoint(&self, chain_id: u64, url: &str) -> Option<Arc<Endpoint>> {
         self.all_endpoints(chain_id)
             .await
@@ -643,6 +652,33 @@ impl Registry {
         summaries
     }
 
+    pub async fn endpoint_metric_snapshots(&self) -> Vec<EndpointMetricSnapshot> {
+        let mut states: Vec<_> = self
+            .chains
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        states.sort_by_key(|state| state.chain_id);
+        let now = Instant::now();
+        let mut snapshots = Vec::new();
+        for state in states {
+            for endpoint in state.endpoints.read().await.iter() {
+                let state_name = match endpoint.state(now) {
+                    EndpointState::Active => "active",
+                    EndpointState::Cooling { .. } => "cooling",
+                    EndpointState::Probation { .. } => "probation",
+                };
+                snapshots.push(EndpointMetricSnapshot {
+                    chain_id: state.chain_id,
+                    url: endpoint.url().to_owned(),
+                    state: state_name,
+                    stats: endpoint.stats(),
+                });
+            }
+        }
+        snapshots
+    }
+
     fn chain(&self, chain_id: u64) -> Option<Arc<ChainState>> {
         self.chains
             .get(&chain_id)
@@ -660,6 +696,14 @@ pub struct ChainSummary {
     pub cooling: usize,
     pub probation: usize,
     pub head: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct EndpointMetricSnapshot {
+    pub chain_id: u64,
+    pub url: String,
+    pub state: &'static str,
+    pub stats: EndpointStatsSnapshot,
 }
 
 pub fn cooldown_for_strikes(strikes: u32) -> Duration {

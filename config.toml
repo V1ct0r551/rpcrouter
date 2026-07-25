@@ -33,6 +33,8 @@ immutable_ttl_seconds = 3600
 [hedging]
 enabled = true
 delay_ms = 300
+max_percent = 10
+min_active_endpoints = 2
 
 [[chain_overrides]]
 chain_id = 1

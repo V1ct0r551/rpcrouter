@@ -1,0 +1,419 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use dashmap::DashMap;
+use prometheus::{
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts,
+    Registry as PrometheusRegistry, TextEncoder,
+};
+
+use crate::registry::{EndpointStatsSnapshot, Registry};
+
+pub struct Metrics {
+    registry: PrometheusRegistry,
+    ingress: IntCounterVec,
+    cache_lookups: IntCounterVec,
+    cache_hits: IntCounterVec,
+    cache_hit_ratio: GaugeVec,
+    cache_misses: IntCounterVec,
+    coalesced: IntCounterVec,
+    coalesce_ratio: GaugeVec,
+    upstream: IntCounterVec,
+    user_visible_errors: IntCounterVec,
+    latency: HistogramVec,
+    failover_depth: HistogramVec,
+    hedge_attempts: IntCounterVec,
+    hedge_ratio: GaugeVec,
+    endpoint_requests: IntCounterVec,
+    endpoint_rate_limited: IntCounterVec,
+    endpoint_cooling_events: IntCounterVec,
+    endpoint_state: IntGaugeVec,
+    known_endpoints: Mutex<HashMap<(String, String), EndpointStatsSnapshot>>,
+    hedge_totals: DashMap<u64, Arc<HedgeTotals>>,
+}
+
+#[derive(Default)]
+struct HedgeTotals {
+    upstream: AtomicU64,
+    hedges: AtomicU64,
+}
+
+impl Metrics {
+    pub fn new() -> prometheus::Result<Self> {
+        let registry = PrometheusRegistry::new();
+        let ingress = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_chain_ingress_requests_total",
+                "Ingress JSON-RPC requests; use rate() for QPS.",
+            ),
+            &["chain_id"],
+        )?;
+        let cache_lookups = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_cache_lookups_total",
+                "Cacheable request lookups.",
+            ),
+            &["chain_id"],
+        )?;
+        let cache_hits = IntCounterVec::new(
+            Opts::new("rpcrouter_cache_hits_total", "Response cache hits."),
+            &["chain_id"],
+        )?;
+        let cache_hit_ratio = GaugeVec::new(
+            Opts::new(
+                "rpcrouter_cache_hit_ratio",
+                "Cache hits divided by cacheable lookups.",
+            ),
+            &["chain_id"],
+        )?;
+        let cache_misses = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_cache_misses_total",
+                "Cache misses entering singleflight.",
+            ),
+            &["chain_id"],
+        )?;
+        let coalesced = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_coalesced_requests_total",
+                "Cache misses served by an in-flight leader.",
+            ),
+            &["chain_id"],
+        )?;
+        let coalesce_ratio = GaugeVec::new(
+            Opts::new(
+                "rpcrouter_coalesce_ratio",
+                "Coalesced followers divided by cache misses.",
+            ),
+            &["chain_id"],
+        )?;
+        let upstream = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_chain_upstream_requests_total",
+                "Data-plane upstream requests; use rate() for QPS.",
+            ),
+            &["chain_id", "endpoint"],
+        )?;
+        let user_visible_errors = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_user_visible_errors_total",
+                "Requests exhausting all upstream endpoints.",
+            ),
+            &["chain_id"],
+        )?;
+        let latency = HistogramVec::new(
+            HistogramOpts::new(
+                "rpcrouter_request_latency_seconds",
+                "End-to-end JSON-RPC request latency.",
+            )
+            .buckets(vec![
+                0.000_1, 0.000_25, 0.000_5, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+                0.5, 1.0, 2.5, 5.0, 15.0,
+            ]),
+            &["chain_id"],
+        )?;
+        let failover_depth = HistogramVec::new(
+            HistogramOpts::new(
+                "rpcrouter_failover_depth",
+                "Number of failed upstream attempts before completion.",
+            )
+            .buckets(vec![0.0, 1.0, 2.0, 3.0, 4.0]),
+            &["chain_id"],
+        )?;
+        let hedge_attempts = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_hedge_attempts_total",
+                "Secondary hedge requests.",
+            ),
+            &["chain_id"],
+        )?;
+        let hedge_ratio = GaugeVec::new(
+            Opts::new(
+                "rpcrouter_hedge_ratio",
+                "Hedge requests divided by data-plane upstream requests.",
+            ),
+            &["chain_id"],
+        )?;
+        let endpoint_requests = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_endpoint_requests_total",
+                "All endpoint requests including health probes; use rate() for QPS.",
+            ),
+            &["chain_id", "endpoint"],
+        )?;
+        let endpoint_rate_limited = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_endpoint_rate_limited_total",
+                "Rate-limit responses observed for an endpoint.",
+            ),
+            &["chain_id", "endpoint"],
+        )?;
+        let endpoint_cooling_events = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_endpoint_cooling_events_total",
+                "Cooling transitions observed for an endpoint.",
+            ),
+            &["chain_id", "endpoint"],
+        )?;
+        let endpoint_state = IntGaugeVec::new(
+            Opts::new(
+                "rpcrouter_endpoint_state",
+                "Endpoint state represented as a one-hot gauge.",
+            ),
+            &["chain_id", "endpoint", "state"],
+        )?;
+
+        for collector in [
+            Box::new(ingress.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(cache_lookups.clone()),
+            Box::new(cache_hits.clone()),
+            Box::new(cache_hit_ratio.clone()),
+            Box::new(cache_misses.clone()),
+            Box::new(coalesced.clone()),
+            Box::new(coalesce_ratio.clone()),
+            Box::new(upstream.clone()),
+            Box::new(user_visible_errors.clone()),
+            Box::new(latency.clone()),
+            Box::new(failover_depth.clone()),
+            Box::new(hedge_attempts.clone()),
+            Box::new(hedge_ratio.clone()),
+            Box::new(endpoint_requests.clone()),
+            Box::new(endpoint_rate_limited.clone()),
+            Box::new(endpoint_cooling_events.clone()),
+            Box::new(endpoint_state.clone()),
+        ] {
+            registry.register(collector)?;
+        }
+
+        Ok(Self {
+            registry,
+            ingress,
+            cache_lookups,
+            cache_hits,
+            cache_hit_ratio,
+            cache_misses,
+            coalesced,
+            coalesce_ratio,
+            upstream,
+            user_visible_errors,
+            latency,
+            failover_depth,
+            hedge_attempts,
+            hedge_ratio,
+            endpoint_requests,
+            endpoint_rate_limited,
+            endpoint_cooling_events,
+            endpoint_state,
+            known_endpoints: Mutex::new(HashMap::new()),
+            hedge_totals: DashMap::new(),
+        })
+    }
+
+    pub fn record_ingress(&self, chain_id: u64) {
+        self.ingress
+            .with_label_values(&[&chain_id.to_string()])
+            .inc();
+    }
+
+    pub fn record_cache_lookup(&self, chain_id: u64, hit: bool) {
+        let chain = chain_id.to_string();
+        let lookups = self.cache_lookups.with_label_values(&[&chain]);
+        lookups.inc();
+        let hits = self.cache_hits.with_label_values(&[&chain]);
+        if hit {
+            hits.inc();
+        }
+        self.cache_hit_ratio
+            .with_label_values(&[&chain])
+            .set(hits.get() as f64 / lookups.get() as f64);
+    }
+
+    pub fn record_cache_miss_role(&self, chain_id: u64, coalesced: bool) {
+        let chain = chain_id.to_string();
+        let misses = self.cache_misses.with_label_values(&[&chain]);
+        misses.inc();
+        let followers = self.coalesced.with_label_values(&[&chain]);
+        if coalesced {
+            followers.inc();
+        }
+        self.coalesce_ratio
+            .with_label_values(&[&chain])
+            .set(followers.get() as f64 / misses.get() as f64);
+    }
+
+    pub fn record_upstream(&self, chain_id: u64, endpoint: &str) {
+        let chain = chain_id.to_string();
+        self.upstream.with_label_values(&[&chain, endpoint]).inc();
+        let totals = self.hedge_totals(chain_id);
+        totals.upstream.fetch_add(1, Ordering::Relaxed);
+        self.update_hedge_ratio(&chain, &totals);
+    }
+
+    pub fn record_hedge(&self, chain_id: u64) {
+        let chain = chain_id.to_string();
+        self.hedge_attempts.with_label_values(&[&chain]).inc();
+        let totals = self.hedge_totals(chain_id);
+        totals.hedges.fetch_add(1, Ordering::Relaxed);
+        self.update_hedge_ratio(&chain, &totals);
+    }
+
+    fn update_hedge_ratio(&self, chain: &str, totals: &HedgeTotals) {
+        let denominator = totals.upstream.load(Ordering::Relaxed);
+        let hedges = totals.hedges.load(Ordering::Relaxed);
+        self.hedge_ratio
+            .with_label_values(&[chain])
+            .set(if denominator == 0 {
+                0.0
+            } else {
+                hedges as f64 / denominator as f64
+            });
+    }
+
+    fn hedge_totals(&self, chain_id: u64) -> Arc<HedgeTotals> {
+        self.hedge_totals
+            .entry(chain_id)
+            .or_insert_with(|| Arc::new(HedgeTotals::default()))
+            .clone()
+    }
+
+    pub fn record_user_visible_error(&self, chain_id: u64) {
+        self.user_visible_errors
+            .with_label_values(&[&chain_id.to_string()])
+            .inc();
+    }
+
+    pub fn record_latency(&self, chain_id: u64, latency: Duration) {
+        self.latency
+            .with_label_values(&[&chain_id.to_string()])
+            .observe(latency.as_secs_f64());
+    }
+
+    pub fn record_failover_depth(&self, chain_id: u64, depth: usize) {
+        self.failover_depth
+            .with_label_values(&[&chain_id.to_string()])
+            .observe(depth as f64);
+    }
+
+    pub async fn encode(&self, rpc_registry: &Registry) -> prometheus::Result<String> {
+        self.sync_endpoints(rpc_registry).await;
+        let families = self.registry.gather();
+        let mut buffer = Vec::new();
+        TextEncoder::new().encode(&families, &mut buffer)?;
+        Ok(String::from_utf8_lossy(&buffer).into_owned())
+    }
+
+    async fn sync_endpoints(&self, rpc_registry: &Registry) {
+        let snapshots = rpc_registry.endpoint_metric_snapshots().await;
+        let current_keys: HashSet<_> = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.chain_id.to_string(), snapshot.url.clone()))
+            .collect();
+        let mut known = lock(&self.known_endpoints);
+        for (chain, endpoint) in known.keys().filter(|key| !current_keys.contains(*key)) {
+            let _ = self
+                .endpoint_requests
+                .remove_label_values(&[chain, endpoint]);
+            let _ = self
+                .endpoint_rate_limited
+                .remove_label_values(&[chain, endpoint]);
+            let _ = self
+                .endpoint_cooling_events
+                .remove_label_values(&[chain, endpoint]);
+            for state in ["active", "cooling", "probation"] {
+                let _ = self
+                    .endpoint_state
+                    .remove_label_values(&[chain, endpoint, state]);
+            }
+        }
+        let mut current = HashMap::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            let chain = snapshot.chain_id.to_string();
+            let key = (chain.clone(), snapshot.url.clone());
+            let previous = known.get(&key).copied().unwrap_or_default();
+            self.endpoint_requests
+                .with_label_values(&[&chain, &snapshot.url])
+                .inc_by(
+                    snapshot
+                        .stats
+                        .outbound_requests
+                        .saturating_sub(previous.outbound_requests),
+                );
+            self.endpoint_rate_limited
+                .with_label_values(&[&chain, &snapshot.url])
+                .inc_by(
+                    snapshot
+                        .stats
+                        .rate_limited
+                        .saturating_sub(previous.rate_limited),
+                );
+            self.endpoint_cooling_events
+                .with_label_values(&[&chain, &snapshot.url])
+                .inc_by(
+                    snapshot
+                        .stats
+                        .cooling_events
+                        .saturating_sub(previous.cooling_events),
+                );
+            for state in ["active", "cooling", "probation"] {
+                self.endpoint_state
+                    .with_label_values(&[&chain, &snapshot.url, state])
+                    .set(i64::from(state == snapshot.state));
+            }
+            current.insert(key, snapshot.stats);
+        }
+        *known = current;
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::{
+        chainlist::{ChainEndpoints, ChainlistSnapshot},
+        config::Config,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn encodes_chain_cache_and_endpoint_metrics() {
+        let config = Config {
+            chains: vec![1],
+            ..Config::default()
+        };
+        let rpc_registry = Arc::new(Registry::new(&config));
+        rpc_registry
+            .apply_snapshot(&ChainlistSnapshot {
+                chains: vec![ChainEndpoints {
+                    chain_id: 1,
+                    name: "Test".to_owned(),
+                    endpoints: vec!["http://upstream".to_owned()],
+                }],
+            })
+            .await;
+        let metrics = Metrics::new().expect("metrics");
+        metrics.record_ingress(1);
+        metrics.record_cache_lookup(1, true);
+        metrics.record_cache_miss_role(1, true);
+        metrics.record_upstream(1, "http://upstream");
+        metrics.record_latency(1, Duration::from_millis(2));
+        let encoded = metrics.encode(&rpc_registry).await.expect("encode");
+        assert!(encoded.contains("rpcrouter_chain_ingress_requests_total{chain_id=\"1\"} 1"));
+        assert!(encoded.contains("rpcrouter_cache_hit_ratio{chain_id=\"1\"} 1"));
+        assert!(encoded.contains("rpcrouter_endpoint_state"));
+        assert!(encoded.contains("endpoint=\"http://upstream\""));
+    }
+}

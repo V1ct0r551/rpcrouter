@@ -4,14 +4,18 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, State},
+    http::{StatusCode, header::CONTENT_TYPE},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde_json::{Value, json, value::RawValue};
 use tokio::task::JoinSet;
 use tracing::error;
 
 use crate::{
     forward::{Forwarder, all_endpoints_exhausted},
+    metrics::Metrics,
     registry::Registry,
 };
 
@@ -19,16 +23,26 @@ use crate::{
 pub struct AppState {
     registry: Arc<Registry>,
     forwarder: Arc<Forwarder>,
+    metrics: Arc<Metrics>,
     batch_limit: usize,
+    metrics_enabled: bool,
 }
 
 impl AppState {
     pub fn new(registry: Arc<Registry>, forwarder: Arc<Forwarder>, batch_limit: usize) -> Self {
+        let metrics = forwarder.metrics();
         Self {
             registry,
             forwarder,
+            metrics,
             batch_limit,
+            metrics_enabled: true,
         }
+    }
+
+    pub fn with_metrics_enabled(mut self, enabled: bool) -> Self {
+        self.metrics_enabled = enabled;
+        self
     }
 }
 
@@ -36,6 +50,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/chains", get(chains))
+        .route("/metrics", get(metrics))
         .route("/rpc/{chain_id}", post(rpc))
         .with_state(state)
 }
@@ -48,47 +63,72 @@ async fn chains(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"chains": state.registry.summaries().await}))
 }
 
+async fn metrics(State(state): State<AppState>) -> Response {
+    if !state.metrics_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.metrics.encode(&state.registry).await {
+        Ok(body) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            body,
+        )
+            .into_response(),
+        Err(error) => {
+            error!(error = %error, "metrics encoding failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn rpc(Path(chain_id): Path<u64>, State(state): State<AppState>, body: Bytes) -> Json<Value> {
-    let request: Value = match serde_json::from_slice(&body) {
+    let request: Box<RawValue> = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(_) => return Json(jsonrpc_error(Value::Null, -32700, "Parse error")),
     };
 
-    match request {
-        Value::Object(_) => Json(state.forwarder.execute(chain_id, request).await),
-        Value::Array(requests) if requests.is_empty() => Json(jsonrpc_error(
-            Value::Null,
-            -32600,
-            "Invalid Request: batch must not be empty",
-        )),
-        Value::Array(requests) if requests.len() > state.batch_limit => Json(jsonrpc_error(
-            Value::Null,
-            -32600,
-            &format!(
-                "Invalid Request: batch exceeds limit of {}",
-                state.batch_limit
-            ),
-        )),
-        Value::Array(requests) => Json(execute_batch(chain_id, &state, requests).await),
+    match request.get().trim_start().as_bytes().first() {
+        Some(b'{') => Json(state.forwarder.execute_raw(chain_id, &request).await),
+        Some(b'[') => {
+            let requests: Vec<Box<RawValue>> = match serde_json::from_str(request.get()) {
+                Ok(requests) => requests,
+                Err(_) => return Json(jsonrpc_error(Value::Null, -32700, "Parse error")),
+            };
+            if requests.is_empty() {
+                return Json(jsonrpc_error(
+                    Value::Null,
+                    -32600,
+                    "Invalid Request: batch must not be empty",
+                ));
+            }
+            if requests.len() > state.batch_limit {
+                return Json(jsonrpc_error(
+                    Value::Null,
+                    -32600,
+                    &format!(
+                        "Invalid Request: batch exceeds limit of {}",
+                        state.batch_limit
+                    ),
+                ));
+            }
+            Json(execute_batch(chain_id, &state, requests).await)
+        }
         _ => Json(jsonrpc_error(Value::Null, -32600, "Invalid Request")),
     }
 }
 
-async fn execute_batch(chain_id: u64, state: &AppState, requests: Vec<Value>) -> Value {
+async fn execute_batch(chain_id: u64, state: &AppState, requests: Vec<Box<RawValue>>) -> Value {
     let mut results = vec![None; requests.len()];
-    let request_ids: Vec<_> = requests
-        .iter()
-        .map(|request| request.get("id").cloned().unwrap_or(Value::Null))
-        .collect();
+    let request_ids: Vec<_> = requests.iter().map(|request| request_id(request)).collect();
     let mut tasks = JoinSet::new();
 
     for (index, request) in requests.into_iter().enumerate() {
-        if !request.is_object() {
+        if !request.get().trim_start().starts_with('{') {
             results[index] = Some(jsonrpc_error(Value::Null, -32600, "Invalid Request"));
             continue;
         }
         let forwarder = Arc::clone(&state.forwarder);
-        tasks.spawn(async move { (index, forwarder.execute(chain_id, request).await) });
+        tasks.spawn(async move { (index, forwarder.execute_raw(chain_id, &request).await) });
     }
 
     while let Some(task) = tasks.join_next().await {
@@ -109,6 +149,16 @@ async fn execute_batch(chain_id: u64, state: &AppState, requests: Vec<Value>) ->
             })
             .collect(),
     )
+}
+
+fn request_id(request: &RawValue) -> Value {
+    #[derive(Deserialize)]
+    struct IdOnly {
+        #[serde(default)]
+        id: Value,
+    }
+
+    serde_json::from_str::<IdOnly>(request.get()).map_or(Value::Null, |request| request.id)
 }
 
 fn jsonrpc_error(id: Value, code: i64, message: &str) -> Value {
@@ -345,6 +395,7 @@ mod tests {
         assert_eq!(health.status(), StatusCode::OK);
 
         let chains = app
+            .clone()
             .oneshot(
                 Request::get("/chains")
                     .body(Body::empty())
@@ -358,5 +409,24 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).expect("chains JSON");
         assert_eq!(value["chains"][0]["chainId"], 1);
         assert_eq!(value["chains"][0]["active"], 1);
+
+        let metrics = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+        assert_eq!(metrics.status(), StatusCode::OK);
+        assert_eq!(
+            metrics.headers()[CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = to_bytes(metrics.into_body(), usize::MAX)
+            .await
+            .expect("metrics body");
+        let body = String::from_utf8(body.to_vec()).expect("metrics text");
+        assert!(body.contains("rpcrouter_endpoint_state"));
     }
 }

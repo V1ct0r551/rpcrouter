@@ -31,7 +31,7 @@ impl Default for Config {
             listen: "0.0.0.0:8545"
                 .parse()
                 .expect("valid default listen address"),
-            metrics_enabled: false,
+            metrics_enabled: true,
             chains: vec![1, 143],
             server: ServerConfig::default(),
             chainlist: ChainlistConfig::default(),
@@ -100,6 +100,13 @@ impl Config {
         }
         if self.cache.max_bytes == 0 || self.cache.immutable_ttl_seconds < 60 * 60 {
             bail!("cache capacity must be nonzero and immutable TTL must be at least one hour");
+        }
+        if self.hedging.delay_ms == 0
+            || self.hedging.max_percent == 0
+            || self.hedging.max_percent > 10
+            || self.hedging.min_active_endpoints < 2
+        {
+            bail!("hedging requires a delay, max_percent 1..=10, and at least two endpoints");
         }
         for chain in &self.chain_overrides {
             if !unique_chains.contains(&chain.chain_id) {
@@ -287,6 +294,8 @@ impl Default for CacheConfig {
 pub struct HedgingConfig {
     pub enabled: bool,
     pub delay_ms: u64,
+    pub max_percent: u32,
+    pub min_active_endpoints: usize,
 }
 
 impl Default for HedgingConfig {
@@ -294,6 +303,8 @@ impl Default for HedgingConfig {
         Self {
             enabled: true,
             delay_ms: 300,
+            max_percent: 10,
+            min_active_endpoints: 2,
         }
     }
 }

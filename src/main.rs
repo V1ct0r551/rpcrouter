@@ -41,11 +41,10 @@ async fn main() -> Result<()> {
     spawn_probes(probes);
 
     let forwarder = Arc::new(Forwarder::new(Arc::clone(&registry), &config)?);
-    let app = router(AppState::new(
-        registry,
-        forwarder,
-        config.server.batch_limit,
-    ));
+    let app = router(
+        AppState::new(registry, forwarder, config.server.batch_limit)
+            .with_metrics_enabled(config.metrics_enabled),
+    );
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     info!(listen = %config.listen, "rpcrouter listening");
     axum::serve(listener, app)
