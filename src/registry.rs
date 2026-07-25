@@ -47,6 +47,7 @@ struct HealthState {
     strikes: u32,
     healthy_since: Option<Instant>,
     consecutive_faults: u8,
+    last_fault: Option<Instant>,
 }
 
 impl HealthState {
@@ -56,6 +57,7 @@ impl HealthState {
             strikes: 0,
             healthy_since: None,
             consecutive_faults: 0,
+            last_fault: None,
         }
     }
 
@@ -212,6 +214,7 @@ impl Endpoint {
             HealthStatus::Cooling { .. } => {
                 health.status = HealthStatus::Probation { passes: 0 };
                 health.consecutive_faults = 0;
+                health.last_fault = None;
                 true
             }
             HealthStatus::Active | HealthStatus::Probation { .. } => true,
@@ -251,6 +254,7 @@ impl Endpoint {
         let mut health = lock(&self.health);
         health.decay_strikes(now);
         health.consecutive_faults = 0;
+        health.last_fault = None;
         if let HealthStatus::Probation { passes } = health.status {
             let passes = passes.saturating_add(1);
             health.status = if passes >= PROBATION_PASSES_REQUIRED {
@@ -285,6 +289,13 @@ impl Endpoint {
             return;
         }
 
+        if health
+            .last_fault
+            .is_none_or(|last_fault| now.saturating_duration_since(last_fault) > ERROR_WINDOW)
+        {
+            health.consecutive_faults = 0;
+        }
+        health.last_fault = Some(now);
         health.consecutive_faults = health.consecutive_faults.saturating_add(1);
         if matches!(health.status, HealthStatus::Active) {
             health.healthy_since = Some(now);
@@ -299,6 +310,7 @@ impl Endpoint {
         health.strikes = health.strikes.saturating_add(1);
         health.healthy_since = None;
         health.consecutive_faults = 0;
+        health.last_fault = None;
         let policy_delay = cooldown_for_strikes(health.strikes);
         let cooldown = signal
             .retry_after
@@ -770,6 +782,24 @@ mod tests {
         assert_eq!(endpoint.state(now), EndpointState::Active);
         endpoint.record_failure(now, FailureSignal::new(FaultKind::ServerError));
         assert!(matches!(endpoint.state(now), EndpointState::Cooling { .. }));
+    }
+
+    #[test]
+    fn ordinary_fault_threshold_resets_outside_error_window() {
+        let endpoint = Endpoint::new("http://flaky".to_owned(), 15, 8, 0);
+        let start = Instant::now();
+        activate(&endpoint, start, 10);
+        endpoint.record_failure(start, FailureSignal::new(FaultKind::ServerError));
+        endpoint.record_failure(start, FailureSignal::new(FaultKind::ServerError));
+        let later = start + ERROR_WINDOW + Duration::from_secs(1);
+        endpoint.record_failure(later, FailureSignal::new(FaultKind::ServerError));
+        assert_eq!(endpoint.state(later), EndpointState::Active);
+        endpoint.record_failure(later, FailureSignal::new(FaultKind::ServerError));
+        endpoint.record_failure(later, FailureSignal::new(FaultKind::ServerError));
+        assert!(matches!(
+            endpoint.state(later),
+            EndpointState::Cooling { .. }
+        ));
     }
 
     #[tokio::test]
