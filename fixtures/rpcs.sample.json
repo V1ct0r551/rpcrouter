@@ -41,13 +41,84 @@
     "name": "BNB Smart Chain Mainnet",
     "chain": "BSC",
     "rpc": [
-      {"url": "https://bsc-rpc.publicnode.com"}
+      {"url": "https://bsc-rpc.publicnode.com"},
+      {"url": "https://bsc-dataseed.bnbchain.org"}
     ],
     "nativeCurrency": {"name": "BNB", "symbol": "BNB", "decimals": 18},
     "shortName": "bnb",
     "chainId": 56,
     "networkId": 56,
-    "isTestnet": false
+    "isTestnet": false,
+    "infoURL": "https://www.bnbchain.org"
+  },
+  {
+    "name": "Polygon Mainnet",
+    "chain": "Polygon",
+    "rpc": [
+      {"url": "https://polygon-bor-rpc.publicnode.com"},
+      {"url": "https://polygon.drpc.org"}
+    ],
+    "nativeCurrency": {"name": "POL", "symbol": "POL", "decimals": 18},
+    "shortName": "pol",
+    "chainId": 137,
+    "networkId": 137,
+    "isTestnet": false,
+    "infoURL": "https://polygon.technology"
+  },
+  {
+    "name": "Arbitrum One",
+    "chain": "ETH",
+    "rpc": [
+      {"url": "https://arbitrum-one-rpc.publicnode.com"},
+      {"url": "https://arb1.arbitrum.io/rpc"}
+    ],
+    "nativeCurrency": {"name": "Ether", "symbol": "ETH", "decimals": 18},
+    "shortName": "arb1",
+    "chainId": 42161,
+    "networkId": 42161,
+    "isTestnet": false,
+    "infoURL": "https://arbitrum.io"
+  },
+  {
+    "name": "Base",
+    "chain": "ETH",
+    "rpc": [
+      {"url": "https://base-rpc.publicnode.com"},
+      {"url": "https://mainnet.base.org"}
+    ],
+    "nativeCurrency": {"name": "Ether", "symbol": "ETH", "decimals": 18},
+    "shortName": "base",
+    "chainId": 8453,
+    "networkId": 8453,
+    "isTestnet": false,
+    "infoURL": "https://base.org"
+  },
+  {
+    "name": "OP Mainnet",
+    "chain": "ETH",
+    "rpc": [
+      {"url": "https://optimism-rpc.publicnode.com"},
+      {"url": "https://mainnet.optimism.io"}
+    ],
+    "nativeCurrency": {"name": "Ether", "symbol": "ETH", "decimals": 18},
+    "shortName": "oeth",
+    "chainId": 10,
+    "networkId": 10,
+    "isTestnet": false,
+    "infoURL": "https://optimism.io"
+  },
+  {
+    "name": "Avalanche C-Chain",
+    "chain": "AVAX",
+    "rpc": [
+      {"url": "https://avalanche-c-chain-rpc.publicnode.com"},
+      {"url": "https://api.avax.network/ext/bc/C/rpc"}
+    ],
+    "nativeCurrency": {"name": "Avalanche", "symbol": "AVAX", "decimals": 18},
+    "shortName": "avax",
+    "chainId": 43114,
+    "networkId": 43114,
+    "isTestnet": false,
+    "infoURL": "https://www.avax.network"
   }
 ]
-

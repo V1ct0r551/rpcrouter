@@ -1,6 +1,6 @@
 listen = "0.0.0.0:8545"
 metrics_enabled = true
-chains = [1, 143]
+chains = [1, 143, 56, 137, 42161, 8453, 10, 43114]
 
 [server]
 batch_limit = 100
@@ -49,5 +49,54 @@ chain_id = 143
 block_time_ms = 400
 confirmation_depth = 64
 tip_ttl_ms = 400
+extra_endpoints = []
+disabled_endpoints = []
+
+# BSC 在 Maxwell 升级后约 750ms 出块；64 块确认深度对不可变缓存保持保守。
+[[chain_overrides]]
+chain_id = 56
+block_time_ms = 750
+confirmation_depth = 64
+tip_ttl_ms = 750
+extra_endpoints = []
+disabled_endpoints = []
+
+[[chain_overrides]]
+chain_id = 137
+block_time_ms = 2000
+confirmation_depth = 128
+tip_ttl_ms = 2000
+extra_endpoints = []
+disabled_endpoints = []
+
+[[chain_overrides]]
+chain_id = 42161
+block_time_ms = 250
+confirmation_depth = 64
+tip_ttl_ms = 250
+extra_endpoints = []
+disabled_endpoints = []
+
+[[chain_overrides]]
+chain_id = 8453
+block_time_ms = 2000
+confirmation_depth = 64
+tip_ttl_ms = 2000
+extra_endpoints = []
+disabled_endpoints = []
+
+[[chain_overrides]]
+chain_id = 10
+block_time_ms = 2000
+confirmation_depth = 64
+tip_ttl_ms = 2000
+extra_endpoints = []
+disabled_endpoints = []
+
+[[chain_overrides]]
+chain_id = 43114
+block_time_ms = 2000
+confirmation_depth = 32
+tip_ttl_ms = 2000
 extra_endpoints = []
 disabled_endpoints = []

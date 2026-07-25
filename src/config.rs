@@ -356,7 +356,21 @@ mod tests {
     #[test]
     fn repository_config_is_valid() {
         let config = Config::from_toml(include_str!("../config.toml")).expect("repository config");
-        assert_eq!(config.chains, [1, 143]);
+        assert_eq!(config.chains, [1, 143, 56, 137, 42161, 8453, 10, 43114]);
+        for (chain_id, block_time_ms, confirmation_depth, tip_ttl_ms) in [
+            (1, 12_000, 64, 2_000),
+            (143, 400, 64, 400),
+            (56, 750, 64, 750),
+            (137, 2_000, 128, 2_000),
+            (42161, 250, 64, 250),
+            (8453, 2_000, 64, 2_000),
+            (10, 2_000, 64, 2_000),
+            (43114, 2_000, 32, 2_000),
+        ] {
+            assert_eq!(config.block_time_ms(chain_id), block_time_ms);
+            assert_eq!(config.confirmation_depth(chain_id), confirmation_depth);
+            assert_eq!(config.tip_ttl_ms(chain_id), tip_ttl_ms);
+        }
     }
 
     #[test]

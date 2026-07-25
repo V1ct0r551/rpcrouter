@@ -347,6 +347,24 @@ mod tests {
         assert_eq!(monad.endpoints.len(), 6);
     }
 
+    #[test]
+    fn fixture_covers_every_repository_chain() {
+        let config = Config::from_toml(include_str!("../config.toml")).expect("repository config");
+        let allowed: HashSet<_> = config.chains.iter().copied().collect();
+        let snapshot = parse_and_filter(BUILTIN_FIXTURE, &allowed).expect("parse fixture");
+        let fixture_chains: HashSet<_> =
+            snapshot.chains.iter().map(|chain| chain.chain_id).collect();
+
+        assert_eq!(fixture_chains, allowed);
+        assert!(snapshot.chains.iter().all(|chain| {
+            !chain.endpoints.is_empty()
+                && chain
+                    .endpoints
+                    .iter()
+                    .all(|endpoint| endpoint.starts_with("https://"))
+        }));
+    }
+
     #[tokio::test]
     async fn sends_etag_and_uses_memory_for_network_failure() {
         #[derive(Clone)]
