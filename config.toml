@@ -13,15 +13,18 @@ cache_path = "./data/rpcs.json"
 
 [upstream]
 request_timeout_ms = 5000
+slow_threshold_ms = 4000
 deadline_ms = 15000
 max_attempts = 4
 default_rps = 15
 default_concurrency = 8
 
-# Phase 2/3 会启用以下参数；Phase 1 先保证配置格式向前兼容。
 [probe]
-interval_seconds = 20
+min_interval_seconds = 15
+max_interval_seconds = 30
 max_concurrency = 32
+request_timeout_ms = 5000
+max_block_lag = 5
 
 [cache]
 max_bytes = 536870912
@@ -45,4 +48,3 @@ confirmation_depth = 64
 tip_ttl_ms = 400
 extra_endpoints = []
 disabled_endpoints = []
-

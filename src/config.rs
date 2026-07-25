@@ -81,11 +81,22 @@ impl Config {
         if self.upstream.request_timeout_ms == 0 || self.upstream.deadline_ms == 0 {
             bail!("upstream timeouts must be greater than zero");
         }
+        if self.upstream.slow_threshold_ms == 0 {
+            bail!("upstream.slow_threshold_ms must be greater than zero");
+        }
         if self.upstream.max_attempts == 0 || self.upstream.max_attempts > 4 {
             bail!("upstream.max_attempts must be between 1 and 4");
         }
         if self.upstream.default_rps == 0 || self.upstream.default_concurrency == 0 {
             bail!("upstream rate and concurrency limits must be greater than zero");
+        }
+        if self.probe.min_interval_seconds == 0
+            || self.probe.max_interval_seconds < self.probe.min_interval_seconds
+        {
+            bail!("probe interval must be a valid nonzero range");
+        }
+        if self.probe.max_concurrency == 0 || self.probe.request_timeout_ms == 0 {
+            bail!("probe concurrency and timeout must be greater than zero");
         }
         for chain in &self.chain_overrides {
             if !unique_chains.contains(&chain.chain_id) {
@@ -121,6 +132,12 @@ impl Config {
                 .and_then(|endpoint| endpoint.concurrency)
                 .unwrap_or(self.upstream.default_concurrency),
         )
+    }
+
+    pub fn lag_threshold(&self, chain_id: u64) -> u64 {
+        self.chain_override(chain_id)
+            .and_then(|chain| chain.max_block_lag)
+            .unwrap_or(self.probe.max_block_lag)
     }
 }
 
@@ -162,6 +179,7 @@ impl Default for ChainlistConfig {
 #[serde(default)]
 pub struct UpstreamConfig {
     pub request_timeout_ms: u64,
+    pub slow_threshold_ms: u64,
     pub deadline_ms: u64,
     pub max_attempts: usize,
     pub default_rps: u32,
@@ -172,6 +190,7 @@ impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
             request_timeout_ms: 5_000,
+            slow_threshold_ms: 4_000,
             deadline_ms: 15_000,
             max_attempts: 4,
             default_rps: 15,
@@ -187,6 +206,7 @@ pub struct ChainOverride {
     pub block_time_ms: Option<u64>,
     pub confirmation_depth: Option<u64>,
     pub tip_ttl_ms: Option<u64>,
+    pub max_block_lag: Option<u64>,
     pub extra_endpoints: Vec<String>,
     pub disabled_endpoints: Vec<String>,
     pub endpoint_overrides: Vec<EndpointOverride>,
@@ -202,15 +222,21 @@ pub struct EndpointOverride {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct ProbeConfig {
-    pub interval_seconds: u64,
+    pub min_interval_seconds: u64,
+    pub max_interval_seconds: u64,
     pub max_concurrency: usize,
+    pub request_timeout_ms: u64,
+    pub max_block_lag: u64,
 }
 
 impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
-            interval_seconds: 20,
+            min_interval_seconds: 15,
+            max_interval_seconds: 30,
             max_concurrency: 32,
+            request_timeout_ms: 5_000,
+            max_block_lag: 5,
         }
     }
 }

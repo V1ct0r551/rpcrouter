@@ -207,6 +207,7 @@ mod tests {
             chain_overrides: Vec::new(),
             upstream: UpstreamConfig {
                 request_timeout_ms: timeout_ms,
+                slow_threshold_ms: 50,
                 deadline_ms: 500,
                 max_attempts: 4,
                 default_rps: 100,
@@ -228,6 +229,15 @@ mod tests {
                 }],
             })
             .await;
+        for endpoint in registry.all_endpoints(1).await {
+            let latency = if endpoint.url().ends_with("/failure") {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(10)
+            };
+            endpoint.record_success(tokio::time::Instant::now(), latency, true);
+            endpoint.record_success(tokio::time::Instant::now(), latency, true);
+        }
         let forwarder = Arc::new(
             Forwarder::new(Arc::clone(&registry), &config).expect("create test forwarder"),
         );
