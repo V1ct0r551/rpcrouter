@@ -5,6 +5,7 @@ use rpcrouter::{
     chainlist::ChainlistLoader,
     config::Config,
     forward::Forwarder,
+    probe::{ProbeManager, spawn as spawn_probes},
     registry::Registry,
     server::{AppState, router},
 };
@@ -36,6 +37,8 @@ async fn main() -> Result<()> {
         Arc::clone(&registry),
         Duration::from_secs(config.chainlist.refresh_seconds),
     );
+    let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
+    spawn_probes(probes);
 
     let forwarder = Arc::new(Forwarder::new(Arc::clone(&registry), &config)?);
     let app = router(AppState::new(
