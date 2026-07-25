@@ -74,6 +74,10 @@ fn request(id: u64) -> Value {
     json!({"jsonrpc":"2.0", "id":id, "method":"eth_blockNumber", "params":[]})
 }
 
+fn uncached_request(id: u64) -> Value {
+    json!({"jsonrpc":"2.0", "id":id, "method":"phase2_uncached", "params":[]})
+}
+
 #[tokio::test]
 async fn persistent_429_cools_stops_traffic_and_recovers_via_probe() {
     let (url, controller) = spawn_mock(MockBehavior {
@@ -90,7 +94,7 @@ async fn persistent_429_cools_stops_traffic_and_recovers_via_probe() {
 
     let before_first = Instant::now();
     assert_eq!(
-        forwarder.execute(1, request(1)).await["error"]["code"],
+        forwarder.execute(1, uncached_request(1)).await["error"]["code"],
         -32000
     );
     let EndpointState::Cooling {
@@ -106,7 +110,7 @@ async fn persistent_429_cools_stops_traffic_and_recovers_via_probe() {
     assert!(first_delay < Duration::from_secs(46));
 
     let calls_while_cooling = controller.request_count();
-    let _ = forwarder.execute(1, request(2)).await;
+    let _ = forwarder.execute(1, uncached_request(2)).await;
     assert_eq!(controller.request_count(), calls_while_cooling);
 
     controller.set_rate_limit_after(None);
@@ -131,7 +135,7 @@ async fn persistent_429_cools_stops_traffic_and_recovers_via_probe() {
     assert_eq!(endpoint.state(second_probe_at), EndpointState::Active);
     assert!(
         forwarder
-            .execute(1, request(3))
+            .execute(1, uncached_request(3))
             .await
             .get("result")
             .is_some()
@@ -139,7 +143,7 @@ async fn persistent_429_cools_stops_traffic_and_recovers_via_probe() {
 
     controller.set_rate_limit_after(Some(0));
     let before_second = Instant::now();
-    let _ = forwarder.execute(1, request(4)).await;
+    let _ = forwarder.execute(1, uncached_request(4)).await;
     let EndpointState::Cooling {
         until: second_until,
         strikes: second_strikes,
