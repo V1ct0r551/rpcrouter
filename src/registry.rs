@@ -574,10 +574,10 @@ impl Registry {
         for item in &endpoints {
             if let Some(item_height) = item.recent_height(now, freshness) {
                 item.lag
-                    .store(head.saturating_sub(item_height), Ordering::Relaxed);
+                    .store(head.abs_diff(item_height), Ordering::Relaxed);
             }
         }
-        if head.saturating_sub(height) > self.config.lag_threshold(chain_id) {
+        if head.abs_diff(height) > self.config.lag_threshold(chain_id) {
             endpoint.record_failure(now, FailureSignal::new(FaultKind::Lagging));
         }
     }
@@ -840,6 +840,36 @@ mod tests {
         assert!(registry.remove_endpoint(1, "http://wrong").await);
         registry.apply_snapshot(&snapshot(&["http://wrong"])).await;
         assert!(registry.all_endpoints(1).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracks_trimmed_head_and_penalizes_lag_or_high_outliers() {
+        let config = Config {
+            chains: vec![1],
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        registry
+            .apply_snapshot(&snapshot(&["http://a", "http://b", "http://outlier"]))
+            .await;
+        let now = Instant::now();
+        let a = registry.endpoint(1, "http://a").await.expect("a");
+        let b = registry.endpoint(1, "http://b").await.expect("b");
+        let outlier = registry
+            .endpoint(1, "http://outlier")
+            .await
+            .expect("outlier");
+        for endpoint in [&a, &b, &outlier] {
+            activate(endpoint, now, 10);
+        }
+        registry.record_probe_height(1, &a, 100, now).await;
+        registry.record_probe_height(1, &b, 101, now).await;
+        registry.record_probe_height(1, &outlier, 10_000, now).await;
+        assert_eq!(registry.head(1), 101);
+        assert_eq!(a.lag(), 1);
+        assert_eq!(b.lag(), 0);
+        assert_eq!(outlier.lag(), 9_899);
+        assert!(outlier.score(now) > a.score(now));
     }
 
     #[test]

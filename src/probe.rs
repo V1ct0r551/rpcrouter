@@ -114,7 +114,17 @@ impl ProbeManager {
     }
 
     pub async fn probe_endpoint(&self, chain_id: u64, endpoint: Arc<Endpoint>) -> ProbeOutcome {
-        let now = Instant::now();
+        self.probe_endpoint_at(chain_id, endpoint, Instant::now())
+            .await
+    }
+
+    /// 显式时钟入口用于无需真实等待冷却窗口的确定性测试。
+    pub async fn probe_endpoint_at(
+        &self,
+        chain_id: u64,
+        endpoint: Arc<Endpoint>,
+        now: Instant,
+    ) -> ProbeOutcome {
         if !endpoint.begin_probe(now) {
             return ProbeOutcome::Skipped;
         }
@@ -130,13 +140,13 @@ impl ProbeManager {
             Ok(response) => response,
             Err(None) => return ProbeOutcome::Skipped,
             Err(Some(signal)) => {
-                endpoint.record_failure(Instant::now(), signal.clone());
+                endpoint.record_failure(now + started.elapsed(), signal.clone());
                 return ProbeOutcome::Failed(signal.kind);
             }
         };
         let Some(actual_chain_id) = parse_hex_result(&chain_id_response) else {
             let signal = FailureSignal::new(FaultKind::InvalidResponse);
-            endpoint.record_failure(Instant::now(), signal.clone());
+            endpoint.record_failure(now + started.elapsed(), signal.clone());
             return ProbeOutcome::Failed(signal.kind);
         };
         if actual_chain_id != chain_id {
@@ -161,18 +171,19 @@ impl ProbeManager {
             Ok(response) => response,
             Err(None) => return ProbeOutcome::Skipped,
             Err(Some(signal)) => {
-                endpoint.record_failure(Instant::now(), signal.clone());
+                endpoint.record_failure(now + started.elapsed(), signal.clone());
                 return ProbeOutcome::Failed(signal.kind);
             }
         };
         let Some(height) = parse_hex_result(&block_response) else {
             let signal = FailureSignal::new(FaultKind::InvalidResponse);
-            endpoint.record_failure(Instant::now(), signal.clone());
+            endpoint.record_failure(now + started.elapsed(), signal.clone());
             return ProbeOutcome::Failed(signal.kind);
         };
 
-        let finished = Instant::now();
-        endpoint.record_success(finished, finished.saturating_duration_since(started), true);
+        let latency = started.elapsed();
+        let finished = now + latency;
+        endpoint.record_success(finished, latency, true);
         self.registry
             .record_probe_height(chain_id, &endpoint, height, finished)
             .await;
