@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.97"
 license = "MIT"
 description = "A resilient public JSON-RPC routing gateway"
+default-run = "rpcrouter"
 
 [dependencies]
 anyhow = "1"
