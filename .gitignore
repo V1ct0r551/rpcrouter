@@ -1,5 +1,6 @@
 .ccteam/
 .claude/settings.local.json
-/target
-/config.toml
+/target/
+/data/
+*.log
 .DS_Store

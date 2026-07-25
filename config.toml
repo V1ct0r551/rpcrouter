@@ -1,0 +1,48 @@
+listen = "0.0.0.0:8545"
+metrics_enabled = false
+chains = [1, 143]
+
+[server]
+batch_limit = 100
+
+[chainlist]
+url = "https://chainlist.org/rpcs.json"
+refresh_seconds = 21600
+stale_grace_seconds = 86400
+cache_path = "./data/rpcs.json"
+
+[upstream]
+request_timeout_ms = 5000
+deadline_ms = 15000
+max_attempts = 4
+default_rps = 15
+default_concurrency = 8
+
+# Phase 2/3 会启用以下参数；Phase 1 先保证配置格式向前兼容。
+[probe]
+interval_seconds = 20
+max_concurrency = 32
+
+[cache]
+max_bytes = 536870912
+
+[hedging]
+enabled = true
+delay_ms = 300
+
+[[chain_overrides]]
+chain_id = 1
+block_time_ms = 12000
+confirmation_depth = 64
+tip_ttl_ms = 2000
+extra_endpoints = []
+disabled_endpoints = []
+
+[[chain_overrides]]
+chain_id = 143
+block_time_ms = 400
+confirmation_depth = 64
+tip_ttl_ms = 400
+extra_endpoints = []
+disabled_endpoints = []
+

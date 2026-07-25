@@ -1,0 +1,22 @@
+[package]
+name = "rpcrouter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+description = "A resilient public JSON-RPC routing gateway"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+dashmap = "6"
+governor = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
