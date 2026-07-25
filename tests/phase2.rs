@@ -7,6 +7,7 @@ use rpcrouter::{
     mock_upstream::{MockBehavior, MockController, router as mock_router},
     probe::{ProbeManager, ProbeOutcome},
     registry::{Endpoint, EndpointState, Registry},
+    signals::{FailureSignal, FaultKind},
 };
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinSet, time::Instant};
@@ -76,6 +77,59 @@ fn request(id: u64) -> Value {
 
 fn uncached_request(id: u64) -> Value {
     json!({"jsonrpc":"2.0", "id":id, "method":"phase2_uncached", "params":[]})
+}
+
+#[tokio::test]
+async fn cold_start_probation_endpoint_serves_immediately() {
+    let (url, upstream) = spawn_mock(MockBehavior::default()).await;
+    let config = phase2_config();
+    let registry = setup_registry(&config, std::slice::from_ref(&url)).await;
+    let endpoint = registry.endpoint(1, &url).await.expect("cold endpoint");
+    assert_eq!(
+        endpoint.state(Instant::now()),
+        EndpointState::Probation { passes: 0 }
+    );
+    let forwarder = Forwarder::new(Arc::clone(&registry), &config).expect("forwarder");
+
+    let response = forwarder.execute(1, uncached_request(1)).await;
+
+    assert_eq!(response["result"], "0x1");
+    assert_eq!(upstream.request_count(), 1);
+    assert_eq!(registry.user_visible_errors(), 0);
+    assert_eq!(
+        endpoint.state(Instant::now()),
+        EndpointState::Probation { passes: 1 }
+    );
+}
+
+#[tokio::test]
+async fn cooling_and_empty_pools_still_return_gateway_error() {
+    let (url, upstream) = spawn_mock(MockBehavior::default()).await;
+    let config = phase2_config();
+    let cooling_registry = setup_registry(&config, std::slice::from_ref(&url)).await;
+    let endpoint = cooling_registry
+        .endpoint(1, &url)
+        .await
+        .expect("cooling endpoint");
+    endpoint.record_failure(Instant::now(), FailureSignal::new(FaultKind::RateLimited));
+    assert!(matches!(
+        endpoint.state(Instant::now()),
+        EndpointState::Cooling { .. }
+    ));
+    let cooling_forwarder =
+        Forwarder::new(Arc::clone(&cooling_registry), &config).expect("cooling forwarder");
+
+    let cooling_response = cooling_forwarder.execute(1, uncached_request(2)).await;
+    assert_eq!(cooling_response["error"]["code"], -32000);
+    assert_eq!(upstream.request_count(), 0);
+    assert_eq!(cooling_registry.user_visible_errors(), 1);
+
+    let empty_registry = setup_registry(&config, &[]).await;
+    let empty_forwarder =
+        Forwarder::new(Arc::clone(&empty_registry), &config).expect("empty forwarder");
+    let empty_response = empty_forwarder.execute(1, uncached_request(3)).await;
+    assert_eq!(empty_response["error"]["code"], -32000);
+    assert_eq!(empty_registry.user_visible_errors(), 1);
 }
 
 #[tokio::test]

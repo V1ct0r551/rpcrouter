@@ -206,6 +206,10 @@ impl Endpoint {
         matches!(lock(&self.health).status, HealthStatus::Active)
     }
 
+    fn is_probation(&self) -> bool {
+        matches!(lock(&self.health).status, HealthStatus::Probation { .. })
+    }
+
     pub fn begin_probe(&self, now: Instant) -> bool {
         let mut health = lock(&self.health);
         health.decay_strikes(now);
@@ -222,7 +226,7 @@ impl Endpoint {
     }
 
     pub fn try_acquire(self: &Arc<Self>) -> Option<EndpointLease> {
-        if !self.is_active() {
+        if matches!(lock(&self.health).status, HealthStatus::Cooling { .. }) {
             return None;
         }
         self.acquire_outbound()
@@ -508,14 +512,20 @@ impl Registry {
         *state.endpoints.write().await = merged;
     }
 
-    /// 对 Active 集反复执行 P2C，生成不同端点的尝试顺序。
+    /// 优先对 Active 集执行 P2C；冷启动无 Active 时回退到 Probation 集。
     pub async fn candidates(&self, chain_id: u64) -> Vec<Arc<Endpoint>> {
-        let mut pool: Vec<_> = self
-            .all_endpoints(chain_id)
-            .await
-            .into_iter()
+        let endpoints = self.all_endpoints(chain_id).await;
+        let mut pool: Vec<_> = endpoints
+            .iter()
             .filter(|endpoint| endpoint.is_active())
+            .cloned()
             .collect();
+        if pool.is_empty() {
+            pool = endpoints
+                .into_iter()
+                .filter(|endpoint| endpoint.is_probation())
+                .collect();
+        }
         let now = Instant::now();
         let mut ordered = Vec::with_capacity(pool.len());
         let mut rng = rand::rng();
