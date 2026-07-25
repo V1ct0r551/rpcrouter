@@ -9,6 +9,7 @@ pub type CacheKey = [u8; 32];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheClass {
     Immutable,
+    ImmutableByResponse { finalized_before: u64 },
     Tip,
 }
 
@@ -73,6 +74,9 @@ impl Classifier {
             CacheClass::Immutable => {
                 hasher.update(&[1]);
             }
+            CacheClass::ImmutableByResponse { .. } => {
+                hasher.update(&[3]);
+            }
             CacheClass::Tip => {
                 hasher.update(&[2]);
                 hasher.update(&head.to_be_bytes());
@@ -82,7 +86,9 @@ impl Classifier {
             key: *hasher.finalize().as_bytes(),
             class,
             ttl: match class {
-                CacheClass::Immutable => self.immutable_ttl,
+                CacheClass::Immutable | CacheClass::ImmutableByResponse { .. } => {
+                    self.immutable_ttl
+                }
                 CacheClass::Tip => settings.tip_ttl,
             },
         })
@@ -138,6 +144,11 @@ fn classify_method(
         | "eth_getTransactionByBlockHashAndIndex"
         | "eth_getBlockTransactionCountByHash"
         | "eth_getUncleCountByBlockHash" => Some(CacheClass::Immutable),
+        "eth_getTransactionByHash" | "eth_getTransactionReceipt" => {
+            Some(CacheClass::ImmutableByResponse {
+                finalized_before: head.saturating_sub(confirmations),
+            })
+        }
         "eth_getBlockByNumber" => classify_block_param(params, 0, head, confirmations, false),
         "eth_call" | "eth_getBalance" | "eth_getCode" => {
             classify_last_block_param(params, head, confirmations, false)
@@ -312,6 +323,21 @@ mod tests {
                 .expect("monad")
                 .ttl,
             Duration::from_millis(400)
+        );
+    }
+
+    #[test]
+    fn transaction_hash_reads_are_deferred_until_response_finality_is_known() {
+        let classifier = classifier();
+        let params = raw(json!(["0xabc"]));
+        let plan = classifier
+            .cache_plan(1, "eth_getTransactionReceipt", Some(&params), 1_000)
+            .expect("receipt plan");
+        assert_eq!(
+            plan.class,
+            CacheClass::ImmutableByResponse {
+                finalized_before: 936
+            }
         );
     }
 }

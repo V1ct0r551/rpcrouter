@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use crate::{
-    classify::{CacheKey, CachePlan},
+    classify::{CacheClass, CacheKey, CachePlan},
     config::Config,
 };
 
@@ -38,6 +38,20 @@ impl CachedResponse {
             ttl,
             weight,
         }))
+    }
+
+    pub fn from_plan_success(response: &Value, plan: CachePlan) -> Option<Arc<Self>> {
+        if let CacheClass::ImmutableByResponse { finalized_before } = plan.class {
+            let block = response
+                .get("result")?
+                .get("blockNumber")?
+                .as_str()
+                .and_then(parse_hex)?;
+            if block >= finalized_before {
+                return None;
+            }
+        }
+        Self::from_success(response, plan.ttl)
     }
 
     pub fn with_id(&self, id: Value) -> Value {
@@ -222,6 +236,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn parse_hex(value: &str) -> Option<u64> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))?;
+    u64::from_str_radix(digits, 16).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -251,6 +272,38 @@ mod tests {
             CachedResponse::from_success(
                 &json!({"jsonrpc":"2.0","id":1,"error":{"code":3}}),
                 Duration::from_secs(1)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn deferred_transaction_cache_requires_old_block_in_response() {
+        let plan = CachePlan {
+            key: [9; 32],
+            class: CacheClass::ImmutableByResponse {
+                finalized_before: 100,
+            },
+            ttl: Duration::from_secs(3_600),
+        };
+        assert!(
+            CachedResponse::from_plan_success(
+                &json!({"jsonrpc":"2.0","id":1,"result":{"blockNumber":"0x63"}}),
+                plan
+            )
+            .is_some()
+        );
+        assert!(
+            CachedResponse::from_plan_success(
+                &json!({"jsonrpc":"2.0","id":1,"result":{"blockNumber":"0x64"}}),
+                plan
+            )
+            .is_none()
+        );
+        assert!(
+            CachedResponse::from_plan_success(
+                &json!({"jsonrpc":"2.0","id":1,"result":{"blockNumber":null}}),
+                plan
             )
             .is_none()
         );

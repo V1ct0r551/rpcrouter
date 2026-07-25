@@ -142,7 +142,7 @@ impl Forwarder {
                             read_only,
                         )
                         .await;
-                    if let Some(cached) = CachedResponse::from_success(&response, plan.ttl) {
+                    if let Some(cached) = CachedResponse::from_plan_success(&response, plan) {
                         self.cache.insert(plan, Arc::clone(&cached)).await;
                         leader.complete_success(cached);
                     } else {
@@ -166,7 +166,7 @@ impl Forwarder {
                                 read_only,
                             )
                             .await;
-                        if let Some(cached) = CachedResponse::from_success(&response, plan.ttl) {
+                        if let Some(cached) = CachedResponse::from_plan_success(&response, plan) {
                             self.cache.insert(plan, cached).await;
                         }
                         response
