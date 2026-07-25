@@ -39,22 +39,7 @@ impl Default for Config {
             probe: ProbeConfig::default(),
             cache: CacheConfig::default(),
             hedging: HedgingConfig::default(),
-            chain_overrides: vec![
-                ChainOverride {
-                    chain_id: 1,
-                    block_time_ms: Some(12_000),
-                    confirmation_depth: Some(64),
-                    tip_ttl_ms: Some(2_000),
-                    ..ChainOverride::default()
-                },
-                ChainOverride {
-                    chain_id: 143,
-                    block_time_ms: Some(400),
-                    confirmation_depth: Some(64),
-                    tip_ttl_ms: Some(400),
-                    ..ChainOverride::default()
-                },
-            ],
+            chain_overrides: Vec::new(),
         }
     }
 }
@@ -302,5 +287,18 @@ mod tests {
         .expect("parse config");
         assert_eq!(config.endpoint_limits(1, "https://rpc.example"), (7, 3));
         assert_eq!(config.endpoint_limits(1, "https://other.example"), (15, 8));
+    }
+
+    #[test]
+    fn repository_config_is_valid() {
+        let config = Config::from_toml(include_str!("../config.toml")).expect("repository config");
+        assert_eq!(config.chains, [1, 143]);
+    }
+
+    #[test]
+    fn partial_config_can_select_one_chain() {
+        let config = Config::from_toml("chains = [1]").expect("single-chain config");
+        assert_eq!(config.chains, [1]);
+        assert!(config.chain_overrides.is_empty());
     }
 }
