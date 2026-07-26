@@ -30,7 +30,8 @@ rpcrouter 是一个 Rust 实现的区块链节点 RPC 路由网关：聚合 [cha
 
 - `docs/research/` — Grok 调研产出（只读参考）
 - `docs/DESIGN.md` — 架构方案（主会话维护）
-- `docs/TASKS.md` — 阶段任务拆解与验收标准（主会话维护，Codex 按此实现）
+- `docs/TASKS.md` — v1 阶段任务拆解与验收标准（已完成，存档）
+- `docs/ROADMAP.md` — v1 后规划：部署 / 生产可用 / 命名链路由（P1–P4）
 
 ## 技术与工程约定
 
@@ -53,5 +54,4 @@ rpcrouter 是一个 Rust 实现的区块链节点 RPC 路由网关：聚合 [cha
 - [x] 验收：8 链真实 E2E；10k QPS 压测双跑验证（docs/reports/loadtest-phase3.md）；
       429 摘除/回池时间线复现；`user_visible_errors == 0`
 
-v1 已交付。后续方向（未排期）：WebSocket 订阅、多实例共享缓存、simd-json 热路径、
-压测进 CI。
+v1 已交付（2026-07-26 验收）。后续任务规划统一沉淀在 `docs/ROADMAP.md`。
