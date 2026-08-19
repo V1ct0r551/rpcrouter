@@ -5,6 +5,11 @@
 
 ## P1 部署（让它跑在服务器上）
 
+> **✅ P1 全部完成**（2026-08-20 验收，见 docs/reports/prod-readiness.md）：
+> Dockerfile 多阶段（rust:1.97 → bookworm-slim，36MB，非 root + HEALTHCHECK）、
+> `RPCROUTER_*` 环境变量覆写、docker-compose（含 monitoring profile）、systemd 样例、
+> release profile 调优；`docker run` 单命令起服务后 8 链真实 smoke 通过。
+
 1. **Dockerfile**：多阶段构建（rust:1.97 → debian-slim/distroless），release + strip；
    `data/` 挂卷（chainlist 磁盘缓存跨重启复用）。
 2. **docker-compose.yml**：环境变量化关键配置项（listen、chains、缓存容量）。
@@ -15,8 +20,12 @@
 
 ## P2 生产可用（放心接真实流量）
 
-> **P2.1 / P2.2 / P2.6 已实现**（w2-hardening 分支，2026 落地）：
-> 优雅退出、入口防护（请求体上限/全局背压/每 IP 限速）、/metrics bearer token 鉴权。
+> **✅ P2.1–P2.4 / P2.6 已完成，P2.5 部分完成**（2026-08-20 验收，见 docs/reports/prod-readiness.md）：
+> 优雅退出、入口防护（请求体上限/全局背压/每 IP 限速）、/metrics bearer token 鉴权、
+> Prometheus 告警 5 条 + Grafana 仪表盘（monitoring profile 实跑验证）、GitHub Actions CI
+> 首跑绿灯（fmt/clippy/test/进程级优雅退出用例/release 构建/1k QPS 离线冒烟）。
+> P2.5 soak：真实网络 30 分钟 × 5 QPS × 8 链已过（0 错误，摘除机制被真实 429 触发验证）；
+> **24h 长跑仍待执行**（scripts/soak.sh 已就绪，`--duration 86400` 即可）。
 >
 > **语义边界（重要）**：`user_visible_errors` 是**上游侧承诺指标**——请求已进入数据面
 > 转发，但所有上游端点耗尽（见 forward.rs 的 `exhausted()`）。入口防护（过载 503、

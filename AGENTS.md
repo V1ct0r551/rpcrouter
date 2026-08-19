@@ -55,3 +55,7 @@ rpcrouter 是一个 Rust 实现的区块链节点 RPC 路由网关：聚合 [cha
       429 摘除/回池时间线复现；`user_visible_errors == 0`
 
 v1 已交付（2026-07-26 验收）。后续任务规划统一沉淀在 `docs/ROADMAP.md`。
+
+- [x] ROADMAP P1 部署 + P2 生产可用（2026-08-20 验收，maker/checker 对抗流程交付；
+      真实环境验收见 `docs/reports/prod-readiness.md`：docker 8 链 smoke、加固特性实测、
+      监控栈实跑、CI 首跑绿灯、30 分钟真实网络 soak 0 错误）。遗留：24h soak、P3 命名链路由。
