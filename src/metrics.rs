@@ -9,7 +9,7 @@ use std::{
 
 use dashmap::DashMap;
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
     Registry as PrometheusRegistry, TextEncoder,
 };
 
@@ -18,6 +18,8 @@ use crate::registry::{EndpointStatsSnapshot, Registry};
 pub struct Metrics {
     registry: PrometheusRegistry,
     ingress: IntCounterVec,
+    ingress_rejected: IntCounterVec,
+    in_flight: IntGauge,
     cache_lookups: IntCounterVec,
     cache_hits: IntCounterVec,
     cache_hit_ratio: GaugeVec,
@@ -65,6 +67,22 @@ impl Metrics {
                 "Ingress JSON-RPC requests; use rate() for QPS.",
             ),
             &["chain_id"],
+        )?;
+        // 入口防护拒绝计数（过载/请求体过大/每 IP 限速）。注意：这些拒绝发生在
+        // 数据面转发之前，属于入口侧防护，**不**计入 user_visible_errors——后者是
+        // 上游侧承诺指标（请求已进入转发但所有上游端点耗尽）。告警规则若要表达
+        // “上游承诺失败”，只应看 user_visible_errors；ingress_rejected 是过载信号，
+        // 二者语义边界不可混淆。
+        let ingress_rejected = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_ingress_rejected_total",
+                "Requests rejected at the ingress guard before forwarding. Not part of user_visible_errors.",
+            ),
+            &["reason"],
+        )?;
+        let in_flight = IntGauge::new(
+            "rpcrouter_in_flight_requests",
+            "Number of ingress requests currently in flight (before guard passes).",
         )?;
         let cache_lookups = IntCounterVec::new(
             Opts::new(
@@ -183,6 +201,8 @@ impl Metrics {
 
         for collector in [
             Box::new(ingress.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(ingress_rejected.clone()),
+            Box::new(in_flight.clone()),
             Box::new(cache_lookups.clone()),
             Box::new(cache_hits.clone()),
             Box::new(cache_hit_ratio.clone()),
@@ -206,6 +226,8 @@ impl Metrics {
         Ok(Self {
             registry,
             ingress,
+            ingress_rejected,
+            in_flight,
             cache_lookups,
             cache_hits,
             cache_hit_ratio,
@@ -231,6 +253,20 @@ impl Metrics {
         self.ingress
             .with_label_values(&[&chain_id.to_string()])
             .inc();
+    }
+
+    /// 入口防护拒绝计数。reason 取值：overload / body_too_large / rate_limited。
+    /// 此计数**不属于** user_visible_errors（上游侧承诺指标）。
+    pub fn record_ingress_rejected(&self, reason: &str) {
+        self.ingress_rejected.with_label_values(&[reason]).inc();
+    }
+
+    pub fn in_flight_inc(&self) {
+        self.in_flight.inc();
+    }
+
+    pub fn in_flight_dec(&self) {
+        self.in_flight.dec();
     }
 
     pub fn record_cache_lookup(&self, chain_id: u64, hit: bool) {

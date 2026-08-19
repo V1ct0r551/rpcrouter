@@ -10,6 +10,13 @@ use serde::Deserialize;
 
 pub const MAX_BATCH_SIZE: usize = 100;
 
+/// 默认请求体大小上限（256 KiB）。
+pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024;
+/// 默认全局并发上限（在飞请求数）。
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1024;
+/// 默认优雅退出排空 deadline（10 秒）。
+pub const DEFAULT_SHUTDOWN_DEADLINE_MS: u64 = 10_000;
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -74,6 +81,26 @@ impl Config {
         }
         if self.server.batch_limit == 0 || self.server.batch_limit > MAX_BATCH_SIZE {
             bail!("server.batch_limit must be between 1 and {MAX_BATCH_SIZE}");
+        }
+        if self.server.max_body_bytes == 0 {
+            bail!("server.max_body_bytes must be greater than zero");
+        }
+        if self.server.max_concurrent_requests == 0 {
+            bail!("server.max_concurrent_requests must be greater than zero");
+        }
+        if self.server.shutdown_deadline_ms == 0 {
+            bail!("server.shutdown_deadline_ms must be greater than zero");
+        }
+        if self.server.per_ip_rate_limit.enabled
+            && (self.server.per_ip_rate_limit.requests_per_second == 0
+                || self.server.per_ip_rate_limit.burst == 0)
+        {
+            bail!("per_ip_rate_limit rate and burst must be greater than zero");
+        }
+        if let Some(token) = &self.server.metrics_auth_token
+            && token.is_empty()
+        {
+            bail!("server.metrics_auth_token must not be empty");
         }
         if self.chainlist.refresh_seconds == 0 {
             bail!("chainlist.refresh_seconds must be greater than zero");
@@ -177,12 +204,48 @@ impl Config {
 #[serde(default)]
 pub struct ServerConfig {
     pub batch_limit: usize,
+    /// 优雅退出时等待在飞请求排空的 deadline（毫秒）。超时强制退出。
+    pub shutdown_deadline_ms: u64,
+    /// 入口请求体大小上限（字节），超限返回 HTTP 413 + JSON-RPC 错误体。
+    pub max_body_bytes: usize,
+    /// 全局并发上限（同时在飞的入口请求数），超限快速拒绝（HTTP 503 + JSON-RPC 错误体）。
+    pub max_concurrent_requests: usize,
+    /// 每 IP 限速配置，默认关闭。
+    pub per_ip_rate_limit: PerIpRateLimitConfig,
+    /// /metrics 端点 bearer token 鉴权开关，None 表示不鉴权。
+    pub metrics_auth_token: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             batch_limit: MAX_BATCH_SIZE,
+            shutdown_deadline_ms: DEFAULT_SHUTDOWN_DEADLINE_MS,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            per_ip_rate_limit: PerIpRateLimitConfig::default(),
+            metrics_auth_token: None,
+        }
+    }
+}
+
+/// 每 IP 限速配置。默认关闭（`enabled = false`）。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct PerIpRateLimitConfig {
+    pub enabled: bool,
+    /// 每秒允许的请求数。
+    pub requests_per_second: u64,
+    /// 突发容量（token bucket 桶大小）。
+    pub burst: u64,
+}
+
+impl Default for PerIpRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            requests_per_second: 20,
+            burst: 40,
         }
     }
 }
@@ -378,5 +441,75 @@ mod tests {
         let config = Config::from_toml("chains = [1]").expect("single-chain config");
         assert_eq!(config.chains, [1]);
         assert!(config.chain_overrides.is_empty());
+    }
+
+    #[test]
+    fn hardening_defaults_are_safe() {
+        let config = Config::default();
+        assert_eq!(config.server.shutdown_deadline_ms, 10_000);
+        assert_eq!(config.server.max_body_bytes, 256 * 1024);
+        assert_eq!(config.server.max_concurrent_requests, 1024);
+        assert!(!config.server.per_ip_rate_limit.enabled);
+        assert_eq!(config.server.metrics_auth_token, None);
+    }
+
+    #[test]
+    fn hardening_rejects_unsafe_values() {
+        assert!(
+            Config::from_toml("chains=[1]\n[server]\nmax_body_bytes=0")
+                .unwrap_err()
+                .to_string()
+                .contains("max_body_bytes")
+        );
+        assert!(
+            Config::from_toml("chains=[1]\n[server]\nmax_concurrent_requests=0")
+                .unwrap_err()
+                .to_string()
+                .contains("max_concurrent_requests")
+        );
+        assert!(
+            Config::from_toml("chains=[1]\n[server]\nshutdown_deadline_ms=0")
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown_deadline_ms")
+        );
+        assert!(
+            Config::from_toml(
+                "chains=[1]\n[server.per_ip_rate_limit]\nenabled=true\nrequests_per_second=0"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("per_ip_rate_limit")
+        );
+        assert!(
+            Config::from_toml("chains=[1]\n[server]\nmetrics_auth_token=\"\"")
+                .unwrap_err()
+                .to_string()
+                .contains("metrics_auth_token")
+        );
+    }
+
+    #[test]
+    fn hardening_accepts_configured_values() {
+        let config = Config::from_toml(
+            r#"
+                chains = [1]
+                [server]
+                shutdown_deadline_ms = 5000
+                max_body_bytes = 1048576
+                max_concurrent_requests = 64
+                metrics_auth_token = "secret"
+                [server.per_ip_rate_limit]
+                enabled = true
+                requests_per_second = 50
+                burst = 100
+            "#,
+        )
+        .expect("valid hardening config");
+        assert_eq!(config.server.shutdown_deadline_ms, 5_000);
+        assert_eq!(config.server.max_body_bytes, 1_048_576);
+        assert_eq!(config.server.max_concurrent_requests, 64);
+        assert!(config.server.per_ip_rate_limit.enabled);
+        assert_eq!(config.server.metrics_auth_token.as_deref(), Some("secret"));
     }
 }
