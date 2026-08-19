@@ -1,0 +1,45 @@
+# rpcrouter systemd 服务样例。
+#
+# 安装步骤（示例，路径请按部署环境调整）：
+#   1. 把编译产物放到可执行路径，例如 /usr/local/bin/rpcrouter；
+#   2. 把 config.toml 放到 /etc/rpcrouter/config.toml，并确认 data 目录可写：
+#        mkdir -p /etc/rpcrouter/data
+#   3. 复制本文件到 /etc/systemd/system/rpcrouter.service；
+#   4. systemctl daemon-reload && systemctl enable --now rpcrouter。
+#
+# 要点说明：
+#   - LimitNOFILE=65536：压测报告显示 fd 上限是本机吞吐瓶颈，
+#     高并发代理请求需要足够的文件描述符额度；
+#   - Restart=always：冷启动 Probation 兜底保证重启过程无故障窗口，
+#     进程异常退出后由 systemd 自动拉起；
+#   - User：以受限的非 root 账户运行，遵循最小权限原则；
+#   - 环境变量 RPCROUTER_* 可覆写配置关键项（见 config.rs apply_env_overrides）。
+
+[Unit]
+Description=rpcrouter EVM JSON-RPC routing gateway
+Documentation=file:///usr/share/doc/rpcrouter/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rpcrouter
+Group=rpcrouter
+WorkingDirectory=/etc/rpcrouter
+# 高并发场景下的文件描述符上限（压测验证的关键瓶颈）。
+LimitNOFILE=65536
+# 进程异常退出即自动重启；配合冷启动 Probation 兜底，无故障重启窗口。
+Restart=always
+RestartSec=3
+# 启动超时与优雅停止窗口。
+TimeoutStartSec=60
+TimeoutStopSec=20
+# 配置与 chainlist 磁盘缓存所在目录；缓存跨重启复用。
+Environment=RPCROUTER_CONFIG=/etc/rpcrouter/config.toml
+Environment=RPCROUTER_CHAINLIST_CACHE_PATH=/etc/rpcrouter/data/rpcs.json
+# 例：如需通过环境变量调整启用链，可追加：
+# Environment=RPCROUTER_CHAINS=1,143,56,137,42161,8453,10,43114
+ExecStart=/usr/local/bin/rpcrouter
+
+[Install]
+WantedBy=multi-user.target
