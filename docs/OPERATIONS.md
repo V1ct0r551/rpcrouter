@@ -96,11 +96,11 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
 ## 6. 校验监控文件
 
 ```sh
-# promtool 校验告警规则与抓取配置（镜像内置 promtool）
-docker run --rm -v "$PWD/ops/prometheus:/etc/prometheus:ro" \
-  prom/prometheus:latest promtool check rules /etc/prometheus/alerts.yml
-docker run --rm -v "$PWD/ops/prometheus:/etc/prometheus:ro" \
-  prom/prometheus:latest promtool check config /etc/prometheus/prometheus.yml
+# promtool 校验告警规则与抓取配置（镜像 entrypoint 是 prometheus，需显式换成 promtool）
+docker run --rm --entrypoint promtool -v "$PWD/ops/prometheus:/etc/prometheus:ro" \
+  prom/prometheus:latest check rules /etc/prometheus/alerts.yml
+docker run --rm --entrypoint promtool -v "$PWD/ops/prometheus:/etc/prometheus:ro" \
+  prom/prometheus:latest check config /etc/prometheus/prometheus.yml
 
 # 校验 compose（含 monitoring profile 的挂载路径）
 docker compose --profile monitoring config
