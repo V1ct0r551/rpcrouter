@@ -97,10 +97,17 @@ impl Config {
         {
             bail!("per_ip_rate_limit rate and burst must be greater than zero");
         }
-        if let Some(token) = &self.server.metrics_auth_token
-            && token.is_empty()
-        {
-            bail!("server.metrics_auth_token must not be empty");
+        if let Some(token) = &self.server.metrics_auth_token {
+            if token.is_empty() {
+                bail!("server.metrics_auth_token must not be empty");
+            }
+            // token 会被放进 Authorization: Bearer <token> 头，必须能用 HTTP header 值表达，
+            // 否则在构建 BearerAuth 时无法编码（会 panic）。
+            if token.bytes().any(is_header_control) {
+                bail!(
+                    "server.metrics_auth_token contains characters not allowed in an HTTP header value"
+                );
+            }
         }
         if self.chainlist.refresh_seconds == 0 {
             bail!("chainlist.refresh_seconds must be greater than zero");
@@ -370,6 +377,11 @@ impl Default for HedgingConfig {
             min_active_endpoints: 2,
         }
     }
+}
+
+/// HTTP header 值中不允许的字节：除 HTAB(0x09) 外的控制字符（0x00–0x1F）与 DEL(0x7F)。
+fn is_header_control(byte: u8) -> bool {
+    (byte < 0x20 && byte != 0x09) || byte == 0x7f
 }
 
 #[cfg(test)]

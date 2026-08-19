@@ -15,6 +15,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use axum::{
@@ -45,6 +46,9 @@ pub struct IpRateLimiter {
 }
 
 impl IpRateLimiter {
+    /// 后台清理周期：周期性地丢弃过期 IP 桶，防止每个唯一 IP 永久驻留内存。
+    pub const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60);
+
     pub fn new(requests_per_second: u64, burst: u64) -> Self {
         let rps = std::num::NonZeroU32::new(requests_per_second as u32)
             .expect("rate must be greater than zero");
@@ -59,6 +63,21 @@ impl IpRateLimiter {
     /// 尝试放行给定客户端地址；返回 false 表示该 IP 超限。
     pub fn allow(&self, addr: SocketAddr) -> bool {
         self.limiter.check_key(&addr).is_ok()
+    }
+
+    /// 启动后台清理任务：周期性调用 retain_recent() 丢弃已恢复到"全新"状态的桶，
+    /// 保证每 IP 限速的内存有界（每个唯一 IP 不会永久驻留）。
+    pub fn spawn_housekeeping(self: &Arc<Self>) {
+        let limiter = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Self::HOUSEKEEPING_INTERVAL);
+            // 先 tick 掉第一次立即触发，从下一周期开始清理。
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                limiter.limiter.retain_recent();
+            }
+        });
     }
 }
 
@@ -137,13 +156,12 @@ where
         // try_acquire_owned：拿不到 permit 说明已过载，立即拒绝，不排队。
         match self.semaphore.clone().try_acquire_owned() {
             Ok(permit) => {
-                self.metrics.in_flight_inc();
+                let guard = InFlightGuard::new(Arc::clone(&self.metrics));
                 let mut inner = self.inner.clone();
-                let metrics = Arc::clone(&self.metrics);
                 Box::pin(async move {
                     let _permit = permit;
+                    let _guard = guard;
                     let response = inner.ready().await.unwrap().call(request).await.unwrap();
-                    metrics.in_flight_dec();
                     Ok(response)
                 })
             }
@@ -159,6 +177,25 @@ where
                 })
             }
         }
+    }
+}
+
+/// 在飞计数 drop guard：构造时 +1，Drop 时 -1。
+/// 用 RAII 保证即使请求 future 被取消（比如强制退出/超时），in_flight gauge 也一定回落。
+struct InFlightGuard {
+    metrics: Arc<Metrics>,
+}
+
+impl InFlightGuard {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        metrics.in_flight_inc();
+        Self { metrics }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.metrics.in_flight_dec();
     }
 }
 

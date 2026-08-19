@@ -66,8 +66,11 @@ impl AppState {
     ) -> Self {
         self.max_body_bytes = max_body_bytes;
         self.concurrency = Arc::new(Semaphore::new(max_concurrent_requests));
-        self.rate_limiter =
-            per_ip_rate_limit.map(|(rps, burst)| Arc::new(IpRateLimiter::new(rps, burst)));
+        if let Some((rps, burst)) = per_ip_rate_limit {
+            let limiter = Arc::new(IpRateLimiter::new(rps, burst));
+            limiter.spawn_housekeeping();
+            self.rate_limiter = Some(limiter);
+        }
         self.metrics_auth = metrics_auth_token.map(|token| BearerAuth::new(&token));
         self
     }
