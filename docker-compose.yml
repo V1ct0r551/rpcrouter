@@ -1,0 +1,80 @@
+# rpcrouter 部署编排。
+# 基础 profile：仅运行网关服务，挂载 data 卷并给出环境变量覆写示例。
+# monitoring profile（`docker compose --profile monitoring up -d`）额外拉起
+# Prometheus + Grafana，引用 ./ops/prometheus/prometheus.yml 与 ./ops/grafana/；
+# 这些 ops 文件由另一工作流提供，当前缺失时基础 profile 不受影响。
+
+services:
+  rpcrouter:
+    image: rpcrouter:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rpcrouter
+    restart: unless-stopped
+    ports:
+      - "8545:8545"
+    volumes:
+      # chainlist 磁盘缓存跨重启复用；若需使用外部配置文件，可追加挂载 config.toml。
+      - rpcrouter-data:/app/data
+    environment:
+      # 环境变量覆写 config 关键项（详见 config.rs 的 apply_env_overrides）。
+      RPCROUTER_LISTEN: "0.0.0.0:8545"
+      RPCROUTER_CHAINS: "1,143,56,137,42161,8453,10,43114"
+      RPCROUTER_CACHE_MAX_BYTES: "536870912"
+      RPCROUTER_METRICS_ENABLED: "true"
+      RPCROUTER_CHAINLIST_REFRESH_SECONDS: "21600"
+      RPCROUTER_CHAINLIST_CACHE_PATH: "/app/data/rpcs.json"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8545/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    networks:
+      - rpcrouter-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["monitoring"]
+    container_name: rpcrouter-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - rpcrouter
+    networks:
+      - rpcrouter-net
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["monitoring"]
+    container_name: rpcrouter-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - rpcrouter-net
+
+volumes:
+  rpcrouter-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  rpcrouter-net:
+    driver: bridge
