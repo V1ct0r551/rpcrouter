@@ -73,6 +73,60 @@ Phase 3 本机离线压测以 10,000 QPS 调度 60 秒，共 600,000 次请求�
 峰值 3 QPS，未超过 15 rps 上限。环境、方法和 429 摘除/回池时间线见
 [Phase 3 压测报告](docs/reports/loadtest-phase3.md)。
 
+## 部署
+
+本仓库提供 Docker、docker-compose 与 systemd 三种部署方式。三种方式都支持用
+`RPCROUTER_*` 环境变量覆写配置关键项（listen 地址、启用链、缓存容量等），详见
+`src/config.rs` 的 `apply_env_overrides`。
+
+### 单条 docker 命令
+
+多阶段构建已封装在 `Dockerfile` 中（rust:1.97 builder → debian:bookworm-slim），
+运行时挂载 `data/` 卷以复用 chainlist 磁盘缓存：
+
+```sh
+# 先构建镜像
+docker build -t rpcrouter:latest .
+
+# 一条命令起服务：仅暴露 8545，data 卷跨重启复用缓存
+docker run -d --name rpcrouter \
+  -p 8545:8545 \
+  -v rpcrouter-data:/app/data \
+  rpcrouter:latest
+```
+
+如需通过环境变量调整启用链：
+
+```sh
+docker run -d --name rpcrouter \
+  -p 8545:8545 \
+  -e RPCROUTER_CHAINS=1,56,137 \
+  -e RPCROUTER_CACHE_MAX_BYTES=268435456 \
+  -v rpcrouter-data:/app/data \
+  rpcrouter:latest
+```
+
+### docker-compose
+
+`docker-compose.yml` 提供网关服务（含 data 卷与环境变量覆写示例）：
+
+```sh
+docker compose up -d
+# 含 Prometheus/Grafana 监控（需先由 ops 工作流提供 ./ops/ 下文件）：
+docker compose --profile monitoring up -d
+```
+
+### systemd
+
+样例位于 `deploy/rpcrouter.service`。安装后 `Restart=always` 保证异常退出自动拉起，
+`LimitNOFILE=65536` 消除高并发下的 fd 瓶颈（压测验证的关键点）：
+
+```sh
+sudo cp deploy/rpcrouter.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rpcrouter
+```
+
 ## 部署注意事项
 
 - 使用 `cargo build --release --bin rpcrouter`，以受限的非 root 账户运行，并将配置和

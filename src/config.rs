@@ -17,6 +17,26 @@ pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1024;
 /// 默认优雅退出排空 deadline（10 秒）。
 pub const DEFAULT_SHUTDOWN_DEADLINE_MS: u64 = 10_000;
 
+/// 环境变量覆写的前缀：`RPCROUTER_*`。
+pub const ENV_PREFIX: &str = "RPCROUTER_";
+
+/// 读取非空环境变量；未设置或为空串时返回 `None`。
+fn env_non_empty(key: &str) -> Option<String> {
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+/// 解析布尔环境变量，接受 1/0/true/false（大小写不敏感）。
+fn parse_bool(raw: &str, key: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{key} is not a valid boolean"),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -63,6 +83,47 @@ impl Config {
                 Err(error).with_context(|| format!("failed to read config {}", path.display()))
             }
         }
+    }
+
+    /// 用 `RPCROUTER_` 前缀的环境变量覆写加载后的配置关键项，用于容器化/托管部署
+    /// 在不改动 config.toml 的前提下调整 listen 地址、启用链、缓存容量等。
+    /// 只在环境变量存在时覆写；空字符串按未设置处理。
+    pub fn apply_env_overrides(&mut self) -> Result<()> {
+        if let Some(raw) = env_non_empty("RPCROUTER_LISTEN") {
+            self.listen = raw
+                .parse()
+                .context("RPCROUTER_LISTEN is not a valid listen address")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_CHAINS") {
+            let mut chains = Vec::new();
+            for part in raw.split(',').map(str::trim) {
+                if part.is_empty() {
+                    continue;
+                }
+                let id: u64 = part.parse().with_context(|| {
+                    format!("RPCROUTER_CHAINS entry `{part}` is not a chain id")
+                })?;
+                chains.push(id);
+            }
+            self.chains = chains;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_CACHE_MAX_BYTES") {
+            self.cache.max_bytes = raw
+                .parse()
+                .context("RPCROUTER_CACHE_MAX_BYTES is not a valid byte count")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_METRICS_ENABLED") {
+            self.metrics_enabled = parse_bool(&raw, "RPCROUTER_METRICS_ENABLED")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_CHAINLIST_REFRESH_SECONDS") {
+            self.chainlist.refresh_seconds = raw
+                .parse()
+                .context("RPCROUTER_CHAINLIST_REFRESH_SECONDS is not a valid duration")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_CHAINLIST_CACHE_PATH") {
+            self.chainlist.cache_path = PathBuf::from(raw);
+        }
+        self.validate()
     }
 
     pub fn from_toml(contents: &str) -> Result<Self> {
@@ -501,6 +562,51 @@ mod tests {
         );
     }
 
+    /// 环境变量是进程全局状态，跨测试并发出可能互相干扰；用静态锁串行化。
+    fn with_env<'a>(vars: &[(&str, &str)], f: impl FnOnce() + 'a) {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (key, value) in vars {
+            // Rust 2024 中设置环境变量是不安全操作，测试内显式授权。
+            unsafe { std::env::set_var(*key, *value) };
+        }
+        f();
+        for (key, _) in vars {
+            unsafe { std::env::remove_var(*key) };
+        }
+    }
+
+    #[test]
+    fn env_overrides_listen_chains_and_cache() {
+        with_env(
+            &[
+                ("RPCROUTER_LISTEN", "127.0.0.1:9999"),
+                ("RPCROUTER_CHAINS", "1, 56,137"),
+                ("RPCROUTER_CACHE_MAX_BYTES", "1048576"),
+                ("RPCROUTER_METRICS_ENABLED", "0"),
+                ("RPCROUTER_CHAINLIST_REFRESH_SECONDS", "120"),
+                ("RPCROUTER_CHAINLIST_CACHE_PATH", "/tmp/rpcrs.json"),
+            ],
+            || {
+                let mut config = Config::default();
+                config
+                    .apply_env_overrides()
+                    .expect("env overrides should apply");
+                assert_eq!(config.listen.to_string(), "127.0.0.1:9999");
+                assert_eq!(config.chains, [1, 56, 137]);
+                assert_eq!(config.cache.max_bytes, 1_048_576);
+                assert!(!config.metrics_enabled);
+                assert_eq!(config.chainlist.refresh_seconds, 120);
+                assert_eq!(
+                    config.chainlist.cache_path,
+                    std::path::PathBuf::from("/tmp/rpcrs.json")
+                );
+            },
+        );
+    }
+
     #[test]
     fn hardening_accepts_configured_values() {
         let config = Config::from_toml(
@@ -523,5 +629,31 @@ mod tests {
         assert_eq!(config.server.max_concurrent_requests, 64);
         assert!(config.server.per_ip_rate_limit.enabled);
         assert_eq!(config.server.metrics_auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn env_empty_value_is_ignored() {
+        with_env(
+            &[("RPCROUTER_LISTEN", ""), ("RPCROUTER_CHAINS", "")],
+            || {
+                let mut config = Config::default();
+                config
+                    .apply_env_overrides()
+                    .expect("empty env should be ignored");
+                assert_eq!(config.listen.to_string(), "0.0.0.0:8545");
+                assert_eq!(config.chains, [1, 143]);
+            },
+        );
+    }
+
+    #[test]
+    fn env_invalid_values_are_rejected() {
+        with_env(&[("RPCROUTER_CACHE_MAX_BYTES", "not-a-number")], || {
+            let mut config = Config::default();
+            let error = config
+                .apply_env_overrides()
+                .expect_err("invalid cache size should fail");
+            assert!(error.to_string().contains("RPCROUTER_CACHE_MAX_BYTES"));
+        });
     }
 }
