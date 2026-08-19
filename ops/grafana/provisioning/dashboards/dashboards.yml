@@ -1,0 +1,18 @@
+# rpcrouter Grafana dashboard 提供器（自动加载 ./ops/grafana/dashboards 下的 JSON）。
+# 由 docker-compose.yml 挂载：
+#   ./ops/grafana/provisioning -> /etc/grafana/provisioning
+#   ./ops/grafana/dashboards  -> /var/lib/grafana/dashboards
+# provider 的 options.path 指向 dashboards 卷，任何放入该目录的 *.json 都会被自动注册。
+apiVersion: 1
+
+providers:
+  - name: rpcrouter
+    orgId: 1
+    folder: "rpcrouter"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

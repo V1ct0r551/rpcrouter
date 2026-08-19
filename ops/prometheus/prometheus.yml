@@ -1,0 +1,32 @@
+# rpcrouter Prometheus 抓取配置。
+#
+# 由 docker-compose.yml 的 monitoring profile 挂载到
+#   ./ops/prometheus/prometheus.yml -> /etc/prometheus/prometheus.yml
+# 抓取目标 rpcrouter 是 compose 服务名，在 rpcrouter-net 桥接网络内可达（见 docker-compose.yml）。
+# 本文件同样加载同目录下的 alerts.yml 告警规则。
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  # 告警/抓取与本地时间的关系：规则里用相对时间窗口（如 [2m]），无需绝对时钟对齐。
+  external_labels:
+    monitor: rpcrouter
+
+# 告警规则文件：alerts.yml 与 prometheus.yml 同目录，挂载后也位于 /etc/prometheus/。
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # 网关自身的 /metrics 端点。compose 网络内服务名 + 端口。
+  - job_name: rpcrouter
+    metrics_path: /metrics
+    scheme: http
+    # 默认 compose 未启用 /metrics 鉴权（RPCROUTER_METRICS_ENABLED=true 且未设 metrics_auth_token）。
+    # 若生产启用了 server.metrics_auth_token，请取消下行注释并填入 token（推荐，避免 /metrics 裸奔）：
+    # authorization:
+    #   type: Bearer
+    #   credentials: "REPLACE_WITH_YOUR_TOKEN"
+    static_configs:
+      - targets: ["rpcrouter:8545"]
+        labels:
+          role: gateway

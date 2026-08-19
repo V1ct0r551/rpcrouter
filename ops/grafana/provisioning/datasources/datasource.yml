@@ -1,0 +1,13 @@
+# rpcrouter Grafana 数据源（自动加载）。
+# 由 docker-compose.yml 挂载 ./ops/grafana/provisioning -> /etc/grafana/provisioning。
+# datasource 目录下所有 *.yml 会被 Grafana 扫描。
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # compose 网络内 Prometheus 服务名。
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
