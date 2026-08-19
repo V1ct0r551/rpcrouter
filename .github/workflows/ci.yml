@@ -34,6 +34,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.0
+          # dtolnay 默认 minimal profile，不带 rustfmt/clippy，必须显式声明
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
