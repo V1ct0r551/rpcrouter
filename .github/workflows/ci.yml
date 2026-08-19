@@ -1,0 +1,57 @@
+# CI（ROADMAP P2.4）：三门槛 + 离线压测冒烟档。
+#
+# 触发：push / PR 到 main，另支持手动 workflow_dispatch。
+# 工具链：固定到 MSRV 1.97.0（Cargo.toml 的 rust-version=1.97），满足“1.97/stable”。
+# 离线说明：本仓库所有测试与压测均不触外网——chainlist 用本地样例/缓存、上游行为用
+# 进程内 mock（见 AGENTS.md 约定），故整条流水线可离线稳定复现。
+#
+# 用单 job 顺序执行的理由：
+#   - 步骤共享同一 target/ 目录与 Swatinem/rust-cache 缓存，避免拆 job 重复编译、
+#     重复缓存下载，整体更省时、更稳；
+#   - 冒烟压测依赖前面刚构建的 release 二进制，天然有先后依赖，拆并发无收益；
+#   - 步骤都是几十秒内的小任务，无并行收益，顺序执行最简洁。
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: fmt / clippy / test / smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (MSRV 1.97)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint (clippy, deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (offline suite)
+        run: cargo test
+
+      - name: Test ignored process-level cases (graceful shutdown)
+        # 优雅退出的进程级用例依赖 kill 命令，Linux runner 支持，故显式补跑。
+        run: cargo test -- --ignored
+
+      - name: Build release binaries
+        # loadtest / mock-upstream 供 ci-smoke.sh 复用；release 带 thin LTO。
+        run: cargo build --release --bins
+
+      - name: Offline load smoke (assert user_visible_errors == 0 && p99 below loose threshold)
+        run: bash scripts/ci-smoke.sh
