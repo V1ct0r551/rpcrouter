@@ -26,3 +26,9 @@ toml = "0.9"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# 生产发布优化：thin LTO 在运行期提升显著且链接时间可控；
+# 单 codegen 单元利于跨函数内联与更好的优化结果。
+lto = "thin"
+codegen-units = 1
