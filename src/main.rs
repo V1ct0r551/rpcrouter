@@ -1,13 +1,14 @@
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
+use axum::ServiceExt;
 use rpcrouter::{
     chainlist::ChainlistLoader,
     config::Config,
     forward::Forwarder,
     probe::{ProbeManager, spawn as spawn_probes},
     registry::Registry,
-    server::{AppState, router},
+    server::{AppState, guarded_service_from_state},
 };
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -41,15 +42,45 @@ async fn main() -> Result<()> {
     spawn_probes(probes);
 
     let forwarder = Arc::new(Forwarder::new(Arc::clone(&registry), &config)?);
-    let app = router(
+    let per_ip = if config.server.per_ip_rate_limit.enabled {
+        Some((
+            config.server.per_ip_rate_limit.requests_per_second,
+            config.server.per_ip_rate_limit.burst,
+        ))
+    } else {
+        None
+    };
+    let app = guarded_service_from_state(
         AppState::new(registry, forwarder, config.server.batch_limit)
-            .with_metrics_enabled(config.metrics_enabled),
+            .with_metrics_enabled(config.metrics_enabled)
+            .with_hardening(
+                config.server.max_body_bytes,
+                config.server.max_concurrent_requests,
+                per_ip,
+                config.server.metrics_auth_token.clone(),
+            ),
     );
+
+    // 用 connect-info 注入客户端地址，供每 IP 限速层读取。
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     info!(listen = %config.listen, "rpcrouter listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+
+    // 优雅退出：收到 SIGTERM/SIGINT 后停收新请求并排空在飞请求；
+    // 排空超过 shutdown_deadline_ms 则强制退出。
+    let drain_deadline = Duration::from_millis(config.server.shutdown_deadline_ms);
+    let serve = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal());
+
+    tokio::select! {
+        result = serve => result?,
+        () = drain_after_signal(drain_deadline) => {
+            error!(deadline_ms = %config.server.shutdown_deadline_ms,
+                "shutdown drain deadline exceeded; forcing exit");
+        }
+    }
     Ok(())
 }
 
@@ -74,9 +105,32 @@ fn spawn_chainlist_refresh(
     });
 }
 
+/// 等待 SIGTERM 或 SIGINT（Ctrl-C）。任一信号到达即返回。
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        error!(error = %error, "failed to install shutdown signal handler");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => info!("SIGTERM received"),
+            _ = sigint.recv() => info!("SIGINT received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            error!(error = %error, "failed to install shutdown signal handler");
+        }
     }
     info!("shutdown signal received");
+}
+
+/// 收到退出信号后启动排空 deadline 计时：信号一到即开始倒计时，
+/// 到期返回，触发主循环强制退出。
+async fn drain_after_signal(deadline: Duration) {
+    shutdown_signal().await;
+    info!(deadline = ?deadline, "graceful shutdown started; draining in-flight requests");
+    tokio::time::sleep(deadline).await;
 }

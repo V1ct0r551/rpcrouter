@@ -10,11 +10,12 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json, value::RawValue};
-use tokio::task::JoinSet;
+use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::error;
 
 use crate::{
     forward::{Forwarder, all_endpoints_exhausted},
+    guard::{self, BearerAuth, IpRateLimiter},
     metrics::Metrics,
     registry::Registry,
 };
@@ -26,6 +27,10 @@ pub struct AppState {
     metrics: Arc<Metrics>,
     batch_limit: usize,
     metrics_enabled: bool,
+    max_body_bytes: usize,
+    concurrency: Arc<Semaphore>,
+    rate_limiter: Option<Arc<IpRateLimiter>>,
+    metrics_auth: Option<BearerAuth>,
 }
 
 impl AppState {
@@ -37,6 +42,12 @@ impl AppState {
             metrics,
             batch_limit,
             metrics_enabled: true,
+            max_body_bytes: crate::config::DEFAULT_MAX_BODY_BYTES,
+            concurrency: Arc::new(Semaphore::new(
+                crate::config::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
+            rate_limiter: None,
+            metrics_auth: None,
         }
     }
 
@@ -44,15 +55,67 @@ impl AppState {
         self.metrics_enabled = enabled;
         self
     }
+
+    /// 应用服务器加固参数（请求体上限、并发上限、每 IP 限速、/metrics 鉴权）。
+    pub fn with_hardening(
+        mut self,
+        max_body_bytes: usize,
+        max_concurrent_requests: usize,
+        per_ip_rate_limit: Option<(u64, u64)>,
+        metrics_auth_token: Option<String>,
+    ) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self.concurrency = Arc::new(Semaphore::new(max_concurrent_requests));
+        self.rate_limiter =
+            per_ip_rate_limit.map(|(rps, burst)| Arc::new(IpRateLimiter::new(rps, burst)));
+        self.metrics_auth = metrics_auth_token.map(|token| BearerAuth::new(&token));
+        self
+    }
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/chains", get(chains))
-        .route("/metrics", get(metrics))
-        .route("/rpc/{chain_id}", post(rpc))
-        .with_state(state)
+        .route("/rpc/{chain_id}", post(rpc));
+
+    // /metrics 支持可选的 bearer token 鉴权。
+    if let Some(auth) = state.metrics_auth.clone() {
+        router = router.route("/metrics", get(metrics).layer(auth));
+    } else {
+        router = router.route("/metrics", get(metrics));
+    }
+
+    router.with_state(state)
+}
+
+/// 构建带入口防护层（请求体上限/并发背压/每 IP 限速）的服务。
+///
+/// 防护层必须包在 Router 外层（Router::layer 需要 Sync，而防护层不是），
+/// 故用 tower::ServiceBuilder 直接包裹 Router 服务。
+pub fn guarded_service_from_state(
+    state: AppState,
+) -> tower::util::BoxCloneService<
+    axum::http::Request<axum::body::Body>,
+    Response,
+    std::convert::Infallible,
+> {
+    let guard_metrics = Arc::clone(&state.metrics);
+    let concurrency = Arc::clone(&state.concurrency);
+    let rate_limiter = state.rate_limiter.clone();
+    let max_body_bytes = state.max_body_bytes;
+    let router = router(state);
+    tower::ServiceBuilder::new()
+        .layer_fn(move |inner| {
+            guard::guarded_service(
+                inner,
+                max_body_bytes,
+                Arc::clone(&concurrency),
+                Arc::clone(&guard_metrics),
+                rate_limiter.clone(),
+            )
+        })
+        .service(router)
 }
 
 async fn healthz() -> Json<Value> {
