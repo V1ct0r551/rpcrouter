@@ -3,6 +3,7 @@ pub mod chainlist;
 pub mod classify;
 pub mod config;
 pub mod forward;
+pub mod guard;
 pub mod hedge;
 pub mod metrics;
 pub mod mock_upstream;
