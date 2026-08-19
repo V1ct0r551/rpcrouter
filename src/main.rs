@@ -76,12 +76,21 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         result = serve => result?,
-        () = drain_after_signal(drain_deadline) => {
+        () = drain_after_signal(shutdown_signal(), drain_deadline) => {
+            // 排空超时：axum 的连接是独立 tokio::spawn 任务，#[tokio::main] 在 main 返回时
+            // drop runtime 会无限等待这些任务（慢客户端/挂起连接会让进程退不出去），
+            // 且无法与正常退出（码 0）区分。故这里立即用非零退出码硬退出。
             error!(deadline_ms = %config.server.shutdown_deadline_ms,
-                "shutdown drain deadline exceeded; forcing exit");
+                "shutdown drain deadline exceeded; forcing process exit");
+            std::process::exit(forced_shutdown_exit_code());
         }
     }
     Ok(())
+}
+
+/// 强制退出（排空超时）使用的进程退出码，非零以便与正常退出（0）区分。
+fn forced_shutdown_exit_code() -> i32 {
+    1
 }
 
 fn spawn_chainlist_refresh(
@@ -129,8 +138,42 @@ async fn shutdown_signal() {
 
 /// 收到退出信号后启动排空 deadline 计时：信号一到即开始倒计时，
 /// 到期返回，触发主循环强制退出。
-async fn drain_after_signal(deadline: Duration) {
-    shutdown_signal().await;
+///
+/// `signal` 抽象成参数以便逻辑层测试：生产传 `shutdown_signal()`，测试传已触发的 future。
+async fn drain_after_signal(
+    signal: impl std::future::Future<Output = ()> + Send,
+    deadline: Duration,
+) {
+    signal.await;
     info!(deadline = ?deadline, "graceful shutdown started; draining in-flight requests");
     tokio::time::sleep(deadline).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forced_shutdown_uses_nonzero_exit_code() {
+        // 强退必须非零，正常退出（Ok(())）隐式为 0，二者据此区分（供进程管理器/脚本判断）。
+        assert_ne!(forced_shutdown_exit_code(), 0);
+    }
+
+    #[test]
+    fn drain_after_signal_waits_for_deadline() {
+        // 逻辑层验证 drain_after_signal：信号一触发即开始倒计时，至少等到 deadline 才返回。
+        let start = tokio::time::Instant::now();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                // 传一个已触发的信号 future（async {} 立即完成），模拟 SIGTERM 已到达。
+                drain_after_signal(async {}, Duration::from_millis(80)).await;
+            });
+        assert!(
+            start.elapsed() >= Duration::from_millis(80),
+            "drain deadline window must be respected"
+        );
+    }
 }
