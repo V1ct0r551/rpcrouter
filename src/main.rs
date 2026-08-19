@@ -23,7 +23,8 @@ async fn main() -> Result<()> {
     let config_path = env::var_os("RPCROUTER_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
-    let config = Config::load(&config_path)?;
+    let mut config = Config::load(&config_path)?;
+    config.apply_env_overrides()?;
     info!(path = %config_path.display(), listen = %config.listen, "configuration loaded");
 
     let chainlist = Arc::new(ChainlistLoader::new(&config)?);
