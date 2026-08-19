@@ -42,7 +42,7 @@ if ! "${RUN_CMD[@]}" \
     --qps "${QPS}" \
     --duration "${DURATION}" \
     --concurrency "${CONCURRENCY}" >"$REPORT_JSON" 2> >(sed 's/^/    /' >&2); then
-    echo "    (loadtest exited non-zero; smoke verdict below uses its JSON report)"
+    echo "    (loadtest exited non-zero — its built-in strict acceptance (p99<=50ms, hit-rate>=98%, endpoint rps limit) is for the full 10k benchmark; smoke verdict below re-judges with the loose CI thresholds)"
 fi
 
 # 用 python3 解析 JSON 并断言；python3 在 ubuntu-latest 与常见本机均可用。
@@ -82,6 +82,10 @@ if p99 > threshold_ms:
     ok = False
 if failed != 0:
     print("FAIL: failed_requests must be 0")
+    ok = False
+requested = report.get("requested_qps", 0)
+if qps < requested / 2:
+    print(f"FAIL: achieved_qps {qps:.1f} is below half of requested {requested}; load did not actually run")
     ok = False
 
 if ok:
