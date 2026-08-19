@@ -4,6 +4,20 @@ chains = [1, 143, 56, 137, 42161, 8453, 10, 43114]
 
 [server]
 batch_limit = 100
+# 优雅退出排空 deadline（毫秒）：收到 SIGTERM/SIGINT 后等待在飞请求排空的时长，超时强退。
+shutdown_deadline_ms = 10000
+# 入口请求体大小上限（字节），超限返回 HTTP 413 + JSON-RPC 错误体。
+max_body_bytes = 262144
+# 全局并发上限（同时在飞的入口请求数），过载快速拒绝（HTTP 503 + JSON-RPC 错误体）。
+max_concurrent_requests = 1024
+# /metrics bearer token 鉴权（可选）。默认不鉴权；如需开启，取消注释并填 token。
+# metrics_auth_token = ""
+
+# 每 IP 限速（默认关闭）。
+[server.per_ip_rate_limit]
+enabled = false
+requests_per_second = 20
+burst = 40
 
 [chainlist]
 url = "https://chainlist.org/rpcs.json"

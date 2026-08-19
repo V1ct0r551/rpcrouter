@@ -1,24 +1,32 @@
 # ROADMAP — v1 之后的任务规划
 
 > 2026-07-26 收官时制定。v1 已交付（三硬指标达标，见 docs/reports/loadtest-phase3.md）。
-> 以下按优先级排列，未排期；每项开工前照旧流程：主会话细化验收 → Codex 实现 → 主会话复验。
+> 以下按优先级排列，未排期；每项开工前照旧流程：主会话细化验收 → Codex 实现 → 主会话评审。
 
 ## P1 部署（让它跑在服务器上）
 
 1. **Dockerfile**：多阶段构建（rust:1.97 → debian-slim/distroless），release + strip；
-   暴露 8545；`data/` 挂卷（chainlist 磁盘缓存跨重启复用）。
-2. **docker-compose.yml**：网关 + 可选 Prometheus/Grafana；环境变量覆写 config 关键项
-   （listen、chains、缓存容量）。
+   `data/` 挂卷（chainlist 磁盘缓存跨重启复用）。
+2. **docker-compose.yml**：环境变量化关键配置项（listen、chains、缓存容量）。
 3. **systemd unit** 样例：`LimitNOFILE=65536`（压测报告已注明 fd 上限是本机瓶颈）、
-   Restart=always——冷启动 Probation 兜底已保证重启无故障窗。
-4. release profile 调优：`lto = "thin"`、`codegen-units = 1`。
+   Restart=always——冷启动 Probation 兜底已保证重启可用。
+4. **release profile 调优**：`lto = "thin"`、`codegen-units = 1`。
 5. 验收：`docker run` 一条命令起服务，8 链 smoke 通过；README 部署章节更新。
 
 ## P2 生产可用（放心接真实流量）
 
+> **P2.1 / P2.2 / P2.6 已实现**（w2-hardening 分支，2026 落地）：
+> 优雅退出、入口防护（请求体上限/全局背压/每 IP 限速）、/metrics bearer token 鉴权。
+>
+> **语义边界（重要）**：`user_visible_errors` 是**上游侧承诺指标**——请求已进入数据面
+> 转发，但所有上游端点耗尽（见 forward.rs 的 `exhausted()`）。入口防护（过载 503、
+> 请求体过大 413、每 IP 限速 429）发生在转发**之前**，属于**入口侧拒绝**，只累计到独立的
+> `rpcrouter_ingress_rejected_total{reason=...}`，**不**计入 `user_visible_errors`。
+> 告警规则若要表达“上游承诺失败”，只看 `user_visible_errors`；`ingress_rejected` 是过载信号，
+> 二者不可混用。
+
 1. **优雅退出**：SIGTERM → 停收新请求、在飞请求排空（deadline 内）再退出。
-2. **入口防护**：请求体大小上限、全局并发/背压（tower 层已有基础，补默认值与拒绝语义）、
-   每 IP 可选限速开关。
+2. **入口防护**：请求体大小上限、全局并发/背压、每 IP 可选限速开关。
 3. **告警面**：Prometheus 告警规则清单——`user_visible_errors > 0`、某链 active 端点数
    低水位、cache hit 骤降、上游 429 率突增；Grafana 仪表盘 JSON 入库。
 4. **CI**：GitHub Actions 跑三门槛 + mock 压测冒烟档（如 1k QPS × 10s，防性能回归）；
@@ -33,7 +41,7 @@
 1. **slug 路由**：`/ethereum/...` 等链名路径与 `/rpc/{chainId}` 并存；内置 slug→chainId
    映射（ethereum→1、bsc→56、polygon→137、arbitrum→42161、avax→43114、base→8453、
    op→10、monad→143…），config 可增改；未知 slug 返回 404 + 可用清单。
-2. **API key 路径段**：v1 语义为「兼容形态」——可选开关：off（忽略该段）/ static（比对
+2. **API keys 路径段**：v1 语义为「兼容形态」——可选开关：off（忽略该段）/ static（比对
    配置内 key 表，计数按 key 打点）。完整鉴权计费不做（见 AGENTS.md 非目标）。
 3. **CONSISTENT-HASH 头**：置 true 时按（key 或调用方标识）一致性哈希粘住上游端点
    （健康前提下），服务 filter/分页等对上游状态敏感的调用序列；落在 select 层，
