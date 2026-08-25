@@ -163,6 +163,7 @@ async fn app(
         config: cfg.clone(),
         started: std::time::Instant::now(),
         state_runtime,
+        public_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let service = app_router(AppState::new(registry.clone(), forwarder, 10).with_admin(admin));
     (service, registry, store, controller)
@@ -296,6 +297,7 @@ async fn unavailable_store_returns_503_without_memory_change() {
         config: cfg,
         started: std::time::Instant::now(),
         state_runtime: StateRuntimeSnapshot::new("memory", "test", "test-1"),
+        public_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let service = app_router(AppState::new(registry.clone(), f, 10).with_admin(admin));
     let r = service
@@ -414,6 +416,7 @@ async fn static_spa_fallback_and_disabled_admin() {
         config: cfg,
         started: std::time::Instant::now(),
         state_runtime: StateRuntimeSnapshot::new("memory", "test", "test-1"),
+        public_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let service = app_router(AppState::new(registry, f, 10).with_admin(admin));
     let r = service

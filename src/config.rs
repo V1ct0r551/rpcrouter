@@ -168,6 +168,9 @@ impl Config {
         if let Some(raw) = env_non_empty("RPCROUTER_ADMIN_STATIC_DIR") {
             self.admin.static_dir = Some(PathBuf::from(raw));
         }
+        if let Some(raw) = env_non_empty("RPCROUTER_ADMIN_PUBLIC_SITE") {
+            self.admin.public_site = parse_bool(&raw, "RPCROUTER_ADMIN_PUBLIC_SITE")?;
+        }
         self.validate()
     }
 
@@ -551,6 +554,7 @@ pub struct StateConfig {
 #[serde(default)]
 pub struct AdminConfig {
     pub enabled: bool,
+    pub public_site: bool,
     pub auth_token: Option<String>,
     pub static_dir: Option<PathBuf>,
     pub cors_allow_origins: Vec<String>,
@@ -561,6 +565,7 @@ impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            public_site: true,
             auth_token: None,
             static_dir: None,
             cors_allow_origins: Vec::new(),
@@ -798,6 +803,7 @@ mod tests {
             &[
                 ("RPCROUTER_ADMIN_TOKEN", "secret"),
                 ("RPCROUTER_ADMIN_STATIC_DIR", "/tmp/dashboard"),
+                ("RPCROUTER_ADMIN_PUBLIC_SITE", "false"),
             ],
             || {
                 let mut config = Config::default();
@@ -809,6 +815,7 @@ mod tests {
                     config.admin.static_dir,
                     Some(std::path::PathBuf::from("/tmp/dashboard"))
                 );
+                assert!(!config.admin.public_site);
             },
         );
     }
@@ -860,6 +867,17 @@ mod tests {
                 .apply_env_overrides()
                 .expect_err("invalid cache size should fail");
             assert!(error.to_string().contains("RPCROUTER_CACHE_MAX_BYTES"));
+        });
+    }
+
+    #[test]
+    fn invalid_public_site_env_is_rejected() {
+        with_env(&[("RPCROUTER_ADMIN_PUBLIC_SITE", "maybe")], || {
+            let mut config = Config::default();
+            let error = config
+                .apply_env_overrides()
+                .expect_err("invalid public site boolean");
+            assert!(error.to_string().contains("RPCROUTER_ADMIN_PUBLIC_SITE"));
         });
     }
 }

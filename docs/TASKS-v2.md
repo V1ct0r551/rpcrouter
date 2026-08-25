@@ -156,7 +156,8 @@ W6b 验收（离线，axum `oneshot` + 进程内 mock 上游 + MemoryStore）：
      实际生效（截图或录屏路径写进交付说明）；
 - c) `docker build` 成功且镜像内 `/dashboard/` 可打开。
 
-## W8 — 公共只读主页（分支 `w8-public-site`，worktree `../rpcrouter-w8`）
+## W8 — 公共只读主页（分支 `w8-public-site`）✅ 2026-08-26 合入 main（8 commit；一轮 checker 1 must-fix + 6 should-fix 全修；
+103 单测 + w8_public 7 例；前端 12 例）
 
 > 2026-08-26 用户决策：对外默认页面改为无需登录的只读公共主页，dashboard 退为运维后台。
 > 方案见 DESIGN-v2 §14；本工作流一轮 checker。

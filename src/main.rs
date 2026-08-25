@@ -190,6 +190,7 @@ async fn main() -> Result<()> {
         config: config.clone(),
         started: std::time::Instant::now(),
         state_runtime,
+        public_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let app = guarded_service_from_state(
         AppState::new(registry, forwarder, config.server.batch_limit)

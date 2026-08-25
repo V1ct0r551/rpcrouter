@@ -52,7 +52,7 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 | `hedging` | 只读请求第二发延迟、全局占比和健康池门槛 |
 | `chain_overrides` | 每链块时间、确认深度 K、tip TTL、附加/屏蔽端点及端点限额；可用于非 pinned 链 |
 | `state` | Redis/File/Memory 状态镜像、命名空间、required、flush 周期与健康快照 TTL |
-| `admin` | Admin API 开关、Bearer token、SPA 静态目录与 CORS 来源 |
+| `admin` | Admin API 开关、公共主页开关、Bearer token、SPA 静态目录与 CORS 来源 |
 
 `chains` 是 pinned 链列表：启动即激活且永不因 idle/LRU 降级。动态目录链首个请求才激活，
 随后无流量自动降级为 dormant；`discovery.deny` 链返回 403。
@@ -63,7 +63,7 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 状态存储环境变量：`RPCROUTER_STATE_BACKEND=redis|file`、`RPCROUTER_REDIS_URL`、
 `RPCROUTER_STATE_NAMESPACE`、`RPCROUTER_STATE_RESET=1`。默认 Redis 不可达时自动降级为
 内存 + `data/state.json`，不会中断 RPC 流量；`RPCROUTER_STATE_REQUIRED=true` 用于必须持久化的部署。
-管理面可用 `RPCROUTER_ADMIN_TOKEN` 与 `RPCROUTER_ADMIN_STATIC_DIR` 覆写 token 和 SPA 目录。
+管理面可用 `RPCROUTER_ADMIN_TOKEN`、`RPCROUTER_ADMIN_STATIC_DIR` 与 `RPCROUTER_ADMIN_PUBLIC_SITE` 覆写 token、SPA 目录和公共主页开关。
 
 仓库配置使用偏保守的缓存确认深度。BSC 按 Maxwell 升级后的约 750ms 出块配置；Polygon
 约 2s、Arbitrum 约 250ms，Base、OP 与 Avalanche 约 2s。tip TTL 不超过对应块时间和 2s。
@@ -75,6 +75,9 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 - `GET /chains`：返回各链端点总数、Active/Cooling/Probation 数量、生命周期 `state` 及 head。
 - `GET /healthz`：进程存活时返回 `{"status":"ok"}`；不代表任一上游当前可用。
 - `GET /metrics`：Prometheus 文本指标；`metrics_enabled = false` 时返回 404。
+- `GET /api/public/overview`：无需登录的公共运行概览，返回服务链数、活跃端点和流量摘要。
+- `GET /api/public/chains`：无需登录的只读链目录，支持 `q`、`testnet`、`state`、`sort`、`limit`、`offset`；disabled 链不可见。
+- `GET /api/public/chains/{id}`：无需登录的单链接入信息；未知或 disabled 链返回 404。公共响应只含裁剪后的链摘要，且带 `Cache-Control: public, max-age=5`。
 
 `/metrics` 包含按链的入口、缓存命中/折叠、上游、用户可见错误、延迟、failover 和 hedge
 指标，以及按端点的请求、429、冷却事件与状态。JSON-RPC 上游耗尽仍使用 HTTP 200，响应体为
@@ -107,16 +110,21 @@ curl -X POST -H 'Authorization: Bearer secret' \
 ```
 
 设置 `admin.static_dir` 后 `/dashboard/` 与任意不存在的 dashboard 路径均回退到
-`index.html`，用于托管独立 React dashboard；静态资源不要求 token。
+`index.html`，用于托管独立 React dashboard；静态资源不要求 token。`admin.public_site = true`
+（默认）时，`/` 与 `/chain/{id}` 也返回同一个 SPA 入口，公共页无需 token；设为 `false`
+可只保留运维后台。公共主页负责普通开发者浏览链目录和 curl 接入示例，`/dashboard/*`
+仍是需要 bearer token 的运维控制台。
 
 ### Dashboard
 
 Dashboard 是 `dashboard/` 下的独立 React/Vite 工程。开发时运行 `npm ci && npm run dev`
-（默认把 `/admin` 代理到本机 8545，可用 `VITE_API_BASE` 覆写）；构建运行
+（默认把 `/admin` 与 `/api` 代理到本机 8545，可用 `VITE_API_BASE` 覆写）；构建运行
 `npm run build`，产物位于 `dashboard/dist`。Dockerfile 会在 node 构建阶段生成该产物，
 并以 `RPCROUTER_ADMIN_STATIC_DIR=/app/dashboard` 默认由网关托管 `/dashboard/`，也可将
 静态目录交给任意 Web 服务器并反代 `/admin/api`。在 Settings 页面输入 Bearer token；
 token 只存浏览器 localStorage，并仅通过 Authorization 请求头发送。
+由于 Vite `base=/dashboard/`，`vite dev` 访问根路径会重定向到 `/dashboard/`；公共页本地预览请使用
+`vite preview` 配合网关，或直接连接已构建的后端静态托管入口。
 
 ## 部署
 

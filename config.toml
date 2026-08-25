@@ -65,6 +65,14 @@ required = false
 flush_interval_ms = 2000
 health_ttl_seconds = 86400
 
+[admin]
+enabled = true
+public_site = true
+# auth_token = "..."
+# static_dir = "./dashboard/dist"
+# cors_allow_origins = ["http://localhost:5173"]
+# allow_private_endpoints = false
+
 [[chain_overrides]]
 chain_id = 1
 block_time_ms = 12000

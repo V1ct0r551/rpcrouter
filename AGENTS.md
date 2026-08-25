@@ -73,3 +73,5 @@ v1 已交付（2026-07-26 验收）。后续任务规划统一沉淀在 `docs/RO
         `/admin/api/*` 只读 + 控制接口，bearer 鉴权、静态托管防穿越、输入校验；compose redis +
         cluster 分片 profile（方案 A）；见 docs/reports/w6-state-admin.md）。
   - [x] W7 React dashboard（2026-08-25 合入：总览/链列表/链详情/设置，四门槛 + CI job + 镜像内置）。
+  - [x] W8 公共只读主页（2026-08-26 合入：`/` 与 `/chain/{id}` 无需登录的只读公共页 + `/api/public/*`
+        无鉴权裁剪接口（5s 服务端 memo），dashboard 退为运维后台；`admin.public_site` 开关；DESIGN-v2 §14）。

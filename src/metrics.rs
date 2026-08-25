@@ -10,7 +10,7 @@ use std::{
 use dashmap::DashMap;
 use prometheus::{
     Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    IntGaugeVec, Opts, Registry as PrometheusRegistry, TextEncoder, core::Collector,
+    IntGaugeVec, Opts, Registry as PrometheusRegistry, TextEncoder,
 };
 
 use crate::registry::{EndpointStatsSnapshot, Registry};
@@ -582,36 +582,53 @@ impl Metrics {
     }
 
     pub fn chain_snapshot(&self, chain_id: u64) -> ChainMetricsSnapshot {
-        let chain = chain_id.to_string();
-        let counter = |metric: &IntCounterVec| {
-            metric
-                .collect()
-                .into_iter()
-                .flat_map(|family| family.get_metric().to_vec())
-                .find(|sample| {
-                    sample
-                        .get_label()
-                        .iter()
-                        .any(|label| label.name() == "chain_id" && label.value() == chain)
-                })
-                .map_or(0, |sample| sample.get_counter().value() as u64)
-        };
-        let hedge_totals = self.hedge_totals.get(&chain_id);
-        ChainMetricsSnapshot {
-            ingress: counter(&self.ingress),
-            cache_lookups: counter(&self.cache_lookups),
-            cache_hits: counter(&self.cache_hits),
-            cache_misses: counter(&self.cache_misses),
-            coalesced: counter(&self.coalesced),
-            upstream: hedge_totals
-                .as_ref()
-                .map_or(0, |v| v.upstream.load(Ordering::Relaxed)),
-            user_visible_errors: counter(&self.user_visible_errors),
-            cold_start_failures: counter(&self.cold_start_failures),
-            hedges: hedge_totals
-                .as_ref()
-                .map_or(0, |v| v.hedges.load(Ordering::Relaxed)),
+        self.chain_snapshots().remove(&chain_id).unwrap_or_default()
+    }
+
+    /// 一次 gather 聚合所有链的计数，避免逐链对每个 CounterVec 重复 collect。
+    pub fn chain_snapshots(&self) -> HashMap<u64, ChainMetricsSnapshot> {
+        let mut snapshots = HashMap::<u64, ChainMetricsSnapshot>::new();
+        for family in self.registry.gather() {
+            let field = match family.name() {
+                "rpcrouter_chain_ingress_requests_total" => 0,
+                "rpcrouter_cache_lookups_total" => 1,
+                "rpcrouter_cache_hits_total" => 2,
+                "rpcrouter_cache_misses_total" => 3,
+                "rpcrouter_coalesced_requests_total" => 4,
+                "rpcrouter_user_visible_errors_total" => 5,
+                "rpcrouter_cold_start_failures_total" => 6,
+                _ => continue,
+            };
+            for metric in family.get_metric() {
+                let Some(chain_id) = metric
+                    .get_label()
+                    .iter()
+                    .find(|label| label.name() == "chain_id")
+                    .and_then(|label| label.value().parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                let value = metric.get_counter().value() as u64;
+                let snapshot = snapshots.entry(chain_id).or_default();
+                match field {
+                    0 => snapshot.ingress = value,
+                    1 => snapshot.cache_lookups = value,
+                    2 => snapshot.cache_hits = value,
+                    3 => snapshot.cache_misses = value,
+                    4 => snapshot.coalesced = value,
+                    5 => snapshot.user_visible_errors = value,
+                    6 => snapshot.cold_start_failures = value,
+                    _ => unreachable!(),
+                }
+            }
         }
+        for entry in &self.hedge_totals {
+            let snapshot = snapshots.entry(*entry.key()).or_default();
+            let totals = entry.value();
+            snapshot.upstream = totals.upstream.load(Ordering::Relaxed);
+            snapshot.hedges = totals.hedges.load(Ordering::Relaxed);
+        }
+        snapshots
     }
 
     pub fn in_flight(&self) -> i64 {
@@ -828,5 +845,21 @@ mod tests {
         assert!(encoded.contains("rpcrouter_chain_activations_total 1"));
         assert!(encoded.contains("rpcrouter_chain_demotions_total{reason=\"lru\"} 1"));
         assert!(encoded.contains("rpcrouter_chains{state=\"dormant\"} 1"));
+    }
+
+    #[test]
+    fn gathers_all_chain_snapshots_in_one_batch() {
+        let metrics = Metrics::new().expect("metrics");
+        metrics.record_ingress(1);
+        metrics.record_cache_lookup(1, true);
+        metrics.record_upstream(1, "http://one");
+        metrics.record_ingress(2);
+        metrics.record_user_visible_error(2);
+        let snapshots = metrics.chain_snapshots();
+        assert_eq!(snapshots[&1].ingress, 1);
+        assert_eq!(snapshots[&1].cache_hits, 1);
+        assert_eq!(snapshots[&1].upstream, 1);
+        assert_eq!(snapshots[&2].ingress, 1);
+        assert_eq!(snapshots[&2].user_visible_errors, 1);
     }
 }

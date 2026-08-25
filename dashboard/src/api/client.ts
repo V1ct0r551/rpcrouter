@@ -17,5 +17,16 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}, timeoutM
     return body as T;
   } finally { clearTimeout(timer) }
 }
+export async function publicFetch<T>(path: string, init: RequestInit = {}, timeoutMs = 10000): Promise<T> {
+  const headers = new Headers(init.headers); headers.set('Accept', 'application/json');
+  if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${API_BASE}${path}`, { ...init, headers, signal: init.signal || controller.signal });
+    const text = await response.text(); let body: unknown; try { body = text ? JSON.parse(text) : undefined } catch { body = text }
+    if (!response.ok) throw new ApiError(response.status, `Request failed (${response.status})`, body);
+    return body as T;
+  } finally { clearTimeout(timer) }
+}
 export const post = <T>(path: string, body: unknown = {}) => apiFetch<T>(path, { method: 'POST', body: JSON.stringify(body) });
 export const put = <T>(path: string, body: unknown) => apiFetch<T>(path, { method: 'PUT', body: JSON.stringify(body) });

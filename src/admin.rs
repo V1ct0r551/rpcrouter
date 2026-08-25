@@ -1,5 +1,9 @@
 //! W6b 管理面：只读观测与显式鉴权的运行时控制。
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
@@ -7,7 +11,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{
         HeaderMap, Method, StatusCode, Uri,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
     },
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -41,6 +45,14 @@ pub struct AdminState {
     pub config: Config,
     pub started: Instant,
     pub state_runtime: Arc<tokio::sync::RwLock<StateRuntimeSnapshot>>,
+    pub public_cache: Arc<tokio::sync::Mutex<Option<PublicCache>>>,
+}
+
+#[derive(Clone)]
+pub struct PublicCache {
+    pub built_at: Instant,
+    pub overview: Value,
+    pub rows: Arc<Vec<PublicChainRow>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -142,10 +154,59 @@ pub struct ChainRow {
     pub endpoint_rows: Option<Vec<EndpointRow>>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicChainRow {
+    pub chain_id: u64,
+    pub name: String,
+    pub short_name: Option<String>,
+    pub is_testnet: bool,
+    pub native_symbol: Option<String>,
+    pub explorer_url: Option<String>,
+    pub status: Option<String>,
+    pub state: String,
+    pub catalog_endpoints: usize,
+    pub endpoints: usize,
+    pub active: usize,
+    pub head: u64,
+    pub ingress_total: u64,
+    pub cache_hits_total: u64,
+    pub cache_lookups_total: u64,
+}
+
 /// 默认排序键：生命周期优先（pinned > hot > dormant > disabled）→ 有活跃端点 / 有端点者优先
 /// → 主网优先于测试网 → 流量降序 → chainId 升序兜底。
 fn priority_key(r: &ChainRow) -> (u8, bool, bool, bool, std::cmp::Reverse<u64>, u64) {
-    let rank = match r.state.as_str() {
+    priority_values(
+        &r.state,
+        r.active,
+        r.endpoints,
+        r.is_testnet,
+        r.ingress_total,
+        r.chain_id,
+    )
+}
+
+fn public_priority_key(r: &PublicChainRow) -> (u8, bool, bool, bool, std::cmp::Reverse<u64>, u64) {
+    priority_values(
+        &r.state,
+        r.active,
+        r.endpoints,
+        r.is_testnet,
+        r.ingress_total,
+        r.chain_id,
+    )
+}
+
+fn priority_values(
+    state: &str,
+    active: usize,
+    endpoints: usize,
+    is_testnet: bool,
+    ingress_total: u64,
+    chain_id: u64,
+) -> (u8, bool, bool, bool, std::cmp::Reverse<u64>, u64) {
+    let rank = match state {
         "pinned" => 0,
         "hot" => 1,
         "dormant" => 2,
@@ -154,11 +215,11 @@ fn priority_key(r: &ChainRow) -> (u8, bool, bool, bool, std::cmp::Reverse<u64>, 
     };
     (
         rank,
-        r.active == 0,
-        r.endpoints == 0,
-        r.is_testnet,
-        std::cmp::Reverse(r.ingress_total),
-        r.chain_id,
+        active == 0,
+        endpoints == 0,
+        is_testnet,
+        std::cmp::Reverse(ingress_total),
+        chain_id,
     )
 }
 
@@ -265,8 +326,16 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/api/state/reset", post(state_reset))
         .route("/dashboard", get(static_file))
         .route("/dashboard/", get(static_file))
-        .route("/dashboard/{*path}", get(static_file))
-        .with_state(state.clone());
+        .route("/dashboard/{*path}", get(static_file));
+    if state.config.admin.public_site {
+        router = router
+            .route("/api/public/overview", get(public_overview))
+            .route("/api/public/chains", get(public_chains))
+            .route("/api/public/chains/{id}", get(public_chain_detail))
+            .route("/", get(public_index))
+            .route("/chain/{id}", get(public_index))
+            .route("/chain/{id}/", get(public_index));
+    }
     if !state.config.admin.cors_allow_origins.is_empty() {
         let origins = state
             .config
@@ -288,9 +357,164 @@ pub fn router(state: AdminState) -> Router {
         router = router.layer(layer);
     }
     if enabled {
-        router
+        router.with_state(state)
     } else {
         Router::new().with_state(state)
+    }
+}
+
+fn public_json(value: Value) -> Response {
+    let mut response = Json(value).into_response();
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("public, max-age=5"),
+    );
+    response
+}
+
+async fn public_index(State(s): State<AdminState>, uri: Uri) -> Response {
+    let path = uri.path();
+    if path != "/"
+        && !path.strip_prefix("/chain/").is_some_and(|rest| {
+            let rest = rest.trim_end_matches('/');
+            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+        })
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(dir) = &s.config.admin.static_dir else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    read_static_file(dir, "index.html").await
+}
+
+async fn public_overview(State(s): State<AdminState>) -> Response {
+    let (overview, _) = public_snapshot(&s).await;
+    public_json(overview)
+}
+
+async fn public_chains(State(s): State<AdminState>, Query(query): Query<ChainQuery>) -> Response {
+    if query.q.as_deref().is_some_and(|q| q.chars().count() > 64) {
+        return err(StatusCode::BAD_REQUEST, "invalid_argument", "q is too long");
+    }
+    let (_, cached_rows) = public_snapshot(&s).await;
+    let mut rows = cached_rows
+        .iter()
+        .filter(|r| r.state != "disabled")
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(state) = query.state.as_deref().filter(|x| *x != "all") {
+        rows.retain(|r| r.state.eq_ignore_ascii_case(state) && r.state != "disabled");
+    }
+    if let Some(testnet) = query.testnet {
+        rows.retain(|r| r.is_testnet == testnet);
+    }
+    if let Some(q) = query.q.as_deref() {
+        let q = q.to_ascii_lowercase();
+        rows.retain(|r| {
+            r.chain_id.to_string().contains(&q)
+                || r.name.to_ascii_lowercase().contains(&q)
+                || r.short_name
+                    .as_deref()
+                    .is_some_and(|x| x.to_ascii_lowercase().contains(&q))
+        });
+    }
+    match query.sort.as_deref() {
+        Some("name") => rows.sort_by_key(|r| r.name.clone()),
+        Some("traffic") => rows.sort_by_key(|r| std::cmp::Reverse(r.ingress_total)),
+        Some("chainId") => rows.sort_by_key(|r| r.chain_id),
+        _ => rows.sort_by_key(public_priority_key),
+    }
+    let total = rows.len();
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(100).min(200);
+    let items = rows
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    public_json(json!({"total":total,"items":items}))
+}
+
+async fn public_chain_detail(State(s): State<AdminState>, Path(id): Path<u64>) -> Response {
+    let (_, rows) = public_snapshot(&s).await;
+    let Some(row) = rows
+        .iter()
+        .find(|row| row.chain_id == id && row.state != "disabled")
+        .cloned()
+    else {
+        return err(StatusCode::NOT_FOUND, "not_found", "unknown chain");
+    };
+    public_json(serde_json::to_value(row).unwrap_or_else(|_| json!({})))
+}
+
+async fn public_snapshot(s: &AdminState) -> (Value, Arc<Vec<PublicChainRow>>) {
+    let mut cache = s.public_cache.lock().await;
+    if let Some(snapshot) = cache
+        .as_ref()
+        .filter(|x| x.built_at.elapsed() < Duration::from_secs(5))
+    {
+        return (snapshot.overview.clone(), snapshot.rows.clone());
+    }
+    let metrics = s.metrics.chain_snapshots();
+    let rows = build_rows_with_metrics(s, None, &metrics).await;
+    let catalog = s.registry.catalog().await;
+    let public_rows = Arc::new(
+        rows.iter()
+            .map(|row| public_row(row, catalog.as_deref()))
+            .collect::<Vec<_>>(),
+    );
+    let counts = s.registry.chain_counts().await;
+    let summaries = s.registry.summaries().await;
+    let traffic = summaries.iter().fold(
+        crate::metrics::ChainMetricsSnapshot::default(),
+        |mut total, summary| {
+            let current = metrics.get(&summary.chain_id).copied().unwrap_or_default();
+            total.ingress += current.ingress;
+            total.cache_hits += current.cache_hits;
+            total.cache_lookups += current.cache_lookups;
+            total.upstream += current.upstream;
+            total
+        },
+    );
+    let overview = json!({
+        "process":{"version":env!("CARGO_PKG_VERSION"),"uptimeSeconds":s.started.elapsed().as_secs()},
+        "chains":{"catalog":public_rows.len(),"pinned":counts.pinned,"hot":counts.hot,"dormant":counts.dormant,"disabled":counts.disabled,"serving":public_rows.iter().filter(|r| (r.state == "pinned" || r.state == "hot") && r.active > 0).count()},
+        "endpoints":{"materialized":summaries.iter().map(|x| x.endpoints).sum::<usize>(),"active":summaries.iter().map(|x| x.active).sum::<usize>()},
+        "traffic":{"ingressTotal":traffic.ingress,"cacheHitsTotal":traffic.cache_hits,"cacheLookupsTotal":traffic.cache_lookups,"upstreamTotal":traffic.upstream},
+        "rpc":{"pathTemplate":"/rpc/{chainId}"}
+    });
+    *cache = Some(PublicCache {
+        built_at: Instant::now(),
+        overview: overview.clone(),
+        rows: Arc::clone(&public_rows),
+    });
+    (overview, public_rows)
+}
+
+fn public_row(row: &ChainRow, catalog: Option<&crate::chainlist::Catalog>) -> PublicChainRow {
+    let chain = catalog.and_then(|c| c.lookup(row.chain_id));
+    PublicChainRow {
+        chain_id: row.chain_id,
+        name: row.name.clone(),
+        short_name: row.short_name.clone(),
+        is_testnet: row.is_testnet,
+        native_symbol: chain.and_then(|x| x.native_symbol.clone()),
+        explorer_url: chain.and_then(|x| {
+            x.explorer_url.as_deref().and_then(|url| {
+                let parsed = reqwest::Url::parse(url).ok()?;
+                matches!(parsed.scheme(), "http" | "https").then(|| url.to_owned())
+            })
+        }),
+        status: row.status.clone(),
+        state: row.state.clone(),
+        catalog_endpoints: row.catalog_endpoints,
+        endpoints: row.endpoints,
+        active: row.active,
+        head: row.head,
+        ingress_total: row.ingress_total,
+        cache_hits_total: row.cache_hits_total,
+        cache_lookups_total: row.cache_lookups_total,
     }
 }
 
@@ -322,9 +546,15 @@ async fn overview(State(s): State<AdminState>, headers: HeaderMap) -> Response {
         refreshing: false,
     });
     let total = s.registry.catalog().await.map_or(0, |c| c.chains.len());
+    let metric_snapshots = s.metrics.chain_snapshots();
     let traffic = summaries
         .iter()
-        .map(|x| s.metrics.chain_snapshot(x.chain_id))
+        .map(|x| {
+            metric_snapshots
+                .get(&x.chain_id)
+                .copied()
+                .unwrap_or_default()
+        })
         .fold(
             crate::metrics::ChainMetricsSnapshot::default(),
             |mut a, b| {
@@ -478,6 +708,7 @@ async fn chainlist_refresh(State(s): State<AdminState>, headers: HeaderMap) -> R
             }
             s.registry.set_catalog(x.catalog).await;
             s.registry.apply_snapshot(&x.snapshot).await;
+            *s.public_cache.lock().await = None;
             Json(json!({"source":x.source.label(),"chains":chain_count})).into_response()
         }
         Ok(None) => err(
@@ -605,6 +836,7 @@ async fn chain_action(
         }
     }
     audit(&s, &format!("chain.{action}"), &id.to_string()).await;
+    *s.public_cache.lock().await = None;
     Json(json!({"chainId":id,"state":s.registry.resolve_for_request(id).await.map_or_else(|| "unknown".to_owned(), |value| format!("{:?}", value.state_label()).to_ascii_lowercase())})).into_response()
 }
 
@@ -1103,6 +1335,15 @@ async fn persist_endpoint(
 }
 
 async fn build_rows(s: &AdminState, only: Option<u64>) -> Vec<ChainRow> {
+    let metrics = s.metrics.chain_snapshots();
+    build_rows_with_metrics(s, only, &metrics).await
+}
+
+async fn build_rows_with_metrics(
+    s: &AdminState,
+    only: Option<u64>,
+    metric_snapshots: &HashMap<u64, crate::metrics::ChainMetricsSnapshot>,
+) -> Vec<ChainRow> {
     let catalog = s.registry.catalog().await;
     let summaries: HashMap<u64, _> = s
         .registry
@@ -1127,7 +1368,7 @@ async fn build_rows(s: &AdminState, only: Option<u64>) -> Vec<ChainRow> {
         let state = summary.map_or("dormant".to_owned(), |x| {
             format!("{:?}", x.state).to_ascii_lowercase()
         });
-        let metrics = s.metrics.chain_snapshot(id);
+        let metrics = metric_snapshots.get(&id).copied().unwrap_or_default();
         let settings = s.registry.chain_settings(id);
         let endpoint_rows = if only.is_some() {
             Some(build_endpoint_rows(s, id, c).await)
@@ -1246,5 +1487,27 @@ mod tests {
         // pinned(有活跃) > pinned(无端点) > hot 主网有活跃 > hot 测试网有活跃 > hot 无活跃但有端点
         // > dormant 按流量 > disabled 垫底
         assert_eq!(ids, vec![1, 8, 2, 7, 3, 6, 5, 4]);
+    }
+
+    #[test]
+    fn public_row_rejects_non_http_explorer_urls() {
+        let row = row(1, "hot", 1, 1, false, 0);
+        let catalog = crate::chainlist::Catalog {
+            chains: vec![crate::chainlist::CatalogChain {
+                chain_id: 1,
+                name: "One".into(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: Some("javascript:alert(1)".into()),
+                status: None,
+                tvl: None,
+                endpoints: Vec::new(),
+            }],
+            by_id: HashMap::from([(1, 0)]),
+        };
+        assert!(public_row(&row, Some(&catalog)).explorer_url.is_none());
     }
 }
