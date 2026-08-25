@@ -1,14 +1,16 @@
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use axum::ServiceExt;
 use rpcrouter::{
     chainlist::ChainlistLoader,
     config::Config,
     forward::Forwarder,
-    probe::{ProbeManager, spawn as spawn_probes},
+    probe::{ProbeManager, spawn_supervised as spawn_probes},
     registry::{Registry, unix_seconds},
     server::{AppState, guarded_service_from_state},
+    state::{FileStore, MemoryStore, RedisStore, ResilientStore, StateStore},
+    supervisor,
 };
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -26,14 +28,74 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("config.toml"));
     let mut config = Config::load(&config_path)?;
     config.apply_env_overrides()?;
+    if env::args().any(|arg| arg == "--reset-state") {
+        config.state.reset = true;
+    }
     info!(path = %config_path.display(), listen = %config.listen, "configuration loaded");
 
+    let mut resilient = None;
+    let store: Arc<dyn StateStore> = match config.state.backend.as_str() {
+        "memory" => Arc::new(MemoryStore::new()),
+        "file" => Arc::new(FileStore::open(&config.state.file_path).await?),
+        "redis" if !config.state.required => {
+            let value = Arc::new(
+                ResilientStore::open(
+                    &config.state.redis_url,
+                    &config.state.namespace,
+                    config.state.health_ttl_seconds,
+                    &config.state.file_path,
+                )
+                .await?,
+            );
+            resilient = Some(Arc::clone(&value));
+            value
+        }
+        "redis" => match tokio::time::timeout(
+            Duration::from_secs(2),
+            RedisStore::connect_with_ttl(
+                &config.state.redis_url,
+                &config.state.namespace,
+                config.state.health_ttl_seconds,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(redis)) => Arc::new(redis),
+            Ok(Err(error)) => bail!("required state store unavailable: {error}"),
+            Err(_) => bail!("required state store unavailable: connection timed out"),
+        },
+        _ => unreachable!(),
+    };
+    if config.state.reset {
+        store.reset().await.context("failed to reset state store")?;
+    }
+    let boot = match store.bootstrap().await {
+        Ok(value) => value,
+        Err(error) if !config.state.required => {
+            tracing::warn!(error=%error,"state schema could not be loaded; resetting optional state");
+            store.reset().await?;
+            store.bootstrap().await?
+        }
+        Err(error) => return Err(error.context("required state bootstrap failed")),
+    };
     let chainlist = Arc::new(ChainlistLoader::new(&config)?);
     let registry = Arc::new(Registry::new(&config));
     let initial = chainlist.load().await?;
     info!(source = ?initial.source, chains = initial.catalog.chains.len(), "chainlist loaded");
     registry.set_catalog(initial.catalog).await;
+    if boot.catalog.is_none() {
+        store
+            .set_catalog(&serde_json::to_value(
+                registry.catalog().await.expect("catalog loaded").as_ref(),
+            )?)
+            .await?;
+    }
     registry.apply_snapshot(&initial.snapshot).await;
+    registry.apply_overrides(&boot.overrides).await;
+    if config.state.restore_hot {
+        registry.activate_restored_hot(&boot.hot_chains).await;
+    }
+    registry.restore_health(&boot.health).await;
     let initial_is_fresh = matches!(
         initial.source,
         rpcrouter::chainlist::RefreshSource::Network
@@ -42,14 +104,18 @@ async fn main() -> Result<()> {
     if initial_is_fresh {
         registry.record_chainlist_refresh(unix_seconds(), initial.source.label());
     }
-    let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
-    spawn_probes(probes);
-
-    // 启动 housekeeping 后台任务（每 30s 一次）。
-    spawn_housekeeping(Arc::clone(&registry));
-
-    let forwarder = Arc::new(Forwarder::new(Arc::clone(&registry), &config)?);
+    let mut forwarder_value = Forwarder::new(Arc::clone(&registry), &config)?;
+    forwarder_value.apply_state_overrides(&boot.overrides);
+    let forwarder = Arc::new(forwarder_value);
     let metrics = forwarder.metrics();
+    if let Some(resilient) = resilient {
+        spawn_state_reconnect(resilient, Arc::clone(&metrics));
+    }
+    let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
+    spawn_probes(probes, Arc::clone(&metrics));
+    metrics.set_state_store_up(store.health().await);
+    // 启动 housekeeping 后台任务（每 30s 一次）。
+    spawn_housekeeping(Arc::clone(&registry), Arc::clone(&metrics));
     metrics.record_chainlist_refresh(initial.source.label());
     if initial.rejected_network_snapshot {
         metrics.record_chainlist_refresh("rejected");
@@ -58,8 +124,14 @@ async fn main() -> Result<()> {
     spawn_chainlist_refresh(
         Arc::clone(&chainlist),
         Arc::clone(&registry),
-        metrics,
         Duration::from_secs(config.chainlist.refresh_seconds),
+        Arc::clone(&metrics),
+    );
+    spawn_state_flush(
+        Arc::clone(&registry),
+        Arc::clone(&store),
+        Arc::clone(&metrics),
+        Duration::from_millis(config.state.flush_interval_ms),
     );
     let per_ip = if config.server.per_ip_rate_limit.enabled {
         Some((
@@ -115,47 +187,133 @@ fn forced_shutdown_exit_code() -> i32 {
 fn spawn_chainlist_refresh(
     chainlist: Arc<ChainlistLoader>,
     registry: Arc<Registry>,
-    metrics: Arc<rpcrouter::metrics::Metrics>,
     refresh_interval: Duration,
+    metrics: Arc<rpcrouter::metrics::Metrics>,
 ) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(refresh_interval);
-        interval.tick().await;
-        loop {
+    supervisor::spawn("chainlist-refresh", metrics.clone(), move || {
+        let chainlist = Arc::clone(&chainlist);
+        let registry = Arc::clone(&registry);
+        let metrics = Arc::clone(&metrics);
+        async move {
+            let mut interval = tokio::time::interval(refresh_interval);
             interval.tick().await;
-            match chainlist.refresh().await {
-                Ok(Some(result)) => {
-                    registry.set_catalog(result.catalog).await;
-                    registry.apply_snapshot(&result.snapshot).await;
-                    if matches!(
-                        result.source,
-                        rpcrouter::chainlist::RefreshSource::Network
-                            | rpcrouter::chainlist::RefreshSource::NotModified
-                    ) {
-                        registry.record_chainlist_refresh(unix_seconds(), result.source.label());
+            loop {
+                interval.tick().await;
+                match chainlist.refresh().await {
+                    Ok(Some(result)) => {
+                        registry.set_catalog(result.catalog).await;
+                        registry.apply_snapshot(&result.snapshot).await;
+                        if matches!(
+                            result.source,
+                            rpcrouter::chainlist::RefreshSource::Network
+                                | rpcrouter::chainlist::RefreshSource::NotModified
+                        ) {
+                            registry
+                                .record_chainlist_refresh(unix_seconds(), result.source.label());
+                        }
+                        metrics.record_chainlist_refresh(result.source.label());
+                        if result.rejected_network_snapshot {
+                            metrics.record_chainlist_refresh("rejected");
+                        }
+                        metrics.record_catalog_records_skipped(result.records_skipped);
+                        info!(source = ?result.source, "chainlist refresh completed");
                     }
-                    metrics.record_chainlist_refresh(result.source.label());
-                    if result.rejected_network_snapshot {
-                        metrics.record_chainlist_refresh("rejected");
+                    Ok(None) => {
+                        info!("chainlist refresh skipped because another refresh is running")
                     }
-                    metrics.record_catalog_records_skipped(result.records_skipped);
-                    info!(source = ?result.source, "chainlist refresh completed");
+                    Err(error) => {
+                        error!(error = %error, "chainlist refresh exhausted all fallbacks")
+                    }
                 }
-                Ok(None) => info!("chainlist refresh skipped because another refresh is running"),
-                Err(error) => error!(error = %error, "chainlist refresh exhausted all fallbacks"),
             }
         }
     });
 }
 
 /// 后台 housekeeping：每 30 秒执行一次 idle 降级 + LRU 淘汰。
-fn spawn_housekeeping(registry: Arc<Registry>) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        interval.tick().await; // 跳过第一次立即触发。
-        loop {
-            interval.tick().await;
-            registry.housekeeping().await;
+fn spawn_housekeeping(registry: Arc<Registry>, metrics: Arc<rpcrouter::metrics::Metrics>) {
+    supervisor::spawn("housekeeping", metrics, move || {
+        let registry = Arc::clone(&registry);
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await; // 跳过第一次立即触发。
+            loop {
+                interval.tick().await;
+                registry.housekeeping().await;
+            }
+        }
+    });
+}
+
+fn spawn_state_flush(
+    registry: Arc<Registry>,
+    store: Arc<dyn StateStore>,
+    metrics: Arc<rpcrouter::metrics::Metrics>,
+    interval: Duration,
+) {
+    supervisor::spawn("state-flush", metrics.clone(), move || {
+        let registry = Arc::clone(&registry);
+        let store = Arc::clone(&store);
+        let metrics = Arc::clone(&metrics);
+        async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let started = std::time::Instant::now();
+                let result = async {
+                    store
+                        .set_hot_chains(&registry.hot_chain_timestamps())
+                        .await?;
+                    let snapshots = registry.take_dirty_health(2_000).await;
+                    let result = store.flush_health(&snapshots).await;
+                    if result.is_err() {
+                        registry.restore_dirty_health(&snapshots).await;
+                    }
+                    result
+                }
+                .await;
+                metrics.set_state_dirty_endpoints(registry.dirty_endpoint_count().await);
+                metrics.set_state_store_up(result.is_ok());
+                metrics.record_state_flush(
+                    if result.is_ok() { "success" } else { "error" },
+                    started.elapsed(),
+                );
+                if let Err(error) = result {
+                    tracing::warn!(error=%error,"state flush failed");
+                }
+            }
+        }
+    });
+}
+
+fn spawn_state_reconnect(store: Arc<ResilientStore>, metrics: Arc<rpcrouter::metrics::Metrics>) {
+    supervisor::spawn("state-reconnect", metrics.clone(), move || {
+        let store = Arc::clone(&store);
+        let metrics = Arc::clone(&metrics);
+        async move {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                if store.health().await {
+                    metrics.set_state_store_up(true);
+                    delay = Duration::from_secs(1);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                metrics.set_state_store_up(false);
+                match store.reconnect().await {
+                    Ok(true) => {
+                        info!("state store reconnected and full snapshot flushed");
+                        metrics.set_state_store_up(true);
+                        delay = Duration::from_secs(1);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(error=%error,"state store reconnect failed");
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(30));
+                    }
+                }
+            }
         }
     });
 }

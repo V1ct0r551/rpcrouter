@@ -22,6 +22,7 @@ use crate::{
     chainlist::{Catalog, ChainEndpoints, ChainlistSnapshot},
     config::Config,
     signals::{FailureSignal, FaultKind},
+    state::{ChainOverrideState, EndpointOverrideState, HealthSnapshot, Overrides},
 };
 
 const ERROR_WINDOW: Duration = Duration::from_secs(60);
@@ -193,6 +194,7 @@ pub struct Endpoint {
     stats: EndpointStats,
     /// 同一端点同一时刻至多一个在飞探针（防止 kick 与周期调度重复入队）。
     probing: AtomicBool,
+    dirty: AtomicBool,
 }
 
 impl Endpoint {
@@ -213,6 +215,7 @@ impl Endpoint {
             height_observation: Mutex::new(None),
             stats: EndpointStats::default(),
             probing: AtomicBool::new(false),
+            dirty: AtomicBool::new(true),
         }
     }
 
@@ -301,6 +304,7 @@ impl Endpoint {
     }
 
     pub fn record_success(&self, now: Instant, latency: Duration, probe: bool) {
+        self.dirty.store(true, Ordering::Release);
         self.update_latency(latency);
         lock(&self.outcomes).record(now, false);
         if probe {
@@ -327,6 +331,7 @@ impl Endpoint {
     }
 
     pub fn record_failure(&self, now: Instant, signal: FailureSignal) {
+        self.dirty.store(true, Ordering::Release);
         self.stats.failures.fetch_add(1, Ordering::Relaxed);
         if signal.kind == FaultKind::RateLimited {
             self.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -402,6 +407,63 @@ impl Endpoint {
         self.stats.snapshot()
     }
 
+    pub fn health_snapshot(&self, chain_id: u64) -> HealthSnapshot {
+        let now_unix = unix_seconds();
+        let state = self.state(Instant::now());
+        let (state_name, cooling_until_unix, strikes) = match state {
+            EndpointState::Active => ("active".to_owned(), None, 0),
+            EndpointState::Probation { .. } => ("probation".to_owned(), None, 0),
+            EndpointState::Cooling { until, strikes } => {
+                let secs = until.saturating_duration_since(Instant::now()).as_secs();
+                (
+                    "cooling".to_owned(),
+                    Some(now_unix.saturating_add(secs)),
+                    strikes,
+                )
+            }
+        };
+        HealthSnapshot {
+            chain_id,
+            url: self.url.clone(),
+            state: state_name,
+            cooling_until_unix,
+            strikes,
+            latency_ewma_us: self.latency_ewma_micros(),
+            lag: self.lag(),
+        }
+    }
+
+    pub fn restore_health(&self, snapshot: &HealthSnapshot) {
+        let mut health = lock(&self.health);
+        health.strikes = snapshot.strikes;
+        health.status = if snapshot.state == "cooling" {
+            let remaining = snapshot
+                .cooling_until_unix
+                .unwrap_or(0)
+                .saturating_sub(unix_seconds());
+            if remaining > 0 {
+                HealthStatus::Cooling {
+                    until: Instant::now() + Duration::from_secs(remaining),
+                }
+            } else {
+                HealthStatus::Probation { passes: 0 }
+            }
+        } else {
+            HealthStatus::Probation { passes: 0 }
+        };
+        self.latency_ewma_micros
+            .store(snapshot.latency_ewma_us, Ordering::Relaxed);
+        self.lag.store(snapshot.lag, Ordering::Relaxed);
+        self.dirty.store(false, Ordering::Release);
+    }
+
+    fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
     fn update_latency(&self, latency: Duration) {
         let sample = latency.as_micros().min(u128::from(u64::MAX)) as u64;
         let mut previous = self.latency_ewma_micros.load(Ordering::Relaxed);
@@ -425,6 +487,7 @@ impl Endpoint {
 
     fn observe_height(&self, height: u64, now: Instant) {
         *lock(&self.height_observation) = Some((height, now));
+        self.dirty.store(true, Ordering::Release);
     }
 
     fn recent_height(&self, now: Instant, freshness: Duration) -> Option<u64> {
@@ -507,6 +570,8 @@ pub struct Registry {
     chains: DashMap<u64, Arc<ChainState>>,
     activation_locks: DashMap<u64, Arc<tokio::sync::Mutex<()>>>,
     runtime_pinned: DashMap<u64, bool>,
+    runtime_chain_overrides: DashMap<u64, ChainOverrideState>,
+    runtime_endpoint_overrides: DashMap<String, EndpointOverrideState>,
     catalog: RwLock<Option<Arc<Catalog>>>,
     config: Config,
     user_visible_errors: AtomicU64,
@@ -537,6 +602,8 @@ impl Registry {
             chains: DashMap::new(),
             activation_locks: DashMap::new(),
             runtime_pinned: DashMap::new(),
+            runtime_chain_overrides: DashMap::new(),
+            runtime_endpoint_overrides: DashMap::new(),
             catalog: RwLock::new(None),
             config: config.clone(),
             user_visible_errors: AtomicU64::new(0),
@@ -577,6 +644,45 @@ impl Registry {
     /// 激活通知通道（探针订阅）。
     pub fn activation_channel(&self) -> broadcast::Sender<u64> {
         self.activation_tx.clone()
+    }
+
+    /// 将持久化运行时覆写叠加到内存。请求路径只读取这些并发 map，不访问 StateStore。
+    pub async fn apply_overrides(&self, overrides: &Overrides) {
+        self.runtime_chain_overrides.clear();
+        self.runtime_endpoint_overrides.clear();
+        for (id, value) in &overrides.chains {
+            self.runtime_chain_overrides.insert(*id, value.clone());
+            if let Some(pinned) = value.pinned {
+                self.runtime_pinned.insert(*id, pinned);
+            }
+            if let Some(state) = self.chain(*id) {
+                if let Some(pinned) = value.pinned {
+                    state.pinned.store(pinned, Ordering::Relaxed);
+                }
+                if let Some(disabled) = value.disabled {
+                    state.disabled.store(disabled, Ordering::Relaxed);
+                }
+            }
+        }
+        for (key, value) in &overrides.endpoints {
+            self.runtime_endpoint_overrides
+                .insert(key.clone(), value.clone());
+        }
+    }
+
+    pub async fn apply_override(&self, chain_id: u64, value: ChainOverrideState) {
+        self.runtime_chain_overrides.insert(chain_id, value.clone());
+        if let Some(pinned) = value.pinned {
+            self.runtime_pinned.insert(chain_id, pinned);
+        }
+        if let Some(state) = self.chain(chain_id) {
+            if let Some(pinned) = value.pinned {
+                state.pinned.store(pinned, Ordering::Relaxed);
+            }
+            if let Some(disabled) = value.disabled {
+                state.disabled.store(disabled, Ordering::Relaxed);
+            }
+        }
     }
 
     // ── 热路径：resolve_for_request ──
@@ -700,6 +806,10 @@ impl Registry {
             desired_urls.extend(chain_override.extra_endpoints.iter().cloned());
         }
 
+        let runtime = self
+            .runtime_chain_overrides
+            .get(&chain_id)
+            .map(|v| v.clone());
         let chain_override = self.config.chain_override(chain_id);
         let disabled: HashSet<&str> = chain_override
             .into_iter()
@@ -713,10 +823,29 @@ impl Registry {
             if disabled.contains(url.as_str()) || !seen.insert(url.clone()) {
                 continue;
             }
-            let (rps, concurrency) = self.config.endpoint_limits(chain_id, &url);
+            let (mut rps, mut concurrency) = self.config.endpoint_limits(chain_id, &url);
+            if let Some(endpoint) = self
+                .runtime_endpoint_overrides
+                .get(&crate::state::endpoint_key(chain_id, &url))
+            {
+                if let Some(v) = endpoint.rps {
+                    rps = v;
+                }
+                if let Some(v) = endpoint.concurrency {
+                    concurrency = v;
+                }
+                if endpoint.disabled == Some(true) {
+                    continue;
+                }
+            }
             endpoints.push(Arc::new(Endpoint::new(url, rps, concurrency, now)));
         }
         *state.endpoints.write().await = endpoints;
+        if let Some(value) = runtime
+            && let Some(disabled) = value.disabled
+        {
+            state.disabled.store(disabled, Ordering::Relaxed);
+        }
 
         // 插入 DashMap。
         self.chains.insert(chain_id, Arc::clone(&state));
@@ -940,6 +1069,85 @@ impl Registry {
             .collect()
     }
 
+    pub fn hot_chain_timestamps(&self) -> Vec<(u64, u64)> {
+        self.chains
+            .iter()
+            .filter_map(|entry| {
+                let state = entry.value();
+                matches!(
+                    state.state_label(),
+                    ChainStateLabel::Pinned | ChainStateLabel::Hot
+                )
+                .then_some((*entry.key(), state.last_ingress.load(Ordering::Relaxed)))
+            })
+            .collect()
+    }
+
+    pub async fn activate_restored_hot(&self, chains: &[(u64, u64)]) {
+        let now = unix_seconds();
+        for (chain_id, last) in chains {
+            if now.saturating_sub(*last) <= self.config.discovery.idle_seconds
+                && let Some(state) = self.resolve_for_request(*chain_id).await
+            {
+                state.last_ingress.store(*last, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub async fn restore_health(&self, snapshots: &[HealthSnapshot]) {
+        for snapshot in snapshots {
+            if let Some(endpoint) = self
+                .all_endpoints(snapshot.chain_id)
+                .await
+                .into_iter()
+                .find(|e| e.url() == snapshot.url)
+            {
+                endpoint.restore_health(snapshot);
+            }
+        }
+    }
+
+    pub async fn take_dirty_health(&self, limit: usize) -> Vec<HealthSnapshot> {
+        let mut out = Vec::new();
+        for entry in &self.hot_chain_ids() {
+            for endpoint in self.all_endpoints(*entry).await {
+                if out.len() >= limit {
+                    return out;
+                }
+                if endpoint.take_dirty() {
+                    out.push(endpoint.health_snapshot(*entry));
+                }
+            }
+        }
+        out
+    }
+
+    pub async fn restore_dirty_health(&self, snapshots: &[HealthSnapshot]) {
+        for snapshot in snapshots {
+            if let Some(endpoint) = self
+                .all_endpoints(snapshot.chain_id)
+                .await
+                .into_iter()
+                .find(|e| e.url() == snapshot.url)
+            {
+                endpoint.mark_dirty();
+            }
+        }
+    }
+
+    pub async fn dirty_endpoint_count(&self) -> usize {
+        let mut count = 0;
+        for chain_id in self.hot_chain_ids() {
+            count += self
+                .all_endpoints(chain_id)
+                .await
+                .into_iter()
+                .filter(|e| e.dirty.load(Ordering::Acquire))
+                .count();
+        }
+        count
+    }
+
     /// housekeeping：idle 降级 + LRU 淘汰。
     pub async fn housekeeping(&self) {
         self.housekeeping_at(unix_seconds()).await;
@@ -1126,6 +1334,7 @@ impl Registry {
             if let Some(item_height) = item.recent_height(now, freshness) {
                 item.lag
                     .store(head.abs_diff(item_height), Ordering::Relaxed);
+                item.dirty.store(true, Ordering::Release);
             }
         }
         if head.abs_diff(height) > self.config.lag_threshold(chain_id) {

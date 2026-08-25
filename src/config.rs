@@ -53,6 +53,7 @@ pub struct Config {
     pub cache: CacheConfig,
     pub hedging: HedgingConfig,
     pub chain_overrides: Vec<ChainOverride>,
+    pub state: StateConfig,
 }
 
 impl Default for Config {
@@ -71,6 +72,7 @@ impl Default for Config {
             cache: CacheConfig::default(),
             hedging: HedgingConfig::default(),
             chain_overrides: Vec::new(),
+            state: StateConfig::default(),
         }
     }
 }
@@ -140,6 +142,21 @@ impl Config {
                 .parse()
                 .context("RPCROUTER_DISCOVERY_IDLE_SECONDS is not a valid integer")?;
         }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_BACKEND") {
+            self.state.backend = raw;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_REDIS_URL") {
+            self.state.redis_url = raw;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_NAMESPACE") {
+            self.state.namespace = raw;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_RESET") {
+            self.state.reset = parse_bool(&raw, "RPCROUTER_STATE_RESET")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_RESTORE_HOT") {
+            self.state.restore_hot = parse_bool(&raw, "RPCROUTER_STATE_RESTORE_HOT")?;
+        }
         self.validate()
     }
 
@@ -200,6 +217,18 @@ impl Config {
         }
         if self.discovery.max_hot_chains == 0 {
             bail!("discovery.max_hot_chains must be greater than zero");
+        }
+        if self.state.backend != "redis"
+            && self.state.backend != "file"
+            && self.state.backend != "memory"
+        {
+            bail!("state.backend must be redis, file, or memory");
+        }
+        if self.state.namespace.trim().is_empty() {
+            bail!("state.namespace must not be empty");
+        }
+        if self.state.flush_interval_ms == 0 || self.state.health_ttl_seconds == 0 {
+            bail!("state intervals must be greater than zero");
         }
         if self.discovery.idle_seconds == 0 {
             bail!("discovery.idle_seconds must be greater than zero");
@@ -482,6 +511,36 @@ pub struct HedgingConfig {
     pub delay_ms: u64,
     pub max_percent: u32,
     pub min_active_endpoints: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct StateConfig {
+    pub backend: String,
+    pub redis_url: String,
+    pub namespace: String,
+    pub required: bool,
+    pub flush_interval_ms: u64,
+    pub health_ttl_seconds: u64,
+    pub reset: bool,
+    pub restore_hot: bool,
+    pub file_path: PathBuf,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            backend: "redis".to_owned(),
+            redis_url: "redis://127.0.0.1:6379/0".to_owned(),
+            namespace: "rpcrouter".to_owned(),
+            required: false,
+            flush_interval_ms: 2_000,
+            health_ttl_seconds: 86_400,
+            reset: false,
+            restore_hot: true,
+            file_path: PathBuf::from("./data/state.json"),
+        }
+    }
 }
 
 impl Default for HedgingConfig {

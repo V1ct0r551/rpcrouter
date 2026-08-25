@@ -435,11 +435,31 @@ fn parse_hex_result(response: &Value) -> Option<u64> {
 }
 
 pub fn spawn(manager: Arc<ProbeManager>) {
+    let metrics = Arc::new(crate::metrics::Metrics::new().expect("probe metrics"));
+    spawn_supervised(manager, metrics);
+}
+
+pub fn spawn_supervised(manager: Arc<ProbeManager>, metrics: Arc<crate::metrics::Metrics>) {
     let rx = manager.take_worker_pool();
-    tokio::spawn(worker_pool(Arc::clone(&manager), rx));
-    tokio::spawn(async move {
-        info!("health probe scheduler started");
-        manager.run().await;
+    let worker_rx = Arc::new(StdMutex::new(Some(rx)));
+    let worker_manager = Arc::clone(&manager);
+    crate::supervisor::spawn("probe-worker", Arc::clone(&metrics), move || {
+        let manager = Arc::clone(&worker_manager);
+        let rx = worker_rx.lock().unwrap_or_else(|p| p.into_inner()).take();
+        async move {
+            if let Some(rx) = rx {
+                worker_pool(manager, rx).await
+            } else {
+                std::future::pending::<()>().await
+            }
+        }
+    });
+    crate::supervisor::spawn("probe-scheduler", metrics, move || {
+        let manager = Arc::clone(&manager);
+        async move {
+            info!("health probe scheduler started");
+            manager.run().await
+        }
     });
 }
 

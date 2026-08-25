@@ -51,6 +51,11 @@ pub struct Metrics {
     chainlist_refresh_total: IntCounterVec,
     chain_activations: IntCounter,
     chain_demotions: IntCounterVec,
+    background_task_restarts: IntCounterVec,
+    state_store_up: IntGauge,
+    state_flush_total: IntCounterVec,
+    state_flush_duration: HistogramVec,
+    state_dirty_endpoints: IntGauge,
     v2_totals: Mutex<V2Totals>,
 }
 
@@ -278,6 +283,35 @@ impl Metrics {
             ),
             &["reason"],
         )?;
+        let background_task_restarts = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_background_task_restarts_total",
+                "Background task restarts after panic or unexpected exit.",
+            ),
+            &["task"],
+        )?;
+        let state_store_up = IntGauge::new(
+            "rpcrouter_state_store_up",
+            "1 when the configured persistent state store is reachable.",
+        )?;
+        let state_flush_total = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_state_flush_total",
+                "State write-behind flushes by result.",
+            ),
+            &["result"],
+        )?;
+        let state_flush_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "rpcrouter_state_flush_duration_seconds",
+                "State write-behind flush duration.",
+            ),
+            &[],
+        )?;
+        let state_dirty_endpoints = IntGauge::new(
+            "rpcrouter_state_dirty_endpoints",
+            "Endpoints waiting for state write-behind.",
+        )?;
 
         for collector in [
             Box::new(ingress.clone()) as Box<dyn prometheus::core::Collector>,
@@ -311,6 +345,11 @@ impl Metrics {
             Box::new(chainlist_refresh_total.clone()),
             Box::new(chain_activations.clone()),
             Box::new(chain_demotions.clone()),
+            Box::new(background_task_restarts.clone()),
+            Box::new(state_store_up.clone()),
+            Box::new(state_flush_total.clone()),
+            Box::new(state_flush_duration.clone()),
+            Box::new(state_dirty_endpoints.clone()),
         ] {
             registry.register(collector)?;
         }
@@ -350,6 +389,11 @@ impl Metrics {
             chainlist_refresh_total,
             chain_activations,
             chain_demotions,
+            background_task_restarts,
+            state_store_up,
+            state_flush_total,
+            state_flush_duration,
+            state_dirty_endpoints,
             v2_totals: Mutex::new(V2Totals::default()),
         })
     }
@@ -512,6 +556,29 @@ impl Metrics {
 
     pub fn record_chain_demotion(&self, reason: &str) {
         self.chain_demotions.with_label_values(&[reason]).inc();
+    }
+
+    pub fn record_background_task_restart(&self, task: &str) {
+        self.background_task_restarts
+            .with_label_values(&[task])
+            .inc();
+    }
+    pub fn background_task_restarts(&self, task: &str) -> u64 {
+        self.background_task_restarts
+            .with_label_values(&[task])
+            .get()
+    }
+    pub fn set_state_store_up(&self, up: bool) {
+        self.state_store_up.set(i64::from(up));
+    }
+    pub fn record_state_flush(&self, result: &str, duration: Duration) {
+        self.state_flush_total.with_label_values(&[result]).inc();
+        self.state_flush_duration
+            .with_label_values(&[] as &[&str])
+            .observe(duration.as_secs_f64());
+    }
+    pub fn set_state_dirty_endpoints(&self, count: usize) {
+        self.state_dirty_endpoints.set(count as i64);
     }
 
     pub fn chain_snapshot(&self, chain_id: u64) -> ChainMetricsSnapshot {

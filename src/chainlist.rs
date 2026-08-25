@@ -13,7 +13,7 @@ use reqwest::{
     Client, StatusCode, Url,
     header::{ETAG, HeaderValue, IF_NONE_MATCH},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -39,7 +39,7 @@ pub struct ChainlistSnapshot {
 // ── 新目录类型（v2） ──
 
 /// 一条链的完整目录元数据。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CatalogChain {
     pub chain_id: u64,
     pub name: String,
@@ -57,14 +57,14 @@ pub struct CatalogChain {
 }
 
 /// 目录里的单个端点（含 tracking 元数据）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CatalogEndpoint {
     pub url: String,
     pub tracking: Option<String>,
 }
 
 /// 完整的目录快照：所有链的元数据 + 端点列表。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Catalog {
     pub chains: Vec<CatalogChain>,
     /// 按 chain_id 查找链在 `chains` 中的索引。

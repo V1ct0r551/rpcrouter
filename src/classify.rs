@@ -3,6 +3,7 @@ use std::{collections::HashMap, time::Duration};
 use serde_json::{Value, value::RawValue};
 
 use crate::config::Config;
+use crate::state::Overrides;
 
 pub type CacheKey = [u8; 32];
 
@@ -59,6 +60,21 @@ impl Classifier {
                 tip_ttl: default_tip_ttl,
             },
             immutable_ttl: Duration::from_secs(config.cache.immutable_ttl_seconds),
+        }
+    }
+
+    pub fn apply_overrides(&mut self, overrides: &Overrides) {
+        for (chain_id, value) in &overrides.chains {
+            let entry = self.chains.entry(*chain_id).or_insert(ChainCacheSettings {
+                confirmation_depth: 64,
+                tip_ttl: Duration::from_secs(2),
+            });
+            if let Some(v) = value.confirmation_depth {
+                entry.confirmation_depth = v;
+            }
+            if let Some(v) = value.tip_ttl_ms {
+                entry.tip_ttl = Duration::from_millis(v);
+            }
         }
     }
 
