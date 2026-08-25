@@ -34,7 +34,13 @@ async fn main() -> Result<()> {
     info!(source = ?initial.source, chains = initial.catalog.chains.len(), "chainlist loaded");
     registry.set_catalog(initial.catalog).await;
     registry.apply_snapshot(&initial.snapshot).await;
-    registry.record_chainlist_refresh(unix_seconds(), &format!("{:?}", initial.source));
+    if matches!(
+        initial.source,
+        rpcrouter::chainlist::RefreshSource::Network
+            | rpcrouter::chainlist::RefreshSource::NotModified
+    ) {
+        registry.record_chainlist_refresh(unix_seconds(), initial.source.label());
+    }
 
     spawn_chainlist_refresh(
         Arc::clone(&chainlist),
@@ -109,14 +115,20 @@ fn spawn_chainlist_refresh(
         interval.tick().await;
         loop {
             interval.tick().await;
-            match chainlist.load().await {
-                Ok(result) => {
+            match chainlist.refresh().await {
+                Ok(Some(result)) => {
                     registry.set_catalog(result.catalog).await;
                     registry.apply_snapshot(&result.snapshot).await;
-                    registry
-                        .record_chainlist_refresh(unix_seconds(), &format!("{:?}", result.source));
+                    if matches!(
+                        result.source,
+                        rpcrouter::chainlist::RefreshSource::Network
+                            | rpcrouter::chainlist::RefreshSource::NotModified
+                    ) {
+                        registry.record_chainlist_refresh(unix_seconds(), result.source.label());
+                    }
                     info!(source = ?result.source, "chainlist refresh completed");
                 }
+                Ok(None) => info!("chainlist refresh skipped because another refresh is running"),
                 Err(error) => error!(error = %error, "chainlist refresh exhausted all fallbacks"),
             }
         }

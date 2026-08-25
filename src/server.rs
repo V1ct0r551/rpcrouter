@@ -233,7 +233,6 @@ async fn rpc(Path(chain_id): Path<u64>, State(state): State<AppState>, body: Byt
 
 async fn execute_batch(chain_id: u64, state: &AppState, requests: Vec<Box<RawValue>>) -> Value {
     // 解析链一次（batch 中共享），在调用方已解析。
-    let endpoint_count = state.registry.endpoint_count(chain_id).await;
     let mut results = vec![None; requests.len()];
     let request_ids: Vec<_> = requests.iter().map(|request| request_id(request)).collect();
     let mut tasks = JoinSet::new();
@@ -260,15 +259,7 @@ async fn execute_batch(chain_id: u64, state: &AppState, requests: Vec<Box<RawVal
             .enumerate()
             .map(|(index, response)| {
                 response.unwrap_or_else(|| {
-                    if endpoint_count == 0 {
-                        jsonrpc_error(
-                            request_ids[index].clone(),
-                            -32000,
-                            &format!("rpcrouter: chain {chain_id} has no public endpoints"),
-                        )
-                    } else {
-                        all_endpoints_exhausted(chain_id, request_ids[index].clone())
-                    }
+                    all_endpoints_exhausted(chain_id, request_ids[index].clone())
                 })
             })
             .collect(),
@@ -309,8 +300,6 @@ mod tests {
         http::{Request, StatusCode, header::CONTENT_TYPE},
         response::{IntoResponse, Response},
     };
-    use std::collections::HashSet;
-
     use tower::ServiceExt;
 
     use crate::{
@@ -615,7 +604,7 @@ mod tests {
     async fn unknown_chain_returns_404_with_jsonrpc_error() {
         let catalog = Catalog {
             chains: vec![],
-            by_id: HashSet::new(),
+            by_id: std::collections::HashMap::new(),
         };
         let app = v2_test_app_with_catalog(catalog).await;
 
@@ -651,7 +640,7 @@ mod tests {
                 tvl: None,
                 endpoints: vec![], // 0 端点
             }],
-            by_id: HashSet::from([127]),
+            by_id: std::collections::HashMap::from([(127, 0)]),
         };
         let app = v2_test_app_with_catalog(catalog).await;
 
@@ -708,7 +697,7 @@ mod tests {
                     tracking: None,
                 }],
             }],
-            by_id: HashSet::from([13]),
+            by_id: std::collections::HashMap::from([(13, 0)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
         let forwarder = Arc::new(
@@ -789,7 +778,7 @@ mod tests {
                     endpoints: vec![],
                 },
             ],
-            by_id: HashSet::from([13, 127]),
+            by_id: std::collections::HashMap::from([(13, 0), (127, 1)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
         let forwarder = Arc::new(

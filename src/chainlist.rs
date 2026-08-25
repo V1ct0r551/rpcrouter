@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -64,18 +64,14 @@ pub struct CatalogEndpoint {
 pub struct Catalog {
     pub chains: Vec<CatalogChain>,
     /// 按 chain_id 查找链在 `chains` 中的索引。
-    pub by_id: HashSet<u64>,
+    pub by_id: HashMap<u64, usize>,
 }
 
 impl Catalog {
     pub fn lookup(&self, chain_id: u64) -> Option<&CatalogChain> {
-        // 先用 HashSet 快速判断是否存在，再线性扫描找到索引。
-        // 对 ~2877 条链的规模，线性扫描是可接受的；
-        // 但为了热路径更廉价，by_id 用于快速判断 unknown。
-        if !self.by_id.contains(&chain_id) {
-            return None;
-        }
-        self.chains.iter().find(|c| c.chain_id == chain_id)
+        self.by_id
+            .get(&chain_id)
+            .and_then(|index| self.chains.get(*index))
     }
 
     pub fn chain_ids(&self) -> impl Iterator<Item = u64> + '_ {
@@ -206,7 +202,10 @@ impl ChainlistLoader {
     pub async fn load(&self) -> Result<LoadResult> {
         match self.fetch_network().await {
             Ok(result) => return Ok(result),
-            Err(error) => warn!(error = %error, "chainlist network refresh failed"),
+            Err(error) => {
+                warn!(error = %error, "chainlist network refresh failed");
+                self.state.lock().await.last_error = Some(error.to_string());
+            }
         }
 
         {
@@ -311,6 +310,7 @@ impl ChainlistLoader {
             let mut state = self.state.lock().await;
             state.last_refresh_unix = unix_ts();
             state.last_source = Some(RefreshSource::NotModified);
+            state.last_error = None;
             let catalog = state
                 .last_success
                 .clone()
@@ -470,7 +470,11 @@ pub fn parse_catalog(
         })
         .collect();
 
-    let by_id: HashSet<u64> = all_chains.iter().map(|c| c.chain_id).collect();
+    let by_id: HashMap<u64, usize> = all_chains
+        .iter()
+        .enumerate()
+        .map(|(index, chain)| (chain.chain_id, index))
+        .collect();
 
     // 构造兼容的旧格式快照
     let snapshot_chains = all_chains

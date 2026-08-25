@@ -471,6 +471,7 @@ pub type ActivationKick = broadcast::Sender<u64>;
 
 pub struct Registry {
     chains: DashMap<u64, Arc<ChainState>>,
+    activation_locks: DashMap<u64, Arc<tokio::sync::Mutex<()>>>,
     catalog: RwLock<Option<Arc<Catalog>>>,
     config: Config,
     user_visible_errors: AtomicU64,
@@ -499,6 +500,7 @@ impl Registry {
         let (activation_tx, _) = broadcast::channel(256);
         Self {
             chains: DashMap::new(),
+            activation_locks: DashMap::new(),
             catalog: RwLock::new(None),
             config: config.clone(),
             user_visible_errors: AtomicU64::new(0),
@@ -557,7 +559,6 @@ impl Registry {
             }
             // dormant 链（已降级，端点运行态已丢弃）需要重新 materialize。
             if label == ChainStateLabel::Dormant {
-                // 删除旧 state，走慢路径重新 materialize。
                 self.chains.remove(&chain_id);
             } else {
                 // pinned / hot：更新 last_ingress 并返回。
@@ -570,11 +571,33 @@ impl Registry {
             }
         }
 
+        // 串行化同一链的首次 materialize，避免重复激活/kick。
+        let activation_lock = self
+            .activation_locks
+            .entry(chain_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _activation_guard = activation_lock.lock().await;
+        if let Some(state) = self.chain(chain_id) {
+            if state.state_label() != ChainStateLabel::Dormant {
+                let now_sec = unix_seconds();
+                if now_sec != state.last_ingress.load(Ordering::Relaxed) {
+                    state.last_ingress.store(now_sec, Ordering::Relaxed);
+                }
+                return Some(state);
+            }
+            self.chains.remove(&chain_id);
+        }
+
         // 未 materialized → 查目录。
         let catalog = self.catalog.read().await;
         let catalog_entry = catalog.as_ref().and_then(|c| c.lookup(chain_id));
         let pinned = self.config.chains.contains(&chain_id);
 
+        // discovery disabled 等价 v1：目录只用于 pinned 链，其他链视为未知。
+        if !self.config.discovery.enabled && !pinned {
+            return None;
+        }
         if catalog_entry.is_none() && !pinned {
             return None; // 未知链
         }
@@ -661,19 +684,36 @@ impl Registry {
             .collect();
         let now = unix_seconds();
 
-        // 旧行为：只为 config.chains 中的链合并。
-        for &chain_id in &self.config.chains {
+        // pinned 链始终合并；动态发现模式下，已 materialized 的 hot 链也必须在刷新时
+        // 保留健康运行态并合并新增/消失端点。dormant 链保持零成本，不创建端点对象。
+        let mut materialized_ids: HashSet<u64> = self.config.chains.iter().copied().collect();
+        materialized_ids.extend(self.chains.iter().filter_map(|entry| {
+            matches!(
+                entry.value().state_label(),
+                ChainStateLabel::Pinned | ChainStateLabel::Hot
+            )
+            .then_some(*entry.key())
+        }));
+
+        for chain_id in materialized_ids {
             let source = source_by_chain.get(&chain_id).copied();
             let name = source
                 .map(|chain| chain.name.clone())
                 .unwrap_or_else(|| format!("Chain {chain_id}"));
+            let pinned = self.config.chains.contains(&chain_id);
             let state = self
                 .chains
                 .entry(chain_id)
-                .or_insert_with(|| Arc::new(ChainState::new(chain_id, name.clone(), true)))
+                .or_insert_with(|| Arc::new(ChainState::new(chain_id, name.clone(), pinned)))
                 .clone();
+            state.pinned.store(pinned, Ordering::Relaxed);
             if source.is_some() {
                 *state.name.write().await = name;
+            }
+            if self.config.discovery.deny.contains(&chain_id) {
+                state.disabled.store(true, Ordering::Relaxed);
+                *state.endpoints.write().await = Vec::new();
+                continue;
             }
             self.merge_chain(&state, source, now).await;
         }
@@ -880,7 +920,10 @@ impl Registry {
 
     /// 端点数量（materialized 链）。
     pub async fn endpoint_count(&self, chain_id: u64) -> usize {
-        self.all_endpoints(chain_id).await.len()
+        let Some(state) = self.chain(chain_id) else {
+            return 0;
+        };
+        state.endpoints.read().await.len()
     }
 
     /// 链是否为 disabled。
@@ -895,7 +938,7 @@ impl Registry {
             .read()
             .await
             .as_ref()
-            .is_some_and(|c| c.by_id.contains(&chain_id))
+            .is_some_and(|c| c.by_id.contains_key(&chain_id))
     }
 
     pub async fn healthy_for_hedging(&self, chain_id: u64, minimum_active: usize) -> bool {
@@ -983,6 +1026,13 @@ impl Registry {
         )
     }
 
+    pub fn materialized_chain_pinned(&self) -> Vec<(u64, bool)> {
+        self.chains
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().pinned.load(Ordering::Relaxed)))
+            .collect()
+    }
+
     /// v2 指标：目录链数量。
     pub fn catalog_chain_count(&self) -> u64 {
         self.catalog_chains_count.load(Ordering::Relaxed)
@@ -1068,12 +1118,20 @@ impl Registry {
                 ChainStateLabel::Disabled => disabled += 1,
             }
         }
-        let catalog_count = self
-            .catalog
-            .read()
-            .await
-            .as_ref()
-            .map_or(0, |c| c.chains.len() as u64);
+        let catalog = self.catalog.read().await;
+        let catalog_count = catalog.as_ref().map_or(0, |c| c.chains.len() as u64);
+        if let Some(catalog) = catalog.as_ref() {
+            for chain in &catalog.chains {
+                if self.chains.contains_key(&chain.chain_id) {
+                    continue;
+                }
+                if self.config.discovery.deny.contains(&chain.chain_id) {
+                    disabled += 1;
+                } else {
+                    dormant += 1;
+                }
+            }
+        }
         ChainCounts {
             catalog: catalog_count,
             pinned,
@@ -1447,7 +1505,7 @@ mod tests {
                     tracking: None,
                 }],
             }],
-            by_id: HashSet::from([1]),
+            by_id: HashMap::from([(1, 0)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
 
@@ -1488,7 +1546,7 @@ mod tests {
                     tracking: None,
                 }],
             }],
-            by_id: HashSet::from([42]),
+            by_id: HashMap::from([(42, 0)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
 
@@ -1542,7 +1600,7 @@ mod tests {
                     tracking: None,
                 }],
             }],
-            by_id: HashSet::from([7]),
+            by_id: HashMap::from([(7, 0)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
 
@@ -1598,7 +1656,7 @@ mod tests {
                     tracking: None,
                 }],
             }],
-            by_id: HashSet::from([1]),
+            by_id: HashMap::from([(1, 0)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
 
@@ -1647,7 +1705,7 @@ mod tests {
                     tracking: None,
                 }],
             }],
-            by_id: HashSet::from([1]),
+            by_id: HashMap::from([(1, 0)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
 
@@ -1684,9 +1742,9 @@ mod tests {
 
         // 在目录中放入 3 条链。
         let mut chains = Vec::new();
-        let mut ids = HashSet::new();
+        let mut ids = HashMap::new();
         for i in 1..=3u64 {
-            ids.insert(i);
+            ids.insert(i, chains.len());
             chains.push(CatalogChain {
                 chain_id: i,
                 name: format!("Chain{i}"),
@@ -1773,7 +1831,7 @@ mod tests {
                     tracking: None,
                 }],
             }],
-            by_id: HashSet::from([99]),
+            by_id: HashMap::from([(99, 0)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
 
@@ -1826,7 +1884,7 @@ mod tests {
                     tracking: None,
                 }],
             }],
-            by_id: HashSet::from([13]),
+            by_id: HashMap::from([(13, 0)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
 
@@ -1859,7 +1917,7 @@ mod tests {
                 tvl: None,
                 endpoints: vec![],
             }],
-            by_id: HashSet::from([100]),
+            by_id: HashMap::from([(100, 0)]),
         };
         registry.set_catalog(Arc::new(catalog)).await;
 

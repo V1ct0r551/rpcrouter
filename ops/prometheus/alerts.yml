@@ -1,4 +1,4 @@
-# rpcrouter production alert rules
+# rpcrouter 生产告警规则
 #
 # Metric names must match src/metrics.rs exports:
 #   - rpcrouter_user_visible_errors_total{chain_id}
@@ -36,10 +36,9 @@ groups:
           summary: "chain {{ $labels.chain_id }} user-visible errors (all upstream endpoints exhausted)"
           description: "rpcrouter has no available endpoints for chain_id={{ $labels.chain_id }}. Callers receive -32000. Investigate endpoint pool immediately."
 
-      # Active endpoints low water mark. v2: only watches pinned chains (rpcrouter_chain_pinned==1)
-      # because dynamic chains with 1 endpoint are expected (1744 of 2877 chains have only 1 endpoint).
+      # Active endpoints low water mark. v2: only watches pinned chains.
       - alert: RpcrouterChainActiveEndpointsLow
-        expr: sum by (chain_id) (rpcrouter_endpoint_state{state="active"} * on(chain_id) group_left rpcrouter_chain_pinned == 1) < 2
+        expr: sum by (chain_id) (rpcrouter_endpoint_state{state="active"}) < 2 and on(chain_id) rpcrouter_chain_pinned == 1
         for: 5m
         labels:
           severity: warning

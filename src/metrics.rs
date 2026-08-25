@@ -49,6 +49,7 @@ pub struct Metrics {
     chainlist_refresh_total: IntCounterVec,
     chain_activations: IntCounter,
     chain_demotions: IntCounterVec,
+    v2_totals: Mutex<V2Totals>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -67,6 +68,15 @@ pub struct ChainMetricsSnapshot {
 struct HedgeTotals {
     upstream: AtomicU64,
     hedges: AtomicU64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct V2Totals {
+    activations: u64,
+    demotions_idle: u64,
+    demotions_lru: u64,
+    demotions_admin: u64,
+    refresh_timestamp: u64,
 }
 
 impl Metrics {
@@ -323,6 +333,7 @@ impl Metrics {
             chainlist_refresh_total,
             chain_activations,
             chain_demotions,
+            v2_totals: Mutex::new(V2Totals::default()),
         })
     }
 
@@ -510,6 +521,42 @@ impl Metrics {
         self.set_probe_queue_depth(rpc_registry.probe_queue_depth.load(Ordering::Relaxed));
         self.set_probe_in_flight(rpc_registry.probe_in_flight.load(Ordering::Relaxed));
         self.set_chainlist_last_refresh(rpc_registry.chainlist_last_refresh());
+        for (chain_id, pinned) in rpc_registry.materialized_chain_pinned() {
+            self.set_chain_pinned(chain_id, pinned);
+        }
+
+        let activations = rpc_registry.chain_activations();
+        let (demotions_idle, demotions_lru, demotions_admin) = rpc_registry.chain_demotions();
+        let mut totals = lock(&self.v2_totals);
+        let previous_refresh_timestamp = totals.refresh_timestamp;
+        self.chain_activations
+            .inc_by(activations.saturating_sub(totals.activations));
+        for (reason, current, previous) in [
+            ("idle", demotions_idle, totals.demotions_idle),
+            ("lru", demotions_lru, totals.demotions_lru),
+            ("admin", demotions_admin, totals.demotions_admin),
+        ] {
+            self.chain_demotions
+                .with_label_values(&[reason])
+                .inc_by(current.saturating_sub(previous));
+        }
+        *totals = V2Totals {
+            activations,
+            demotions_idle,
+            demotions_lru,
+            demotions_admin,
+            refresh_timestamp: previous_refresh_timestamp,
+        };
+        let refresh_ts = rpc_registry.chainlist_last_refresh();
+        if refresh_ts != previous_refresh_timestamp {
+            let source = rpc_registry.chainlist_refresh_source_str();
+            if !source.is_empty() {
+                self.chainlist_refresh_total
+                    .with_label_values(&[&source])
+                    .inc();
+            }
+            totals.refresh_timestamp = refresh_ts;
+        }
     }
 
     async fn sync_endpoints(&self, rpc_registry: &Registry) {

@@ -159,6 +159,14 @@ impl Config {
         if unique_chains.len() != self.chains.len() {
             bail!("chains must not contain duplicates");
         }
+        if self
+            .discovery
+            .deny
+            .iter()
+            .any(|chain_id| unique_chains.contains(chain_id))
+        {
+            bail!("discovery.deny must not contain pinned chains");
+        }
         if self.server.batch_limit == 0 || self.server.batch_limit > MAX_BATCH_SIZE {
             bail!("server.batch_limit must be between 1 and {MAX_BATCH_SIZE}");
         }

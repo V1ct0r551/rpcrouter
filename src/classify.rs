@@ -38,6 +38,7 @@ impl Classifier {
             .chains
             .iter()
             .copied()
+            .chain(config.chain_overrides.iter().map(|item| item.chain_id))
             .map(|chain_id| {
                 (
                     chain_id,
