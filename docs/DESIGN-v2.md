@@ -362,3 +362,13 @@ Phase B 各项仅作为 P5 备选，按需再立项。** 不用轮询：轮询�
   bucket 或共享响应缓存（按 §12 Phase B/P5 规划）。
 - cluster profile 关闭共享 `chains:hot` 的启动预激活（`state.restore_hot=false`），避免实例接管
   历史分片后全部探测同一链；单实例默认仍恢复热链，覆写与健康快照继续共享。
+
+### W6b 偏差记录
+
+- Admin API 复用 axum 路由与内存 Registry；为保持 RPC 热路径零 StateStore 调用，管理读接口
+  只在请求到达管理路由时读取状态，控制写入成功后才应用内存覆写。
+- `cache.clear?chainId` 当前安全退化为全量清理（缓存条目未保留可逆 chain 索引），不改变
+  数据面语义但会比精确清理影响更多缓存。
+- 端点 `probe` 在无 ProbeManager 的进程内测试环境返回 503；生产主进程始终注入探针管理器。
+- 最近 flush 时间在 Admin state 摘要中暂以 0 表示，详细时间仍可由 Prometheus flush 指标
+  查询；后续可在 StateStore 接口增加只读元数据 getter。

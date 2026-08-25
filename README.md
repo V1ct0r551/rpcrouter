@@ -52,6 +52,7 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 | `hedging` | 只读请求第二发延迟、全局占比和健康池门槛 |
 | `chain_overrides` | 每链块时间、确认深度 K、tip TTL、附加/屏蔽端点及端点限额；可用于非 pinned 链 |
 | `state` | Redis/File 状态镜像、命名空间、required、flush 周期与健康快照 TTL |
+| `admin` | Admin API 开关、Bearer token、SPA 静态目录与 CORS 来源 |
 
 `chains` 是 pinned 链列表：启动即激活且永不因 idle/LRU 降级。动态目录链首个请求才激活，
 随后无流量自动降级为 dormant；`discovery.deny` 链返回 403。
@@ -62,6 +63,7 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 状态存储环境变量：`RPCROUTER_STATE_BACKEND=redis|file`、`RPCROUTER_REDIS_URL`、
 `RPCROUTER_STATE_NAMESPACE`、`RPCROUTER_STATE_RESET=1`。默认 Redis 不可达时自动降级为
 内存 + `data/state.json`，不会中断 RPC 流量；`RPCROUTER_STATE_REQUIRED=true` 用于必须持久化的部署。
+管理面可用 `RPCROUTER_ADMIN_TOKEN` 与 `RPCROUTER_ADMIN_STATIC_DIR` 覆写 token 和 SPA 目录。
 
 仓库配置使用偏保守的缓存确认深度。BSC 按 Maxwell 升级后的约 750ms 出块配置；Polygon
 约 2s、Arbitrum 约 250ms，Base、OP 与 Avalanche 约 2s。tip TTL 不超过对应块时间和 2s。
@@ -88,6 +90,24 @@ Phase 3 本机离线压测以 10,000 QPS 调度 60 秒，共 600,000 次请求�
 9,999.836 QPS，hit + fold 为 99.9948%，p99 4.126ms，用户可见错误为 0，且 mock 端点
 峰值 3 QPS，未超过 15 rps 上限。环境、方法和 429 摘除/回池时间线见
 [Phase 3 压测报告](docs/reports/loadtest-phase3.md)。
+
+## Admin API
+
+`admin.enabled` 默认开启；未配置 token 时 GET 只读接口开放，所有写操作返回
+`403 admin_disabled`。配置 token 后所有 `/admin/api/*` 请求必须携带
+`Authorization: Bearer <token>`。管理接口不会在 `/rpc` 请求路径访问状态存储。
+
+```sh
+curl http://127.0.0.1:8545/admin/api/overview
+curl -H 'Authorization: Bearer secret' \
+  'http://127.0.0.1:8545/admin/api/chains?state=dormant&limit=200'
+curl -X POST -H 'Authorization: Bearer secret' \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm":true}' http://127.0.0.1:8545/admin/api/state/reset
+```
+
+设置 `admin.static_dir` 后 `/dashboard/` 与任意不存在的 dashboard 路径均回退到
+`index.html`，用于托管独立 React dashboard；静态资源不要求 token。
 
 ## 部署
 

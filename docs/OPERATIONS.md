@@ -189,6 +189,26 @@ Redis 是默认持久镜像，key 使用 `{namespace}:` 前缀。内存仍是数
 库 API 用于运维脚本。健康快照按 `health_ttl_seconds` 过期，冷却中的端点重启恢复为 Cooling，
 其余端点恢复为 Probation，Active 必须重新通过探针。
 
+### 运行时控制
+
+Admin API 的写操作先写入 StateStore，成功后才更新内存运行态；收到
+`503 state_store_unavailable` 时应先检查 Redis/File 镜像与
+`rpcrouter_state_store_up`。常用操作：
+
+```sh
+curl http://127.0.0.1:8545/admin/api/chains/1
+curl -X POST -H 'Authorization: Bearer secret' \
+  -H 'Content-Type: application/json' -d '{"url":"https://rpc.example"}' \
+  http://127.0.0.1:8545/admin/api/chains/1/endpoints/disable
+curl -X PUT -H 'Authorization: Bearer secret' \
+  -H 'Content-Type: application/json' -d '{"tipTtlMs":1000}' \
+  http://127.0.0.1:8545/admin/api/chains/1/settings
+```
+
+未配置 `admin.auth_token` 时只读 GET 可用，写操作固定返回 403；生产环境应配置
+token、TLS 和反向代理限流。变更前用 `state/export` 备份，`state/import` 恢复，
+`state/reset` 必须显式提交 `{"confirm":true}`。每次控制操作追加审计记录。
+
 ## 10. 扩容/缩容与故障接管
 
 使用 `docker compose --profile cluster up -d redis rpcrouter-1 rpcrouter-2 rpcrouter-3 nginx`
