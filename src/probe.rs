@@ -26,6 +26,8 @@ use crate::{
 const PROBE_BODY_LIMIT: usize = 1024 * 1024;
 const SCHEDULER_TICK: Duration = Duration::from_millis(250);
 
+type ProbeQueueRx = mpsc::Receiver<(u64, Arc<Endpoint>)>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeOutcome {
     Passed,
@@ -45,12 +47,16 @@ pub struct ProbeManager {
     slow_threshold: Duration,
     /// 有界工作池：due 端点入队，worker 消费。
     queue_tx: mpsc::Sender<(u64, Arc<Endpoint>)>,
+    /// 工作池接收端（在 start_workers 中取出）。
+    queue_rx: Mutex<Option<ProbeQueueRx>>,
     /// 激活 kick 通道。
     kick_rx: Mutex<tokio::sync::broadcast::Receiver<u64>>,
     /// 在飞探针计数。
     in_flight: Arc<AtomicU64>,
     /// 队列深度（近似，由 channel 长度估算）。
     queue_depth: Arc<AtomicU64>,
+    /// 工作池并发数。
+    max_concurrency: usize,
 }
 
 impl ProbeManager {
@@ -63,7 +69,7 @@ impl ProbeManager {
         let kick_rx = registry.activation_channel().subscribe();
         let in_flight = Arc::new(AtomicU64::new(0));
         let queue_depth = Arc::new(AtomicU64::new(0));
-        let manager = Self {
+        Ok(Self {
             registry,
             client,
             global_slots: Arc::new(Semaphore::new(config.probe.max_concurrency)),
@@ -73,13 +79,21 @@ impl ProbeManager {
             request_timeout: Duration::from_millis(config.probe.request_timeout_ms),
             slow_threshold: Duration::from_millis(config.upstream.slow_threshold_ms),
             queue_tx,
+            queue_rx: Mutex::new(Some(queue_rx)),
             kick_rx: Mutex::new(kick_rx),
             in_flight,
             queue_depth,
-        };
-        // 启动有界工作池。
-        tokio::spawn(worker_pool(queue_rx, config.probe.max_concurrency));
-        Ok(manager)
+            max_concurrency: config.probe.max_concurrency,
+        })
+    }
+
+    /// 取出并启动有界工作池（必须在 manager 被 Arc 包装后调用，仅一次）。
+    fn take_worker_pool(self: &Arc<Self>) -> ProbeQueueRx {
+        self.queue_rx
+            .try_lock()
+            .expect("queue_rx lock")
+            .take()
+            .expect("workers already started")
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -168,6 +182,7 @@ impl ProbeManager {
             .await
     }
 
+    /// 显式时钟入口用于无需真实等待冷却窗口的确定性测试。
     pub async fn probe_endpoint_at(
         &self,
         chain_id: u64,
@@ -322,152 +337,21 @@ impl ProbeManager {
     }
 }
 
-/// 有界工作池：N 个 worker 从队列消费探针任务。
+/// 有界工作池：N 个 worker 从队列消费探针任务，通过 manager 执行。
 /// 不再每个 due 端点 `tokio::spawn` 一个任务挂在信号量上。
-async fn worker_pool(mut rx: mpsc::Receiver<(u64, Arc<Endpoint>)>, concurrency: usize) {
-    // 用 Arc<Semaphore> 限制并发，每个 worker 拿 permit 后执行。
-    let slots = Arc::new(Semaphore::new(concurrency));
+async fn worker_pool(manager: Arc<ProbeManager>, mut rx: ProbeQueueRx) {
+    let slots = Arc::new(Semaphore::new(manager.max_concurrency));
     loop {
         let (chain_id, endpoint) = match rx.recv().await {
             Some(item) => item,
             None => break,
         };
+        let manager = Arc::clone(&manager);
         let slots = Arc::clone(&slots);
         tokio::spawn(async move {
             let _permit = slots.acquire_owned().await;
-            probe_one(chain_id, endpoint).await;
+            manager.probe_endpoint(chain_id, endpoint).await;
         });
-    }
-}
-
-async fn probe_one(chain_id: u64, endpoint: Arc<Endpoint>) {
-    let now = Instant::now();
-    if !endpoint.begin_probe(now) {
-        return;
-    }
-    let client = Client::builder()
-        .user_agent(concat!("rpcrouter/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("build probe client");
-    let request_timeout = Duration::from_secs(5);
-    let slow_threshold = Duration::from_secs(4);
-
-    let started = Instant::now();
-    let chain_id_response = match rpc_call_one(
-        &client,
-        &endpoint,
-        "eth_chainId",
-        json!("rpcrouter-probe-chain"),
-        request_timeout,
-        slow_threshold,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(None) => return,
-        Err(Some(signal)) => {
-            endpoint.record_failure(now + started.elapsed(), signal.clone());
-            return;
-        }
-    };
-    let Some(actual) = parse_hex_result(&chain_id_response) else {
-        endpoint.record_failure(
-            now + started.elapsed(),
-            FailureSignal::new(FaultKind::InvalidResponse),
-        );
-        return;
-    };
-    if actual != chain_id {
-        endpoint.record_failure(
-            now + started.elapsed(),
-            FailureSignal::new(FaultKind::InvalidResponse),
-        );
-        return;
-    }
-    let block_response = match rpc_call_one(
-        &client,
-        &endpoint,
-        "eth_blockNumber",
-        json!("rpcrouter-probe-block"),
-        request_timeout,
-        slow_threshold,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(None) => return,
-        Err(Some(signal)) => {
-            endpoint.record_failure(now + started.elapsed(), signal.clone());
-            return;
-        }
-    };
-    let Some(_height) = parse_hex_result(&block_response) else {
-        endpoint.record_failure(
-            now + started.elapsed(),
-            FailureSignal::new(FaultKind::InvalidResponse),
-        );
-        return;
-    };
-    let latency = started.elapsed();
-    endpoint.record_success(now + latency, latency, true);
-}
-
-async fn rpc_call_one(
-    client: &Client,
-    endpoint: &Arc<Endpoint>,
-    method: &str,
-    id: Value,
-    request_timeout: Duration,
-    slow_threshold: Duration,
-) -> std::result::Result<Value, Option<FailureSignal>> {
-    let Some(_lease) = endpoint.try_acquire_probe() else {
-        return Err(None);
-    };
-    let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":[]});
-    let body = serde_json::to_vec(&request)
-        .map_err(|_| Some(FailureSignal::new(FaultKind::InvalidResponse)))?;
-    let started = Instant::now();
-    let response = timeout(
-        request_timeout,
-        client
-            .post(endpoint.url())
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send(),
-    )
-    .await;
-    let mut response = match response {
-        Err(_) => return Err(Some(FailureSignal::new(FaultKind::Timeout))),
-        Ok(Err(_)) => return Err(Some(FailureSignal::new(FaultKind::Transport))),
-        Ok(Ok(response)) => response,
-    };
-    let status = response.status();
-    let headers = response.headers().clone();
-    let mut body = Vec::new();
-    loop {
-        let chunk = match response.chunk().await {
-            Ok(chunk) => chunk,
-            Err(_) => return Err(Some(FailureSignal::new(FaultKind::Transport))),
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        if body.len().saturating_add(chunk.len()) > PROBE_BODY_LIMIT {
-            return Err(Some(FailureSignal::new(FaultKind::InvalidResponse)));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    match classify_response(
-        status,
-        &headers,
-        &body,
-        started.elapsed(),
-        &id,
-        slow_threshold,
-    ) {
-        ResponseClassification::Valid(value) => Ok(value),
-        ResponseClassification::Degraded { fault, .. } => Err(Some(FailureSignal::new(fault))),
-        ResponseClassification::Failure(signal) => Err(Some(signal)),
     }
 }
 
@@ -480,6 +364,8 @@ fn parse_hex_result(response: &Value) -> Option<u64> {
 }
 
 pub fn spawn(manager: Arc<ProbeManager>) {
+    let rx = manager.take_worker_pool();
+    tokio::spawn(worker_pool(Arc::clone(&manager), rx));
     tokio::spawn(async move {
         info!("health probe scheduler started");
         manager.run().await;
