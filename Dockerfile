@@ -3,7 +3,18 @@
 # 源码编译发生在 builder 阶段；运行阶段仅保留静态二进制，镜像尽量精简。
 
 # ---------------------------------------------------------------------------
-# 阶段 1：编译
+# 阶段 1：构建 Dashboard 静态资源
+# ---------------------------------------------------------------------------
+FROM node:22-bookworm-slim AS dashboard-builder
+
+WORKDIR /dashboard
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci
+COPY dashboard ./
+RUN npm run build
+
+# ---------------------------------------------------------------------------
+# 阶段 2：编译 Rust 网关
 # 使用 rust:1.97（与 Cargo.toml 的 rust-version=1.97 对齐），编译 release 二进制。
 # ---------------------------------------------------------------------------
 FROM rust:1.97 AS builder
@@ -19,7 +30,7 @@ COPY fixtures ./fixtures
 RUN cargo build --release --bin rpcrouter
 
 # ---------------------------------------------------------------------------
-# 阶段 2：运行镜像
+# 阶段 3：运行镜像
 # 仅拷贝二进制与默认配置；debian:bookworm-slim 足够满足 rustls(TLS) 运行需求。
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim
@@ -35,6 +46,7 @@ RUN groupadd --gid 10001 rpcrouter \
 WORKDIR /app
 
 COPY --from=builder /build/target/release/rpcrouter /usr/local/bin/rpcrouter
+COPY --from=dashboard-builder /dashboard/dist /app/dashboard
 # 运行时仍可被环境变量/挂载配置覆写；默认配置启用全部 8 条链。
 COPY config.toml /app/config.toml
 COPY cluster.toml /app/cluster.toml
@@ -49,6 +61,7 @@ VOLUME /app/data
 # 可选覆盖：RPCROUTER_CONFIG 指向挂载的配置文件；RPCROUTER_* 覆写关键项。
 ENV RPCROUTER_CONFIG=/app/config.toml
 ENV RPCROUTER_CHAINLIST_CACHE_PATH=/app/data/rpcs.json
+ENV RPCROUTER_ADMIN_STATIC_DIR=/app/dashboard
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8545/healthz >/dev/null || exit 1

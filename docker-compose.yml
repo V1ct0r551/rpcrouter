@@ -36,6 +36,7 @@ services:
       RPCROUTER_REDIS_URL: "redis://redis:6379/0"
       # 环境变量覆写 config 关键项（详见 config.rs 的 apply_env_overrides）。
       RPCROUTER_LISTEN: "0.0.0.0:8545"
+      RPCROUTER_ADMIN_STATIC_DIR: "/app/dashboard"
       RPCROUTER_CHAINS: "1,143,56,137,42161,8453,10,43114"
       RPCROUTER_CACHE_MAX_BYTES: "536870912"
       RPCROUTER_METRICS_ENABLED: "true"
