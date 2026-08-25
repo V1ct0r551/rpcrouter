@@ -659,12 +659,14 @@ mod tests {
         metrics.record_cache_miss_role(1, true);
         metrics.record_upstream(1, "http://upstream");
         metrics.record_latency(1, Duration::from_millis(2));
+        metrics.record_catalog_records_skipped(1);
         let encoded = metrics.encode(&rpc_registry).await.expect("encode");
         assert!(encoded.contains("rpcrouter_chain_ingress_requests_total{chain_id=\"1\"} 1"));
         assert!(encoded.contains("rpcrouter_cache_hit_ratio{chain_id=\"1\"} 1"));
         assert!(encoded.contains("rpcrouter_endpoint_state"));
         assert!(encoded.contains("endpoint=\"http://upstream\""));
         assert!(encoded.contains("rpcrouter_chain_pinned{chain_id=\"1\"} 1"));
+        assert!(encoded.contains("rpcrouter_catalog_records_skipped_total 1"));
     }
 
     #[tokio::test]

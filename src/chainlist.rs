@@ -941,6 +941,22 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_document_uses_the_same_tolerant_record_parser() {
+        let document = serde_json::json!({
+            "chains": [
+                {"name":"Good", "chainId": 1, "rpc": []},
+                {"name":"Bad", "chainId": "bad", "rpc": []}
+            ]
+        });
+        let bytes = serde_json::to_vec(&document).expect("serialize");
+        let (catalog, _, stats) =
+            parse_catalog_with_stats(&bytes, true, true, &HashSet::new()).expect("parse wrapped");
+        assert_eq!(catalog.chains.len(), 1);
+        assert_eq!(stats.records_total, 2);
+        assert_eq!(stats.records_skipped, 1);
+    }
+
+    #[test]
     #[ignore = "requires local data/rpcs.json; never accesses the network"]
     fn parses_full_local_chainlist_if_present() {
         let path = Path::new("data/rpcs.json");
@@ -999,10 +1015,9 @@ mod tests {
             ChainlistLoader::with_client_legacy(Client::new(), url, cache_path.clone(), [1, 143])
                 .expect("loader");
 
-        assert_eq!(
-            loader.load().await.expect("network load").source,
-            RefreshSource::Network
-        );
+        let network = loader.load().await.expect("network load");
+        assert_eq!(network.source, RefreshSource::Network);
+        assert_eq!(network.records_skipped, 1);
         assert_eq!(
             loader.load().await.expect("not modified").source,
             RefreshSource::NotModified
