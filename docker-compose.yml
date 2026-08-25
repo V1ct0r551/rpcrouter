@@ -12,6 +12,11 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
     networks:
       - rpcrouter-net
 
@@ -57,7 +62,9 @@ services:
     environment:
       RPCROUTER_REDIS_URL: "redis://redis:6379/0"
       RPCROUTER_CONFIG: "/app/cluster.toml"
-    depends_on: [redis]
+    depends_on:
+      redis:
+        condition: service_healthy
     networks: [rpcrouter-net]
   rpcrouter-2:
     image: rpcrouter:latest
@@ -68,7 +75,9 @@ services:
     environment:
       RPCROUTER_REDIS_URL: "redis://redis:6379/0"
       RPCROUTER_CONFIG: "/app/cluster.toml"
-    depends_on: [redis]
+    depends_on:
+      redis:
+        condition: service_healthy
     networks: [rpcrouter-net]
   rpcrouter-3:
     image: rpcrouter:latest
@@ -79,7 +88,9 @@ services:
     environment:
       RPCROUTER_REDIS_URL: "redis://redis:6379/0"
       RPCROUTER_CONFIG: "/app/cluster.toml"
-    depends_on: [redis]
+    depends_on:
+      redis:
+        condition: service_healthy
     networks: [rpcrouter-net]
   nginx:
     image: nginx:1.27-alpine

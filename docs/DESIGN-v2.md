@@ -353,11 +353,11 @@ Phase B 各项仅作为 P5 备选，按需再立项。** 不用轮询：轮询�
 
 ### W6a 偏差记录
 
-- RedisStore 以 namespace 下的 JSON document 作为兼容镜像，同时用 pipeline 写入 `meta`、
-  `catalog`、`override:*`、`health:*`、`chains:hot` 与 `audit` 结构化 key；这样在不增加请求
-  路径网络往返的前提下保留 import/reset 的 MULTI/EXEC 原子边界。
-- optional Redis 降级通过 FileStore 镜像承接，后台 supervisor 指数退避重连并执行完整导入；
-  管理 API 尚未实现（属于 W6b，本轮未触碰）。
+- RedisStore 使用结构化 key 作为唯一真相：`meta`、独立 `catalog`、`override:index`、
+  `health:index`、按实例 `hot:<instance_id>` 与 `audit`；不再维护 document JSON 镜像。
+  import/reset 使用 MULTI/EXEC 批量清理和重写。
+- optional Redis 降级通过 FileStore 镜像承接，后台 supervisor 指数退避重连；Redis 非空时
+  不用本地文件覆盖，只补写本地脏 health 快照。
 - Endpoint dirty 集合按端点原子位维护，flush 每轮最多 2000 条；未引入 Redis 分布式 token
   bucket 或共享响应缓存（按 §12 Phase B/P5 规划）。
 - cluster profile 关闭共享 `chains:hot` 的启动预激活（`state.restore_hot=false`），避免实例接管

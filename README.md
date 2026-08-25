@@ -51,7 +51,7 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 | `cache` | 按响应字节加权的容量（默认 512 MiB）和不可变 TTL |
 | `hedging` | 只读请求第二发延迟、全局占比和健康池门槛 |
 | `chain_overrides` | 每链块时间、确认深度 K、tip TTL、附加/屏蔽端点及端点限额；可用于非 pinned 链 |
-| `state` | Redis/File 状态镜像、命名空间、required、flush 周期与健康快照 TTL |
+| `state` | Redis/File/Memory 状态镜像、命名空间、required、flush 周期与健康快照 TTL |
 | `admin` | Admin API 开关、Bearer token、SPA 静态目录与 CORS 来源 |
 
 `chains` 是 pinned 链列表：启动即激活且永不因 idle/LRU 降级。动态目录链首个请求才激活，
@@ -161,7 +161,8 @@ docker compose --profile cluster up -d --build redis rpcrouter-1 rpcrouter-2 rpc
 # 分片入口：http://127.0.0.1:18545/rpc/{chainId}
 ```
 
-扩容只需在 `deploy/nginx-shard.conf` 增加实例并 reload；每条链固定落一个实例，故缓存、
+compose 使用 `deploy/nginx-shard-compose.conf`，独立部署模板为 `deploy/nginx-shard.conf`。
+扩容时在对应文件增加实例并 reload；每条链固定落一个实例，故缓存、
 in-flight 折叠和端点限流不会按实例数放大。Redis 使用 appendonly 卷，故障时实例会用本地
 镜像继续出流量，恢复后自动回灌。
 
