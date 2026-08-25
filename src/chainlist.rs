@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -140,8 +143,6 @@ struct LoaderState {
     etag: Option<HeaderValue>,
     last_success: Option<Arc<Catalog>>,
     last_snapshot: Option<Arc<ChainlistSnapshot>>,
-    /// 刷新锁：manual refresh 与周期刷新互斥。
-    refreshing: bool,
     /// 最近一次成功刷新的 Unix 秒时间戳。
     last_refresh_unix: u64,
     /// 最近一次成功刷新的来源。
@@ -158,6 +159,7 @@ pub struct ChainlistLoader {
     include_testnets: bool,
     pinned_chains: HashSet<u64>,
     state: Mutex<LoaderState>,
+    refreshing: AtomicBool,
 }
 
 impl ChainlistLoader {
@@ -193,6 +195,7 @@ impl ChainlistLoader {
             include_testnets,
             pinned_chains: pinned_chains.into_iter().collect(),
             state: Mutex::new(LoaderState::default()),
+            refreshing: AtomicBool::new(false),
         })
     }
 
@@ -218,10 +221,11 @@ impl ChainlistLoader {
         }
 
         {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             if let (Some(catalog), Some(snapshot)) =
                 (state.last_success.clone(), state.last_snapshot.clone())
             {
+                state.last_source = Some(RefreshSource::Memory);
                 return Ok(LoadResult {
                     catalog,
                     snapshot,
@@ -272,17 +276,25 @@ impl ChainlistLoader {
     /// 手动刷新入口（供 W6 调用），与周期刷新互斥。
     /// 返回 Ok(LoadResult) 成功；刷新进行中返回 None。
     pub async fn refresh(&self) -> Result<Option<LoadResult>> {
-        let mut state = self.state.lock().await;
-        if state.refreshing {
+        if self
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             return Ok(None);
         }
-        state.refreshing = true;
-        drop(state);
-
-        let result = self.load().await;
-
-        self.state.lock().await.refreshing = false;
-        result.map(Some)
+        struct RefreshGuard<'a> {
+            refreshing: &'a AtomicBool,
+        }
+        impl Drop for RefreshGuard<'_> {
+            fn drop(&mut self) {
+                self.refreshing.store(false, Ordering::Release);
+            }
+        }
+        let _guard = RefreshGuard {
+            refreshing: &self.refreshing,
+        };
+        self.load().await.map(Some)
     }
 
     /// 查询最近一次刷新状态（供 metrics 与 Admin API）。
@@ -306,7 +318,7 @@ impl ChainlistLoader {
             catalog_chains,
             catalog_endpoints,
             last_error: state.last_error.clone(),
-            refreshing: state.refreshing,
+            refreshing: self.refreshing.load(Ordering::Acquire),
         }
     }
 
@@ -391,7 +403,6 @@ impl ChainlistLoader {
         let mut state = self.state.lock().await;
         state.last_success = Some(Arc::clone(&catalog));
         state.last_snapshot = Some(Arc::clone(&snapshot));
-        state.last_refresh_unix = unix_ts();
         state.last_source = Some(source);
         LoadResult {
             catalog,
