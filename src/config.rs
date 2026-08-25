@@ -803,6 +803,7 @@ mod tests {
             &[
                 ("RPCROUTER_ADMIN_TOKEN", "secret"),
                 ("RPCROUTER_ADMIN_STATIC_DIR", "/tmp/dashboard"),
+                ("RPCROUTER_ADMIN_PUBLIC_SITE", "false"),
             ],
             || {
                 let mut config = Config::default();
@@ -814,6 +815,7 @@ mod tests {
                     config.admin.static_dir,
                     Some(std::path::PathBuf::from("/tmp/dashboard"))
                 );
+                assert!(!config.admin.public_site);
             },
         );
     }

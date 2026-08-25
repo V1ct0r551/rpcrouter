@@ -179,6 +179,34 @@ async fn public_rows_are_redacted_and_disabled_chains_are_hidden() {
         assert!(!serialized.contains(forbidden), "leaked {forbidden}");
     }
     assert_eq!(body["items"][0]["nativeSymbol"], "ETH");
+    let keys = body["items"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        [
+            "active",
+            "cacheHitsTotal",
+            "cacheLookupsTotal",
+            "catalogEndpoints",
+            "chainId",
+            "endpoints",
+            "explorerUrl",
+            "head",
+            "ingressTotal",
+            "isTestnet",
+            "name",
+            "nativeSymbol",
+            "shortName",
+            "state",
+            "status",
+        ]
+        .into_iter()
+        .collect()
+    );
     let disabled = service
         .clone()
         .oneshot(
@@ -235,7 +263,14 @@ async fn public_spa_routes_are_safe_and_obey_configuration() {
         );
     }
     let (disabled, _) = app(None, false, Some(dir)).await;
-    for path in ["/", "/chain/1", "/chain/1/", "/api/public/overview"] {
+    for path in [
+        "/",
+        "/chain/1",
+        "/chain/1/",
+        "/api/public/overview",
+        "/api/public/chains",
+        "/api/public/chains/1",
+    ] {
         assert_eq!(
             response(&disabled, path, None).await.status(),
             StatusCode::NOT_FOUND

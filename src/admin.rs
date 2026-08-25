@@ -377,13 +377,6 @@ async fn public_chains(State(s): State<AdminState>, Query(query): Query<ChainQue
     if query.q.as_deref().is_some_and(|q| q.chars().count() > 64) {
         return err(StatusCode::BAD_REQUEST, "invalid_argument", "q is too long");
     }
-    if query.limit.is_some_and(|limit| limit > 200) {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "limit must be <= 200",
-        );
-    }
     let mut rows = build_rows(&s, None).await;
     rows.retain(|r| r.state != "disabled");
     if let Some(state) = query.state.as_deref().filter(|x| *x != "all") {
