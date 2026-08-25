@@ -151,51 +151,70 @@ async fn rpc(Path(chain_id): Path<u64>, State(state): State<AppState>, body: Byt
     // 路由层解析链一次（batch 也只做一次）。
     // 语义边界：未知链 404 / 禁用链 403 / 0 端点链 503，均为入口拒绝，
     // 计入 ingress_rejected，不计 user_visible_errors。
+    let request: Box<RawValue> = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return Json(jsonrpc_error(Value::Null, -32700, "Parse error")).into_response(),
+    };
+    let request_is_batch = request.get().trim_start().starts_with('[');
+    let ingress_error = |status: StatusCode, error: Value| {
+        if request_is_batch
+            && let Ok(batch) = serde_json::from_str::<Vec<Box<RawValue>>>(request.get())
+        {
+            return (
+                status,
+                Json(Value::Array(
+                    batch
+                        .iter()
+                        .map(|item| {
+                            let id = request_id(item);
+                            let mut item_error = error.clone();
+                            item_error["id"] = id;
+                            item_error
+                        })
+                        .collect(),
+                )),
+            )
+                .into_response();
+        }
+        (status, Json(error)).into_response()
+    };
     let resolved = state.registry.resolve_for_request(chain_id).await;
     let Some(chain_state) = resolved else {
         // 未知链 → 404。
         state.metrics.record_ingress_rejected("unknown_chain");
-        return (
+        return ingress_error(
             StatusCode::NOT_FOUND,
-            Json(jsonrpc_error(
+            jsonrpc_error(
                 Value::Null,
                 -32000,
                 &format!("rpcrouter: unknown chain id {chain_id}"),
-            )),
-        )
-            .into_response();
+            ),
+        );
     };
     if chain_state.state_label() == crate::registry::ChainStateLabel::Disabled {
         state.metrics.record_ingress_rejected("chain_disabled");
-        return (
+        return ingress_error(
             StatusCode::FORBIDDEN,
-            Json(jsonrpc_error(
+            jsonrpc_error(
                 Value::Null,
                 -32000,
                 &format!("rpcrouter: chain {chain_id} is disabled"),
-            )),
-        )
-            .into_response();
+            ),
+        );
     }
     // 0 端点链 → 503。
     let endpoint_count = state.registry.endpoint_count(chain_id).await;
     if endpoint_count == 0 {
         state.metrics.record_ingress_rejected("no_endpoints");
-        return (
+        return ingress_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(jsonrpc_error(
+            jsonrpc_error(
                 Value::Null,
                 -32000,
                 &format!("rpcrouter: chain {chain_id} has no public endpoints"),
-            )),
-        )
-            .into_response();
+            ),
+        );
     }
-
-    let request: Box<RawValue> = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(_) => return Json(jsonrpc_error(Value::Null, -32700, "Parse error")).into_response(),
-    };
 
     match request.get().trim_start().as_bytes().first() {
         Some(b'{') => Json(state.forwarder.execute_raw(chain_id, &request).await).into_response(),

@@ -506,6 +506,7 @@ pub type ActivationKick = broadcast::Sender<u64>;
 pub struct Registry {
     chains: DashMap<u64, Arc<ChainState>>,
     activation_locks: DashMap<u64, Arc<tokio::sync::Mutex<()>>>,
+    runtime_pinned: DashMap<u64, bool>,
     catalog: RwLock<Option<Arc<Catalog>>>,
     config: Config,
     user_visible_errors: AtomicU64,
@@ -535,6 +536,7 @@ impl Registry {
         Self {
             chains: DashMap::new(),
             activation_locks: DashMap::new(),
+            runtime_pinned: DashMap::new(),
             catalog: RwLock::new(None),
             config: config.clone(),
             user_visible_errors: AtomicU64::new(0),
@@ -606,10 +608,17 @@ impl Registry {
         }
 
         // 未知链不得污染 activation_locks：先完成目录/配置判定，再建立锁。
-        let pinned = self.config.chains.contains(&chain_id);
+        let pinned = self.config.chains.contains(&chain_id)
+            || self
+                .runtime_pinned
+                .get(&chain_id)
+                .is_some_and(|value| *value);
+        let denied = self.config.discovery.deny.contains(&chain_id);
         let catalog = self.catalog.read().await;
         let catalog_entry = catalog.as_ref().and_then(|c| c.lookup(chain_id));
-        if (!self.config.discovery.enabled && !pinned) || (catalog_entry.is_none() && !pinned) {
+        if !denied
+            && ((!self.config.discovery.enabled && !pinned) || (catalog_entry.is_none() && !pinned))
+        {
             return None;
         }
         drop(catalog);
@@ -641,7 +650,9 @@ impl Registry {
         let catalog_entry = catalog.as_ref().and_then(|c| c.lookup(chain_id));
 
         // discovery disabled 等价 v1：目录只用于 pinned 链，其他链视为未知。
-        if (!self.config.discovery.enabled && !pinned) || (catalog_entry.is_none() && !pinned) {
+        if !denied
+            && ((!self.config.discovery.enabled && !pinned) || (catalog_entry.is_none() && !pinned))
+        {
             return None;
         }
 
@@ -714,8 +725,37 @@ impl Registry {
         // 更新 last_ingress。
         state.last_ingress.store(now, Ordering::Relaxed);
 
+        // 激活路径同步执行软上限检查，避免短时间冷启动扫过整份目录。
+        let hot_count = self
+            .chains
+            .iter()
+            .filter(|entry| entry.value().state_label() == ChainStateLabel::Hot)
+            .count();
+        let mut kick_probes = true;
+        if hot_count > self.config.discovery.max_hot_chains {
+            let candidate = self
+                .chains
+                .iter()
+                .filter_map(|entry| {
+                    let value = entry.value();
+                    let last = value.last_ingress.load(Ordering::Relaxed);
+                    (!value.pinned.load(Ordering::Relaxed)
+                        && *entry.key() != chain_id
+                        && now.saturating_sub(last) >= 5)
+                        .then_some((*entry.key(), last))
+                })
+                .min_by_key(|(_, last)| *last);
+            kick_probes = if let Some((evict_id, last)) = candidate {
+                self.demote_if_unchanged(evict_id, "lru", last).await
+            } else {
+                false
+            };
+        }
+
         // 通知探针调度器。
-        let _ = self.activation_tx.send(chain_id);
+        if kick_probes {
+            let _ = self.activation_tx.send(chain_id);
+        }
 
         Some(state)
     }
@@ -748,7 +788,11 @@ impl Registry {
             let name = source
                 .map(|chain| chain.name.clone())
                 .unwrap_or_else(|| format!("Chain {chain_id}"));
-            let pinned = self.config.chains.contains(&chain_id);
+            let pinned = self.config.chains.contains(&chain_id)
+                || self
+                    .runtime_pinned
+                    .get(&chain_id)
+                    .is_some_and(|value| *value);
             let state = self
                 .chains
                 .entry(chain_id)
@@ -875,7 +919,11 @@ impl Registry {
         let Some(state) = self.chain(chain_id) else {
             return false;
         };
+        self.runtime_pinned.insert(chain_id, pinned);
         state.pinned.store(pinned, Ordering::Relaxed);
+        if !pinned {
+            state.last_ingress.store(unix_seconds(), Ordering::Relaxed);
+        }
         true
     }
 

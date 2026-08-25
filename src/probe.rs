@@ -399,9 +399,23 @@ async fn worker_pool(manager: Arc<ProbeManager>, mut rx: ProbeQueueRx) {
                 manager.mark_received();
                 let manager = Arc::clone(&manager);
                 active.spawn(async move {
+                    struct CompletionGuard {
+                        manager: Arc<ProbeManager>,
+                        chain_id: u64,
+                        endpoint: Arc<Endpoint>,
+                    }
+                    impl Drop for CompletionGuard {
+                        fn drop(&mut self) {
+                            self.manager.complete(self.chain_id, &self.endpoint);
+                        }
+                    }
+                    let _guard = CompletionGuard {
+                        manager: Arc::clone(&manager),
+                        chain_id,
+                        endpoint: Arc::clone(&endpoint),
+                    };
                     manager.probe_endpoint(chain_id, Arc::clone(&endpoint)).await;
                     manager.schedule_after_completion(chain_id, &endpoint).await;
-                    manager.complete(chain_id, &endpoint);
                 });
             }
             joined = active.join_next(), if !active.is_empty() => {

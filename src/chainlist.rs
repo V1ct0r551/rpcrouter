@@ -366,6 +366,22 @@ impl ChainlistLoader {
             &self.pinned_chains,
         )
         .context("chainlist response is invalid")?;
+        let previous_chains = self
+            .state
+            .lock()
+            .await
+            .last_success
+            .as_ref()
+            .map_or(0, |catalog| catalog.chains.len());
+        if catalog.chains.is_empty()
+            || (previous_chains > 0 && catalog.chains.len() * 2 < previous_chains)
+        {
+            warn!(
+                chains = catalog.chains.len(),
+                previous_chains, "chainlist response rejected by catalog sanity check"
+            );
+            bail!("chainlist response failed catalog sanity check");
+        }
         if let Err(error) = persist_cache(&self.cache_path, &bytes).await {
             warn!(
                 path = %self.cache_path.display(),
@@ -710,6 +726,48 @@ mod tests {
         format!("http://{address}/rpcs.json")
     }
 
+    #[tokio::test]
+    async fn cancelled_refresh_releases_refresh_guard() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/rpcs.json",
+            get({
+                let calls = Arc::clone(&calls);
+                move || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        (StatusCode::OK, BUILTIN_FIXTURE).into_response()
+                    }
+                }
+            }),
+        );
+        let url = spawn_server(app).await;
+        let loader = ChainlistLoader::with_client(
+            Client::new(),
+            url,
+            temporary_cache_path("cancelled-refresh"),
+            true,
+            true,
+            HashSet::new(),
+        )
+        .expect("loader");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), loader.refresh())
+                .await
+                .is_err()
+        );
+        assert!(!loader.refresh_state().await.refreshing);
+        let result = loader
+            .refresh()
+            .await
+            .expect("second refresh")
+            .expect("not busy");
+        assert_eq!(result.source, RefreshSource::Network);
+    }
+
     #[test]
     fn fixture_is_filtered_and_deduplicated() {
         let snapshot = parse_and_filter(BUILTIN_FIXTURE, &allowed()).expect("parse fixture");
@@ -925,6 +983,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn endpoint_normalization_deduplicates_fragments_and_tracking_forms() {
+        let raw = serde_json::json!({
+            "chains": [{
+                "name": "Dedup",
+                "chainId": 9001,
+                "rpc": [
+                    "https://a/#x",
+                    {"url": "https://a/", "tracking": "provider"},
+                    "https://a/"
+                ]
+            }]
+        });
+        let bytes = serde_json::to_vec(&raw).expect("json");
+        let (catalog, _) = parse_catalog(&bytes, true, true, &HashSet::new()).expect("catalog");
+        let chain = catalog.lookup(9001).expect("chain");
+        assert_eq!(chain.endpoints.len(), 1);
+        assert_eq!(chain.endpoints[0].url, "https://a/");
     }
 
     #[test]

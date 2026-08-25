@@ -26,7 +26,7 @@
 groups:
   - name: rpcrouter-availability
     rules:
-      # Any user-visible error is an alert. This is the project's only hard promise to callers.
+      # 任一上游承诺失败都告警；这是项目对调用方的唯一硬承诺。
       - alert: RpcrouterUserVisibleErrors
         expr: sum by (chain_id) (rate(rpcrouter_user_visible_errors_total[2m])) > 0
         for: 2m
@@ -36,9 +36,9 @@ groups:
           summary: "chain {{ $labels.chain_id }} user-visible errors (all upstream endpoints exhausted)"
           description: "rpcrouter has no available endpoints for chain_id={{ $labels.chain_id }}. Callers receive -32000. Investigate endpoint pool immediately."
 
-      # Active endpoints low water mark. v2: only watches pinned chains.
+      # Active 端点低水位；v2 仅观察 pinned 链。
       - alert: RpcrouterChainActiveEndpointsLow
-        expr: sum by (chain_id) (rpcrouter_endpoint_state{state="active"}) < 2 and on(chain_id) rpcrouter_chain_pinned == 1
+        expr: rpcrouter_chain_pinned == 1 unless on(chain_id) (sum by (chain_id) (rpcrouter_endpoint_state{state="active"}) >= 2)
         for: 5m
         labels:
           severity: warning
@@ -48,7 +48,7 @@ groups:
 
   - name: rpcrouter-performance
     rules:
-      # Cache hit ratio drop.
+      # 缓存命中率下降。
       - alert: RpcrouterCacheHitRatioDropped
         expr: max_over_time(rpcrouter_cache_hit_ratio[1m]) < 0.8
         for: 5m
