@@ -943,15 +943,17 @@ mod tests {
             forwarder,
             config.server.batch_limit,
         ));
-        let (status, _) = post_json_status(app.clone(), "/rpc/999", json!([{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]},{"jsonrpc":"2.0","id":2,"method":"eth_blockNumber","params":[]}])).await;
+        let (status, body) = post_json_status(app.clone(), "/rpc/999", json!([{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]},{"jsonrpc":"2.0","id":2,"method":"eth_blockNumber","params":[]}])).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _) = post_json_status(
+        assert_eq!(body.as_array().map(Vec::len), Some(2));
+        let (status, body) = post_json_status(
             app,
             "/rpc/127",
             json!([{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}]),
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
         let encoded = metrics.encode(&registry).await.expect("metrics");
         assert!(encoded.contains("reason=\"unknown_chain\"} 1"));
         assert!(encoded.contains("reason=\"no_endpoints\"} 1"));
