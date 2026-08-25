@@ -89,6 +89,7 @@ pub enum RefreshSource {
     Network,
     NotModified,
     Memory,
+    StateStore,
     Disk,
     Fixture,
 }
@@ -100,6 +101,7 @@ impl RefreshSource {
             Self::Network => "network",
             Self::NotModified => "not_modified",
             Self::Memory => "memory",
+            Self::StateStore => "state_store",
             Self::Disk => "disk",
             Self::Fixture => "fixture",
         }
@@ -214,6 +216,14 @@ impl ChainlistLoader {
 
     /// 优先联网刷新；失败后依次回退到进程内快照、磁盘缓存和内置样例。
     pub async fn load(&self) -> Result<LoadResult> {
+        self.load_with_store_catalog(None).await
+    }
+
+    /// 启动加载顺序：网络、进程内、状态存储、磁盘、fixture。
+    pub async fn load_with_store_catalog(
+        &self,
+        store_catalog: Option<&Value>,
+    ) -> Result<LoadResult> {
         let rejected_network_snapshot = match self.fetch_network().await {
             Ok(result) => return Ok(result),
             Err(error) => {
@@ -237,6 +247,32 @@ impl ChainlistLoader {
                     records_skipped: 0,
                     rejected_network_snapshot,
                 });
+            }
+        }
+
+        if let Some(value) = store_catalog {
+            match serde_json::to_vec(value)
+                .context("failed to encode state store catalog")
+                .and_then(|bytes| {
+                    parse_catalog_with_stats(
+                        &bytes,
+                        self.discovery_enabled,
+                        self.include_testnets,
+                        &self.pinned_chains,
+                    )
+                }) {
+                Ok((catalog, snapshot, stats)) => {
+                    return Ok(self
+                        .remember(
+                            catalog,
+                            snapshot,
+                            stats,
+                            RefreshSource::StateStore,
+                            rejected_network_snapshot,
+                        )
+                        .await);
+                }
+                Err(error) => warn!(error = %error, "state store catalog is invalid"),
             }
         }
 
@@ -448,6 +484,36 @@ impl ChainlistLoader {
             rejected_network_snapshot,
         }
     }
+}
+
+/// 将内存目录转换为 chainlist 兼容文档，供持久层回退后复用同一解析路径。
+pub fn catalog_document(catalog: &Catalog) -> Value {
+    Value::Array(
+        catalog
+            .chains
+            .iter()
+            .map(|chain| {
+                serde_json::json!({
+                    "chainId": chain.chain_id,
+                    "name": chain.name,
+                    "shortName": chain.short_name,
+                    "chain": chain.chain,
+                    "chainSlug": chain.slug,
+                    "isTestnet": chain.is_testnet,
+                    "nativeCurrency": chain.native_symbol.as_ref().map(|symbol| serde_json::json!({"symbol": symbol})),
+                    "explorers": chain.explorer_url.as_ref().map(|url| vec![serde_json::json!({"url": url})]).unwrap_or_default(),
+                    "status": chain.status,
+                    "tvl": chain.tvl,
+                    "rpc": chain.endpoints.iter().map(|endpoint| {
+                        match &endpoint.tracking {
+                            Some(tracking) => serde_json::json!({"url": endpoint.url, "tracking": tracking}),
+                            None => Value::String(endpoint.url.clone()),
+                        }
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn unix_ts() -> u64 {
@@ -1094,6 +1160,47 @@ mod tests {
         );
         assert_eq!(stats.records_skipped, 0);
         assert!(endpoints >= 5_000, "only {endpoints} endpoints");
+    }
+
+    #[tokio::test]
+    async fn state_store_catalog_is_used_before_disk_and_fixture() {
+        let mut config = Config::default();
+        config.chainlist.cache_path =
+            std::env::temp_dir().join(format!("rpcrouter-missing-{}.json", unix_ts()));
+        let loader = ChainlistLoader::with_client(
+            Client::new(),
+            "http://127.0.0.1:1/unreachable".to_owned(),
+            config.chainlist.cache_path.clone(),
+            true,
+            true,
+            [],
+        )
+        .unwrap();
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 999,
+                name: "Stored".to_owned(),
+                short_name: Some("stored".to_owned()),
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: Some("active".to_owned()),
+                tvl: None,
+                endpoints: vec![CatalogEndpoint {
+                    url: "https://stored.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashMap::from([(999, 0)]),
+        };
+        let result = loader
+            .load_with_store_catalog(Some(&catalog_document(&catalog)))
+            .await
+            .unwrap();
+        assert_eq!(result.source, RefreshSource::StateStore);
+        assert_eq!(result.catalog.lookup(999).unwrap().name, "Stored");
     }
 
     #[tokio::test]

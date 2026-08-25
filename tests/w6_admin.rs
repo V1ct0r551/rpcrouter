@@ -20,7 +20,7 @@ use rpcrouter::{
     server::{AppState, router as app_router},
     state::{
         BootstrapState, ChainOverrideState, EndpointOverrideState, HealthSnapshot, MemoryStore,
-        Overrides, StateExport, StateStore,
+        Overrides, StateExport, StateRuntimeSnapshot, StateStore,
     },
 };
 use serde_json::{Value, json};
@@ -143,6 +143,16 @@ async fn app(
     let forwarder = Arc::new(Forwarder::new(Arc::clone(&registry), &cfg).unwrap());
     let store = Arc::new(MemoryStore::new());
     store.bootstrap().await.unwrap();
+    let state_runtime = StateRuntimeSnapshot::new("memory", "test", "test-1");
+    {
+        let mut snapshot = state_runtime.write().await;
+        snapshot.up = true;
+        snapshot.last_flush_unix = 101;
+        snapshot.last_flush_result = "success".into();
+        snapshot.last_flush_duration_ms = 12;
+        snapshot.dirty_endpoints = 3;
+        snapshot.last_ping_unix = 102;
+    }
     let admin = AdminState {
         registry: Arc::clone(&registry),
         forwarder: Arc::clone(&forwarder),
@@ -152,6 +162,7 @@ async fn app(
         probe: Some(Arc::new(ProbeManager::new(registry.clone(), &cfg).unwrap())),
         config: cfg.clone(),
         started: std::time::Instant::now(),
+        state_runtime,
     };
     let service = app_router(AppState::new(registry.clone(), forwarder, 10).with_admin(admin));
     (service, registry, store, controller)
@@ -222,6 +233,31 @@ async fn admin_auth_matrix_and_read_only_contract() {
 }
 
 #[tokio::test]
+async fn state_metadata_uses_runtime_snapshot_without_store_calls() {
+    let (service, _, store, _) = app(None, true).await;
+    let before = store.call_count();
+    let response = service
+        .oneshot(
+            Request::get("/admin/api/state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["backend"], "memory");
+    assert_eq!(body["namespace"], "test");
+    assert_eq!(body["instanceId"], "test-1");
+    assert_eq!(body["lastFlushUnix"], 101);
+    assert_eq!(body["lastFlushResult"], "success");
+    assert_eq!(body["lastFlushDurationMs"], 12);
+    assert_eq!(body["dirtyEndpoints"], 3);
+    assert_eq!(body["lastPingUnix"], 102);
+    assert_eq!(store.call_count(), before);
+}
+
+#[tokio::test]
 async fn endpoint_controls_persist_then_change_runtime() {
     let (app, registry, store, _) = app(Some("secret"), true).await;
     let body = json!({"url": registry.endpoint(1, registry.all_endpoints(1).await[0].url()).await.unwrap().url()});
@@ -259,6 +295,7 @@ async fn unavailable_store_returns_503_without_memory_change() {
         probe: None,
         config: cfg,
         started: std::time::Instant::now(),
+        state_runtime: StateRuntimeSnapshot::new("memory", "test", "test-1"),
     };
     let service = app_router(AppState::new(registry.clone(), f, 10).with_admin(admin));
     let r = service
@@ -366,6 +403,7 @@ async fn static_spa_fallback_and_disabled_admin() {
         probe: None,
         config: cfg,
         started: std::time::Instant::now(),
+        state_runtime: StateRuntimeSnapshot::new("memory", "test", "test-1"),
     };
     let r = app_router(AppState::new(registry, f, 10).with_admin(admin))
         .oneshot(

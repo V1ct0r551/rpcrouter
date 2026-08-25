@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -12,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use redis::{
     AsyncCommands,
     aio::{ConnectionManager, ConnectionManagerConfig},
@@ -26,6 +28,41 @@ use tokio::{
 use tracing::{info, warn};
 
 pub const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug)]
+pub struct StateRuntimeSnapshot {
+    pub backend: String,
+    pub namespace: String,
+    pub instance_id: String,
+    pub schema_version: u32,
+    pub up: bool,
+    pub last_flush_unix: u64,
+    pub last_flush_result: String,
+    pub last_flush_duration_ms: u64,
+    pub dirty_endpoints: u64,
+    pub last_ping_unix: u64,
+}
+
+impl StateRuntimeSnapshot {
+    pub fn new(
+        backend: impl Into<String>,
+        namespace: impl Into<String>,
+        instance_id: impl Into<String>,
+    ) -> Arc<RwLock<Self>> {
+        Arc::new(RwLock::new(Self {
+            backend: backend.into(),
+            namespace: namespace.into(),
+            instance_id: instance_id.into(),
+            schema_version: SCHEMA_VERSION,
+            up: false,
+            last_flush_unix: 0,
+            last_flush_result: "unknown".to_owned(),
+            last_flush_duration_ms: 0,
+            dirty_endpoints: 0,
+            last_ping_unix: 0,
+        }))
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -72,6 +109,8 @@ pub struct BootstrapState {
     pub overrides: Overrides,
     pub health: Vec<HealthSnapshot>,
     pub hot_chains: Vec<(u64, u64)>,
+    pub catalog_etag: Option<String>,
+    pub catalog_fetched_at: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -82,12 +121,23 @@ pub struct StateExport {
     pub overrides: Overrides,
     pub health: Vec<HealthSnapshot>,
     pub hot_chains: Vec<(u64, u64)>,
+    pub catalog_etag: Option<String>,
+    pub catalog_fetched_at: u64,
 }
 
 #[async_trait]
 pub trait StateStore: Send + Sync {
     async fn bootstrap(&self) -> Result<BootstrapState>;
     async fn set_catalog(&self, catalog: &Value) -> Result<()>;
+    async fn set_catalog_metadata(
+        &self,
+        catalog: &Value,
+        etag: Option<&str>,
+        fetched_at: u64,
+    ) -> Result<()> {
+        let _ = (etag, fetched_at);
+        self.set_catalog(catalog).await
+    }
     async fn load_overrides(&self) -> Result<Overrides>;
     async fn put_chain_override(&self, chain_id: u64, value: &ChainOverrideState) -> Result<()>;
     async fn delete_chain_override(&self, chain_id: u64) -> Result<()>;
@@ -123,6 +173,8 @@ struct FileDocument {
     audit: Vec<AuditEntry>,
     seeded_at: u64,
     last_flush_at: u64,
+    catalog_etag: Option<String>,
+    catalog_fetched_at: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AuditEntry {
@@ -135,6 +187,32 @@ fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+pub fn instance_id() -> String {
+    std::env::var("RPCROUTER_INSTANCE_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                std::env::var("HOSTNAME").unwrap_or_else(|_| "rpcrouter".into()),
+                std::process::id()
+            )
+        })
+}
+
+fn gzip_json(value: &Value) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&serde_json::to_vec(value)?)?;
+    Ok(encoder.finish()?)
+}
+
+fn gunzip_json(bytes: &[u8]) -> Result<Value> {
+    let mut decoder = GzDecoder::new(bytes);
+    let mut raw = Vec::new();
+    decoder.read_to_end(&mut raw)?;
+    serde_json::from_slice(&raw).context("Redis catalog JSON is invalid")
 }
 
 #[derive(Clone)]
@@ -176,11 +254,26 @@ impl StateStore for MemoryStore {
             overrides: d.overrides.clone(),
             health: d.health.clone(),
             hot_chains: d.hot_chains.clone(),
+            catalog_etag: d.catalog_etag.clone(),
+            catalog_fetched_at: d.catalog_fetched_at,
         })
     }
     async fn set_catalog(&self, catalog: &Value) -> Result<()> {
         self.bump();
         self.inner.lock().await.catalog = Some(catalog.clone());
+        Ok(())
+    }
+    async fn set_catalog_metadata(
+        &self,
+        catalog: &Value,
+        etag: Option<&str>,
+        fetched_at: u64,
+    ) -> Result<()> {
+        self.bump();
+        let mut d = self.inner.lock().await;
+        d.catalog = Some(catalog.clone());
+        d.catalog_etag = etag.map(str::to_owned);
+        d.catalog_fetched_at = fetched_at;
         Ok(())
     }
     async fn load_overrides(&self) -> Result<Overrides> {
@@ -266,6 +359,8 @@ impl StateStore for MemoryStore {
             overrides: d.overrides.clone(),
             health: d.health.clone(),
             hot_chains: d.hot_chains.clone(),
+            catalog_etag: d.catalog_etag.clone(),
+            catalog_fetched_at: d.catalog_fetched_at,
         })
     }
     async fn import(&self, v: &StateExport) -> Result<()> {
@@ -279,6 +374,8 @@ impl StateStore for MemoryStore {
         d.overrides = v.overrides.clone();
         d.health = v.health.clone();
         d.hot_chains = v.hot_chains.clone();
+        d.catalog_etag = v.catalog_etag.clone();
+        d.catalog_fetched_at = v.catalog_fetched_at;
         Ok(())
     }
     async fn reset(&self) -> Result<()> {
@@ -380,11 +477,27 @@ impl StateStore for FileStore {
             overrides: d.overrides.clone(),
             health: d.health.clone(),
             hot_chains: d.hot_chains.clone(),
+            catalog_etag: d.catalog_etag.clone(),
+            catalog_fetched_at: d.catalog_fetched_at,
         })
     }
     async fn set_catalog(&self, v: &Value) -> Result<()> {
         self.bump();
         self.inner.lock().await.catalog = Some(v.clone());
+        self.save().await
+    }
+    async fn set_catalog_metadata(
+        &self,
+        v: &Value,
+        etag: Option<&str>,
+        fetched_at: u64,
+    ) -> Result<()> {
+        self.bump();
+        let mut d = self.inner.lock().await;
+        d.catalog = Some(v.clone());
+        d.catalog_etag = etag.map(str::to_owned);
+        d.catalog_fetched_at = fetched_at;
+        drop(d);
         self.save().await
     }
     async fn load_overrides(&self) -> Result<Overrides> {
@@ -466,6 +579,8 @@ impl StateStore for FileStore {
             overrides: d.overrides.clone(),
             health: d.health.clone(),
             hot_chains: d.hot_chains.clone(),
+            catalog_etag: d.catalog_etag.clone(),
+            catalog_fetched_at: d.catalog_fetched_at,
         })
     }
     async fn import(&self, v: &StateExport) -> Result<()> {
@@ -479,6 +594,8 @@ impl StateStore for FileStore {
         d.overrides = v.overrides.clone();
         d.health = v.health.clone();
         d.hot_chains = v.hot_chains.clone();
+        d.catalog_etag = v.catalog_etag.clone();
+        d.catalog_fetched_at = v.catalog_fetched_at;
         drop(d);
         self.save().await
     }
@@ -541,16 +658,7 @@ impl RedisStore {
         Ok(Self {
             manager: Arc::new(Mutex::new(manager)),
             prefix: format!("{{{namespace}}}"),
-            instance_id: std::env::var("RPCROUTER_INSTANCE_ID")
-                .ok()
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| {
-                    format!(
-                        "{}-{}",
-                        std::env::var("HOSTNAME").unwrap_or_else(|_| "rpcrouter".into()),
-                        std::process::id()
-                    )
-                }),
+            instance_id: instance_id(),
             calls: Arc::new(AtomicU64::new(0)),
             health_ttl_seconds,
         })
@@ -652,10 +760,19 @@ impl StateStore for RedisStore {
             .await
             .context("Redis schema seed timed out")??;
         }
-        let catalog_raw: Option<String> = timeout(
+        let (catalog_raw, catalog_etag, catalog_fetched_at): (
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<u64>,
+        ) = timeout(
             Duration::from_secs(3),
-            redis::cmd("GET")
+            pipe()
+                .cmd("GET")
                 .arg(self.key("catalog"))
+                .cmd("GET")
+                .arg(self.key("catalog:etag"))
+                .cmd("GET")
+                .arg(self.key("catalog:fetched_at"))
                 .query_async(&mut *c),
         )
         .await
@@ -669,28 +786,41 @@ impl StateStore for RedisStore {
         drop(c);
         Ok(BootstrapState {
             schema_version,
-            catalog: catalog_raw
-                .map(|raw| serde_json::from_str(&raw))
-                .transpose()?,
+            catalog: catalog_raw.as_deref().map(gunzip_json).transpose()?,
             overrides: self.load_overrides().await?,
             health: self.load_health().await?,
             hot_chains: hot_raw,
+            catalog_etag,
+            catalog_fetched_at: catalog_fetched_at.unwrap_or(0),
         })
     }
     async fn set_catalog(&self, v: &Value) -> Result<()> {
+        self.set_catalog_metadata(v, None, now()).await
+    }
+    async fn set_catalog_metadata(
+        &self,
+        v: &Value,
+        etag: Option<&str>,
+        fetched_at: u64,
+    ) -> Result<()> {
         self.bump();
-        let raw = serde_json::to_string(v)?;
+        let raw = gzip_json(v)?;
         let mut c = self.manager.lock().await;
-        let _: () = pipe()
+        let mut p = pipe();
+        p.cmd("SET").arg(self.key("catalog")).arg(raw);
+        if let Some(etag) = etag {
+            p.cmd("SET").arg(self.key("catalog:etag")).arg(etag);
+        } else {
+            p.cmd("DEL").arg(self.key("catalog:etag"));
+        }
+        let _: () = p
             .cmd("SET")
-            .arg(self.key("catalog"))
-            .arg(raw)
+            .arg(self.key("catalog:fetched_at"))
+            .arg(fetched_at)
             .cmd("HSET")
             .arg(self.key("meta"))
             .arg("schema_version")
             .arg(SCHEMA_VERSION)
-            .arg("fetched_at")
-            .arg(now())
             .query_async(&mut *c)
             .await?;
         Ok(())
@@ -856,6 +986,8 @@ impl StateStore for RedisStore {
             overrides: d.overrides,
             health: d.health,
             hot_chains: d.hot_chains,
+            catalog_etag: d.catalog_etag,
+            catalog_fetched_at: d.catalog_fetched_at,
         })
     }
     async fn import(&self, v: &StateExport) -> Result<()> {
@@ -878,7 +1010,13 @@ impl StateStore for RedisStore {
         if let Some(catalog) = &v.catalog {
             p.cmd("SET")
                 .arg(self.key("catalog"))
-                .arg(serde_json::to_string(catalog)?);
+                .arg(gzip_json(catalog)?);
+            if let Some(etag) = &v.catalog_etag {
+                p.cmd("SET").arg(self.key("catalog:etag")).arg(etag);
+            }
+            p.cmd("SET")
+                .arg(self.key("catalog:fetched_at"))
+                .arg(v.catalog_fetched_at);
         }
         for (id, value) in &v.overrides.chains {
             let key = self.key(&format!("override:chain:{id}"));
@@ -1054,6 +1192,22 @@ impl StateStore for ResilientStore {
         }
         Ok(())
     }
+    async fn set_catalog_metadata(
+        &self,
+        v: &Value,
+        etag: Option<&str>,
+        fetched_at: u64,
+    ) -> Result<()> {
+        self.fallback
+            .set_catalog_metadata(v, etag, fetched_at)
+            .await?;
+        if let Some(p) = self.primary().await
+            && p.set_catalog_metadata(v, etag, fetched_at).await.is_err()
+        {
+            self.failed().await
+        }
+        Ok(())
+    }
     async fn load_overrides(&self) -> Result<Overrides> {
         if let Some(p) = self.primary().await {
             match p.load_overrides().await {
@@ -1212,6 +1366,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_and_file_catalog_round_trip_for_fallback() {
+        let value = serde_json::json!([{"chainId": 1, "name": "Stored", "rpc": ["https://stored.example"]}]);
+        let memory = MemoryStore::new();
+        memory
+            .set_catalog_metadata(&value, Some("memory-etag"), 7)
+            .await
+            .unwrap();
+        let boot = memory.bootstrap().await.unwrap();
+        assert_eq!(boot.catalog, Some(value.clone()));
+        assert_eq!(boot.catalog_etag.as_deref(), Some("memory-etag"));
+
+        let path = std::env::temp_dir().join(format!("rpcrouter-catalog-{}.json", now()));
+        let file = FileStore::open(&path).await.unwrap();
+        file.set_catalog_metadata(&value, Some("file-etag"), 8)
+            .await
+            .unwrap();
+        let boot = FileStore::open(&path)
+            .await
+            .unwrap()
+            .bootstrap()
+            .await
+            .unwrap();
+        assert_eq!(boot.catalog, Some(value));
+        assert_eq!(boot.catalog_etag.as_deref(), Some("file-etag"));
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
     async fn file_store_is_atomic_and_persistent() {
         let dir = std::env::temp_dir().join(format!("rpcrouter-state-test-{}", now()));
         let path = dir.join("state.json");
@@ -1235,6 +1417,34 @@ mod tests {
             Some(true)
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Redis"]
+    async fn redis_catalog_is_gzipped_with_metadata() {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".into());
+        let store = RedisStore::connect(&url, &format!("gzip-test-{}", now()))
+            .await
+            .unwrap();
+        let value =
+            serde_json::json!([{"chainId": 1, "name": "One", "rpc": ["https://one.example"]}]);
+        store
+            .set_catalog_metadata(&value, Some("etag-1"), 123)
+            .await
+            .unwrap();
+        let mut connection = store.manager.lock().await;
+        let raw: Vec<u8> = redis::cmd("GET")
+            .arg(store.key("catalog"))
+            .query_async(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(&raw[..2], &[0x1f, 0x8b]);
+        drop(connection);
+        let boot = store.bootstrap().await.unwrap();
+        assert_eq!(boot.catalog, Some(value));
+        assert_eq!(boot.catalog_etag.as_deref(), Some("etag-1"));
+        assert_eq!(boot.catalog_fetched_at, 123);
+        store.reset().await.unwrap();
     }
 
     #[tokio::test]

@@ -18,14 +18,15 @@ use tower_http::cors::CorsLayer;
 use tracing::warn;
 
 use crate::{
-    chainlist::ChainlistLoader,
+    chainlist::{ChainlistLoader, catalog_document},
     config::Config,
     forward::Forwarder,
     metrics::Metrics,
     probe::ProbeManager,
     registry::{EndpointState, Registry},
     state::{
-        ChainOverrideState, EndpointOverrideState, Overrides, StateExport, StateStore, endpoint_key,
+        ChainOverrideState, EndpointOverrideState, Overrides, StateExport, StateRuntimeSnapshot,
+        StateStore, endpoint_key,
     },
 };
 
@@ -39,6 +40,7 @@ pub struct AdminState {
     pub probe: Option<Arc<ProbeManager>>,
     pub config: Config,
     pub started: Instant,
+    pub state_runtime: Arc<tokio::sync::RwLock<StateRuntimeSnapshot>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -322,8 +324,20 @@ async fn state_info(State(s): State<AdminState>, headers: HeaderMap) -> Response
     if let Err(r) = auth(&headers, &Method::GET, s.config.admin.auth_token.as_deref()) {
         return r;
     }
-    let export = s.store.export().await.ok();
-    Json(json!({"backend":s.store.backend_name(),"up":s.store.health().await,"schemaVersion":export.as_ref().map_or(crate::state::SCHEMA_VERSION,|x|x.schema_version),"dirtyEndpoints":s.registry.dirty_endpoint_count().await,"lastFlushUnix":0,"overrides":export.map_or(0,|x|x.overrides.chains.len()+x.overrides.endpoints.len())})).into_response()
+    let snapshot = s.state_runtime.read().await.clone();
+    Json(json!({
+        "backend": snapshot.backend,
+        "namespace": snapshot.namespace,
+        "instanceId": snapshot.instance_id,
+        "up": snapshot.up,
+        "schemaVersion": snapshot.schema_version,
+        "dirtyEndpoints": snapshot.dirty_endpoints,
+        "lastFlushUnix": snapshot.last_flush_unix,
+        "lastFlushResult": snapshot.last_flush_result,
+        "lastFlushDurationMs": snapshot.last_flush_duration_ms,
+        "lastPingUnix": snapshot.last_ping_unix,
+    }))
+    .into_response()
 }
 async fn state_export(State(s): State<AdminState>, headers: HeaderMap) -> Response {
     if let Err(r) = auth(&headers, &Method::GET, s.config.admin.auth_token.as_deref()) {
@@ -357,17 +371,16 @@ async fn chainlist_refresh(State(s): State<AdminState>, headers: HeaderMap) -> R
     match loader.refresh().await {
         Ok(Some(x)) => {
             let chain_count = x.catalog.chains.len();
-            let catalog_value = match serde_json::to_value(x.catalog.as_ref()) {
-                Ok(value) => value,
-                Err(error) => {
-                    return err(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "state_store_unavailable",
-                        error.to_string(),
-                    );
-                }
-            };
-            if let Err(error) = s.store.set_catalog(&catalog_value).await {
+            let refresh = loader.refresh_state().await;
+            if let Err(error) = s
+                .store
+                .set_catalog_metadata(
+                    &catalog_document(x.catalog.as_ref()),
+                    refresh.etag.as_deref(),
+                    crate::registry::unix_seconds(),
+                )
+                .await
+            {
                 return err(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "state_store_unavailable",

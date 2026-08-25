@@ -4,13 +4,16 @@ use anyhow::{Context, Result, bail};
 use axum::ServiceExt;
 use rpcrouter::{
     admin::AdminState,
-    chainlist::ChainlistLoader,
+    chainlist::{ChainlistLoader, catalog_document},
     config::Config,
     forward::Forwarder,
     probe::{ProbeManager, spawn_supervised as spawn_probes},
     registry::{Registry, unix_seconds},
     server::{AppState, guarded_service_from_state},
-    state::{FileStore, MemoryStore, RedisStore, ResilientStore, StateStore},
+    state::{
+        FileStore, MemoryStore, RedisStore, ResilientStore, StateRuntimeSnapshot, StateStore,
+        instance_id,
+    },
     supervisor,
 };
 use tracing::{error, info};
@@ -87,14 +90,22 @@ async fn main() -> Result<()> {
     };
     let chainlist = Arc::new(ChainlistLoader::new(&config)?);
     let registry = Arc::new(Registry::new(&config));
-    let initial = chainlist.load().await?;
+    let initial = chainlist
+        .load_with_store_catalog(boot.catalog.as_ref())
+        .await?;
     info!(source = ?initial.source, chains = initial.catalog.chains.len(), "chainlist loaded");
     registry.set_catalog(initial.catalog).await;
-    if boot.catalog.is_none() {
+    if boot.catalog.is_none()
+        || matches!(initial.source, rpcrouter::chainlist::RefreshSource::Network)
+    {
+        let catalog = registry.catalog().await.expect("catalog loaded");
+        let refresh_state = chainlist.refresh_state().await;
         store
-            .set_catalog(&serde_json::to_value(
-                registry.catalog().await.expect("catalog loaded").as_ref(),
-            )?)
+            .set_catalog_metadata(
+                &catalog_document(catalog.as_ref()),
+                refresh_state.etag.as_deref(),
+                unix_seconds(),
+            )
             .await?;
     }
     registry.apply_overrides(&boot.overrides).await;
@@ -115,6 +126,11 @@ async fn main() -> Result<()> {
     forwarder_value.apply_state_overrides(&boot.overrides);
     let forwarder = Arc::new(forwarder_value);
     let metrics = forwarder.metrics();
+    let state_runtime = StateRuntimeSnapshot::new(
+        store.backend_name(),
+        config.state.namespace.clone(),
+        instance_id(),
+    );
     if let Some(resilient) = resilient {
         spawn_state_reconnect(
             resilient,
@@ -123,9 +139,17 @@ async fn main() -> Result<()> {
             Arc::clone(&metrics),
         );
     }
+    spawn_state_ping(
+        Arc::clone(&store),
+        Arc::clone(&metrics),
+        Arc::clone(&state_runtime),
+    );
     let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
     spawn_probes(Arc::clone(&probes), Arc::clone(&metrics));
-    metrics.set_state_store_up(store.health().await);
+    let initial_up = store.health().await;
+    metrics.set_state_store_up(initial_up);
+    state_runtime.write().await.up = initial_up;
+    state_runtime.write().await.last_ping_unix = unix_seconds();
     // 启动 housekeeping 后台任务（每 30s 一次）。
     spawn_housekeeping(Arc::clone(&registry), Arc::clone(&metrics));
     metrics.record_chainlist_refresh(initial.source.label());
@@ -136,6 +160,7 @@ async fn main() -> Result<()> {
     spawn_chainlist_refresh(
         Arc::clone(&chainlist),
         Arc::clone(&registry),
+        Arc::clone(&store),
         Duration::from_secs(config.chainlist.refresh_seconds),
         Arc::clone(&metrics),
     );
@@ -144,6 +169,7 @@ async fn main() -> Result<()> {
         Arc::clone(&store),
         Arc::clone(&metrics),
         Duration::from_millis(config.state.flush_interval_ms),
+        Arc::clone(&state_runtime),
     );
     let per_ip = if config.server.per_ip_rate_limit.enabled {
         Some((
@@ -162,6 +188,7 @@ async fn main() -> Result<()> {
         probe: Some(Arc::clone(&probes)),
         config: config.clone(),
         started: std::time::Instant::now(),
+        state_runtime,
     };
     let app = guarded_service_from_state(
         AppState::new(registry, forwarder, config.server.batch_limit)
@@ -210,12 +237,14 @@ fn forced_shutdown_exit_code() -> i32 {
 fn spawn_chainlist_refresh(
     chainlist: Arc<ChainlistLoader>,
     registry: Arc<Registry>,
+    store: Arc<dyn StateStore>,
     refresh_interval: Duration,
     metrics: Arc<rpcrouter::metrics::Metrics>,
 ) {
     supervisor::spawn("chainlist-refresh", metrics.clone(), move || {
         let chainlist = Arc::clone(&chainlist);
         let registry = Arc::clone(&registry);
+        let store = Arc::clone(&store);
         let metrics = Arc::clone(&metrics);
         async move {
             let mut interval = tokio::time::interval(refresh_interval);
@@ -224,6 +253,23 @@ fn spawn_chainlist_refresh(
                 interval.tick().await;
                 match chainlist.refresh().await {
                     Ok(Some(result)) => {
+                        if matches!(
+                            result.source,
+                            rpcrouter::chainlist::RefreshSource::Network
+                                | rpcrouter::chainlist::RefreshSource::NotModified
+                        ) {
+                            let refresh_state = chainlist.refresh_state().await;
+                            if let Err(error) = store
+                                .set_catalog_metadata(
+                                    &catalog_document(result.catalog.as_ref()),
+                                    refresh_state.etag.as_deref(),
+                                    unix_seconds(),
+                                )
+                                .await
+                            {
+                                tracing::warn!(error=%error, "state catalog update failed");
+                            }
+                        }
                         registry.set_catalog(result.catalog).await;
                         registry.apply_snapshot(&result.snapshot).await;
                         if matches!(
@@ -273,11 +319,13 @@ fn spawn_state_flush(
     store: Arc<dyn StateStore>,
     metrics: Arc<rpcrouter::metrics::Metrics>,
     interval: Duration,
+    state_runtime: Arc<tokio::sync::RwLock<StateRuntimeSnapshot>>,
 ) {
     supervisor::spawn("state-flush", metrics.clone(), move || {
         let registry = Arc::clone(&registry);
         let store = Arc::clone(&store);
         let metrics = Arc::clone(&metrics);
+        let state_runtime = Arc::clone(&state_runtime);
         async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
@@ -300,6 +348,15 @@ fn spawn_state_flush(
                     if result.is_ok() { "success" } else { "error" },
                     started.elapsed(),
                 );
+                let dirty = registry.dirty_endpoint_count().await as u64;
+                let mut snapshot = state_runtime.write().await;
+                snapshot.last_flush_unix = unix_seconds();
+                snapshot.last_flush_result =
+                    if result.is_ok() { "success" } else { "error" }.to_owned();
+                snapshot.last_flush_duration_ms =
+                    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                snapshot.dirty_endpoints = dirty;
+                drop(snapshot);
                 if let Err(error) = result {
                     tracing::warn!(error=%error,"state flush failed");
                 }
@@ -318,17 +375,14 @@ fn spawn_state_reconnect(
         let store = Arc::clone(&store);
         let registry = Arc::clone(&registry);
         let forwarder = Arc::clone(&forwarder);
-        let metrics = Arc::clone(&metrics);
         async move {
             let mut delay = Duration::from_secs(1);
             loop {
                 if store.health().await {
-                    metrics.set_state_store_up(true);
                     delay = Duration::from_secs(1);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
-                metrics.set_state_store_up(false);
                 match store.reconnect().await {
                     Ok(true) => {
                         if let Ok(overrides) = store.load_overrides().await {
@@ -336,7 +390,6 @@ fn spawn_state_reconnect(
                             forwarder.apply_state_overrides(&overrides);
                         }
                         info!("state store reconnected and Redis overrides applied");
-                        metrics.set_state_store_up(true);
                         delay = Duration::from_secs(1);
                     }
                     Ok(false) => {}
@@ -346,6 +399,29 @@ fn spawn_state_reconnect(
                         delay = (delay * 2).min(Duration::from_secs(30));
                     }
                 }
+            }
+        }
+    });
+}
+
+fn spawn_state_ping(
+    store: Arc<dyn StateStore>,
+    metrics: Arc<rpcrouter::metrics::Metrics>,
+    state_runtime: Arc<tokio::sync::RwLock<StateRuntimeSnapshot>>,
+) {
+    supervisor::spawn("state-ping", metrics.clone(), move || {
+        let store = Arc::clone(&store);
+        let metrics = Arc::clone(&metrics);
+        let state_runtime = Arc::clone(&state_runtime);
+        async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let up = store.health().await;
+                metrics.set_state_store_up(up);
+                let mut snapshot = state_runtime.write().await;
+                snapshot.up = up;
+                snapshot.last_ping_unix = unix_seconds();
             }
         }
     });
