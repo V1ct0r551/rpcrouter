@@ -109,6 +109,15 @@ curl -X POST -H 'Authorization: Bearer secret' \
 设置 `admin.static_dir` 后 `/dashboard/` 与任意不存在的 dashboard 路径均回退到
 `index.html`，用于托管独立 React dashboard；静态资源不要求 token。
 
+### Dashboard
+
+Dashboard 是 `dashboard/` 下的独立 React/Vite 工程。开发时运行 `npm ci && npm run dev`
+（默认把 `/admin` 代理到本机 8545，可用 `VITE_API_BASE` 覆写）；构建运行
+`npm run build`，产物位于 `dashboard/dist`。Dockerfile 会在 node 构建阶段生成该产物，
+并以 `RPCROUTER_ADMIN_STATIC_DIR=/app/dashboard` 默认由网关托管 `/dashboard/`，也可将
+静态目录交给任意 Web 服务器并反代 `/admin/api`。在 Settings 页面输入 Bearer token；
+token 只存浏览器 localStorage，并仅通过 Authorization 请求头发送。
+
 ## 部署
 
 本仓库提供 Docker、docker-compose 与 systemd 三种部署方式。三种方式都支持用
