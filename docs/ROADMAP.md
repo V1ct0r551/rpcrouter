@@ -1,6 +1,7 @@
 # ROADMAP — v1 之后的任务规划
 
-> 2026-07-26 收官时制定。v1 已交付（三硬指标达标，见 docs/reports/loadtest-phase3.md）。
+> 2026-07-26 收官时制定，2026-08-25 增补 P3（动态全链 + Dashboard），原 P3/P4 顺延为 P4/P5。
+> v1 已交付（三硬指标达标，见 docs/reports/loadtest-phase3.md）。
 > 以下按优先级排列，未排期；每项开工前照旧流程：主会话细化验收 → Codex 实现 → 主会话评审。
 
 ## P1 部署（让它跑在服务器上）
@@ -43,7 +44,20 @@
 5. **soak**：真实网络低 QPS（≤5）长跑 24h，观察摘除/回池分布与内存曲线。
 6. /metrics 绑定内网地址或加简单鉴权开关。
 
-## P3 命名链路由（对齐 ChainUp 网关形态）
+## P3 动态全链目录 + 状态控制 Dashboard（2026-08-25 立项，进行中）
+
+> 需求：从固定 8 链扩展到**实时动态获取并支持 chainlist `rpcs.json` 里的全部链**
+> （2877 条），并提供状态控制 Dashboard（独立 React 工程 `dashboard/`，经 REST API 与
+> 网关通信）。方案见 `docs/DESIGN-v2.md`，任务拆解与验收见 `docs/TASKS-v2.md`。
+
+1. **W5 动态目录与链生命周期**：Catalog 全量解析；链 pinned/hot/dormant/disabled 生命周期
+   （按需激活、idle 降级、LRU 上限）；未知链 404 / 无端点 503 / 禁用 403 且不计
+   `user_visible_errors`；探针有界工作池只覆盖激活链；chainlist 刷新 1h + 状态可观测。
+2. **W6 Admin REST API**：`/admin/api/*` 只读 + 控制接口，bearer 鉴权（无 token 则控制
+   接口 403），运行时覆写持久化 `data/overrides.json`，可选托管前端静态产物。
+3. **W7 React Dashboard**：总览 / 链列表 / 链详情 / 设置；亮暗主题；CI 前端 job；镜像内置。
+
+## P4 命名链路由（对齐 ChainUp 网关形态）
 
 参照 api.chainup.net 的 demo：`POST /{chain_slug}/{api_key}` + `CONSISTENT-HASH` 头。
 
@@ -59,7 +73,7 @@
    （非以太坊 JSON-RPC），列为长期方向；如要做，先从 Solana（JSON-RPC 形态最接近）
    单独立项调研，不进本仓库 v1 架构假设。
 
-## P4 长期
+## P5 长期
 
 - WebSocket 订阅透传（eth_subscribe）
 - 多实例共享缓存（Redis）与分布式出站限流

@@ -22,7 +22,9 @@ rpcrouter 是一个 Rust 实现的区块链节点 RPC 路由网关：聚合 [cha
   不亲自写大规模实现代码，控制自身上下文膨胀。
 - **Grok**：调研——开源项目复用评估、chainlist 数据源、限频行为盘点等。产出落到
   `docs/research/`。
-- **Codex**：实现——按 `docs/TASKS.md` 的阶段任务开发，交付可编译、带测试的代码。
+- **Codex / dsh**：实现——按 `docs/TASKS*.md` 的阶段任务开发，交付可编译、带测试的代码。
+  P1 起实际用 ccteam 调度 dsh（maker=xy/deepseek-v4-pro，checker=xy/deepseek-v4-flash），
+  maker 在独立 git worktree 分支开发，checker 单轮对抗审查，主会话合入。
 
 全程自主推进，不向用户中途提问。
 
@@ -31,7 +33,8 @@ rpcrouter 是一个 Rust 实现的区块链节点 RPC 路由网关：聚合 [cha
 - `docs/research/` — Grok 调研产出（只读参考）
 - `docs/DESIGN.md` — 架构方案（主会话维护）
 - `docs/TASKS.md` — v1 阶段任务拆解与验收标准（已完成，存档）
-- `docs/ROADMAP.md` — v1 后规划：部署 / 生产可用 / 命名链路由（P1–P4）
+- `docs/ROADMAP.md` — v1 后规划：部署 / 生产可用 / 动态全链+Dashboard / 命名链路由（P1–P5）
+- `docs/DESIGN-v2.md` / `docs/TASKS-v2.md` — P3 动态全链目录 + 状态控制 Dashboard 的方案与任务拆解
 
 ## 技术与工程约定
 
@@ -58,4 +61,7 @@ v1 已交付（2026-07-26 验收）。后续任务规划统一沉淀在 `docs/RO
 
 - [x] ROADMAP P1 部署 + P2 生产可用（2026-08-20 验收，maker/checker 对抗流程交付；
       真实环境验收见 `docs/reports/prod-readiness.md`：docker 8 链 smoke、加固特性实测、
-      监控栈实跑、CI 首跑绿灯、30 分钟真实网络 soak 0 错误）。遗留：24h soak、P3 命名链路由。
+      监控栈实跑、CI 首跑绿灯、30 分钟真实网络 soak 0 错误）。遗留：24h soak。
+- [ ] ROADMAP P3 动态全链目录 + 状态控制 Dashboard（2026-08-25 立项；W5 → W6 → W7 串行
+      推进，见 docs/TASKS-v2.md）。前端为独立 React 工程 `dashboard/`，前端门槛：
+      `npm run lint && npm run typecheck && npm test && npm run build`。
