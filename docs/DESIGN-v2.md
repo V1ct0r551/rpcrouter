@@ -292,20 +292,39 @@ Probation 起步——不恢复 Active（探针必须重新证明）。
 5. 所有写操作只触及本命名空间，可与其他应用共用一个 Redis；key 使用 `{namespace}` hash tag
    风格前缀，兼容 Redis Cluster。
 
-### 11.4 实现要点
+### 11.4 实现要点（2026-08-25 checker 审查后修订为决策 D1–D6）
 
+- **D1 结构化 key 是唯一读真相**：不再维护任何整体 JSON document 镜像。读取用
+  HGETALL / SMEMBERS / ZRANGE（靠 `override:index` 避免 SCAN）；写入是单 key 写，不做读-改-写；
+  只有 import / reset 这类多 key 原子操作用 MULTI/EXEC。
+- **D2 catalog 单独存**：`{ns}:catalog`（gzip JSON）+ `catalog:etag` + `catalog:fetched_at`，每次
+  成功网络刷新写一次；启动回退顺序：网络 → 内存 → Redis catalog → 磁盘 → fixture。
+- **D3 Redis 非空即以 Redis 为准**：启动/重连时 `meta` 存在 → 从 Redis 加载覆写并重新应用到内存，
+  只补 flush 本地脏 health；只有空库才 seed；**永远不用本地文件 import 覆盖 Redis**。本地文件
+  （FileStore 或降级镜像）只是降级期间的本地缓存。
+- **D4 所有 Redis 交互有界**：`ConnectionManager::new_with_config` 设 retries=0（重连交给
+  supervisor 退避）、connect 2s、response 5s；open / reconnect / 每个 store 方法外再包
+  `tokio::time::timeout`（bootstrap 3s、单次 flush 5s）。`required=false` 时 Redis 拒连或黑洞都必须
+  ≤3s 内监听并服务；断连期间 flush 不阻塞，脏集合上限 20000（超出只保留最新，计数指标）。
+- **D5 hot 集合按实例写**：`{ns}:hot:{instance_id}`（ZADD/ZREM 增量，实例心跳 TTL 60s），预激活
+  只读本实例集合；`instance_id` 来自 `RPCROUTER_INSTANCE_ID` 或主机名+pid。
+- **D6 本地文件写策略**：紧凑 JSON、只在内容变化时写、原子写；损坏/旧 schema 文件在 optional 模式
+  下改名 `.corrupt-<unix>` 并 warn 后按空库起。
 - `state::StateStore` trait（async）：`bootstrap()`, `load_overrides()`, `put_chain_override()`,
-  `put_endpoint_override()`, `delete_*()`, `flush_health(batch)`, `load_health()`,
-  `set_hot_chains()`, `append_audit()`, `export()`, `import()`, `reset()`, `health()`；
-  实现：`MemoryStore`（测试）、`FileStore`（`data/state.json`）、`RedisStore`。
-- crate：`redis`（`tokio-comp` + `connection-manager`，自动重连）；批量写用 pipeline，
-  import/reset 用 `MULTI/EXEC`。
-- write-behind：Registry 维护脏端点集合（DashSet），flush 任务每周期取走、pipeline 写入；
-  单次上限 2000 条，超出下周期续写。
+  `put_endpoint_override()`, `delete_*()`（同步 DEL + SREM）, `flush_health(batch)`, `load_health()`,
+  `set_hot_chains()`, `append_audit()`, `export()`, `import()`, `reset()`（兜底 `SCAN MATCH {ns}:*`）,
+  `health()`（真实 PING）；实现：`MemoryStore`（测试）、`FileStore`、`RedisStore`、`ResilientStore`
+  （Redis + 本地镜像降级）。
+- crate：`redis`（`tokio-comp` + `connection-manager`）；批量写用 pipeline。
+- write-behind：Registry 维护脏端点集合，flush 任务每周期取走、pipeline 写入；单次上限 2000 条。
+- `state_store_up` 只由一处带超时的真实 PING（每 5s）设置；降级/恢复切换有限频日志。
+- 端点级覆写（disabled / rps / concurrency）对 pinned 链与动态链一视同仁（`merge_chain` 与
+  materialize 共用同一 helper），chainlist 刷新不得还原覆写；恢复的 health 快照保留在 Registry，
+  链 materialize 时再套用（cluster 下 `restore_hot=false` 也能恢复冷却期）。
 - 指标：`rpcrouter_state_store_up`、`rpcrouter_state_flush_total{result}`、
   `rpcrouter_state_flush_duration_seconds`、`rpcrouter_state_dirty_endpoints`。
-- docker-compose：新增 `redis:7-alpine` 服务（`--appendonly yes` + 卷）；网关默认
-  `RPCROUTER_REDIS_URL=redis://redis:6379/0`。
+- docker-compose：`redis:7-alpine`（`--appendonly yes` + 卷 + healthcheck，实例
+  `depends_on: condition: service_healthy`）；网关默认 `RPCROUTER_REDIS_URL=redis://redis:6379/0`。
 
 ## 12. 多实例与横向扩展路线（2026-08-25 增补）
 
