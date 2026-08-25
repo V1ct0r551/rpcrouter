@@ -37,6 +37,7 @@ WORKDIR /app
 COPY --from=builder /build/target/release/rpcrouter /usr/local/bin/rpcrouter
 # 运行时仍可被环境变量/挂载配置覆写；默认配置启用全部 8 条链。
 COPY config.toml /app/config.toml
+COPY cluster.toml /app/cluster.toml
 
 # chainlist 磁盘缓存跨重启复用；运行时由卷挂载到 /app/data。
 RUN mkdir -p /app/data && chown -R rpcrouter:rpcrouter /app

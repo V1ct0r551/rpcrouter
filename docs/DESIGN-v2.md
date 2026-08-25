@@ -350,3 +350,15 @@ Phase B 各项仅作为 P5 备选，按需再立项。** 不用轮询：轮询�
 - 刷新周期通过 `ChainlistLoader::refresh()` 与手动刷新共享互斥状态；Memory/Disk/Fixture 回退不会伪造新鲜刷新时间。
 - `discovery.enabled=false` 在 registry 路由层拒绝非 pinned 目录链，保持 v1 语义；deny 与 pinned 的冲突在配置校验阶段拒绝。
 - 已知限制：`rpcrouter_chain_pinned` 标签数最坏为 materialized 链数；极端 `Retry-After` 仍可能触发 `Instant` 加法边界；墙钟向后跳可能延迟/集中一次 idle 降级；未知链 Classifier 仍使用默认 TTL，而配置中 1/143 有专用值；RPC 条目自身仍要求字符串或含字符串 `url` 的对象。上述项不影响 W5 的动态目录、生命周期边界与离线验收，留待后续独立加固。
+
+### W6a 偏差记录
+
+- RedisStore 以 namespace 下的 JSON document 作为兼容镜像，同时用 pipeline 写入 `meta`、
+  `catalog`、`override:*`、`health:*`、`chains:hot` 与 `audit` 结构化 key；这样在不增加请求
+  路径网络往返的前提下保留 import/reset 的 MULTI/EXEC 原子边界。
+- optional Redis 降级通过 FileStore 镜像承接，后台 supervisor 指数退避重连并执行完整导入；
+  管理 API 尚未实现（属于 W6b，本轮未触碰）。
+- Endpoint dirty 集合按端点原子位维护，flush 每轮最多 2000 条；未引入 Redis 分布式 token
+  bucket 或共享响应缓存（按 §12 Phase B/P5 规划）。
+- cluster profile 关闭共享 `chains:hot` 的启动预激活（`state.restore_hot=false`），避免实例接管
+  历史分片后全部探测同一链；单实例默认仍恢复热链，覆写与健康快照继续共享。

@@ -106,3 +106,11 @@ groups:
         annotations:
           summary: "probe queue depth {{ $value }} exceeds threshold"
           description: "Probe queue depth is {{ $value }}, exceeding 128. This may indicate slow upstream responses or too many hot chains. Check rpcrouter_probe_in_flight and upstream timeouts."
+      - alert: RpcrouterStateStoreDown
+        expr: rpcrouter_state_store_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "rpcrouter state store is unavailable"
+          description: "Persistent state is in degraded mode; the data plane continues serving from memory/file cache."

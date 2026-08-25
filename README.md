@@ -51,12 +51,17 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 | `cache` | 按响应字节加权的容量（默认 512 MiB）和不可变 TTL |
 | `hedging` | 只读请求第二发延迟、全局占比和健康池门槛 |
 | `chain_overrides` | 每链块时间、确认深度 K、tip TTL、附加/屏蔽端点及端点限额；可用于非 pinned 链 |
+| `state` | Redis/File 状态镜像、命名空间、required、flush 周期与健康快照 TTL |
 
 `chains` 是 pinned 链列表：启动即激活且永不因 idle/LRU 降级。动态目录链首个请求才激活，
 随后无流量自动降级为 dormant；`discovery.deny` 链返回 403。
 
 容器部署可用 `RPCROUTER_DISCOVERY_ENABLED`、`RPCROUTER_DISCOVERY_MAX_HOT_CHAINS` 和
 `RPCROUTER_DISCOVERY_IDLE_SECONDS` 覆写动态目录策略。
+
+状态存储环境变量：`RPCROUTER_STATE_BACKEND=redis|file`、`RPCROUTER_REDIS_URL`、
+`RPCROUTER_STATE_NAMESPACE`、`RPCROUTER_STATE_RESET=1`。默认 Redis 不可达时自动降级为
+内存 + `data/state.json`，不会中断 RPC 流量；`required=true` 用于必须持久化的部署。
 
 仓库配置使用偏保守的缓存确认深度。BSC 按 Maxwell 升级后的约 750ms 出块配置；Polygon
 约 2s、Arbitrum 约 250ms，Base、OP 与 Avalanche 约 2s。tip TTL 不超过对应块时间和 2s。
@@ -126,6 +131,19 @@ docker compose up -d
 # 含 Prometheus/Grafana 监控（需先由 ops 工作流提供 ./ops/ 下文件）：
 docker compose --profile monitoring up -d
 ```
+
+### 多实例分片
+
+方案 A 使用 nginx 对 `/rpc/{chainId}` 做一致性哈希，3 个无状态网关共享同一 Redis：
+
+```sh
+docker compose --profile cluster up -d --build redis rpcrouter-1 rpcrouter-2 rpcrouter-3 nginx
+# 分片入口：http://127.0.0.1:18545/rpc/{chainId}
+```
+
+扩容只需在 `deploy/nginx-shard.conf` 增加实例并 reload；每条链固定落一个实例，故缓存、
+in-flight 折叠和端点限流不会按实例数放大。Redis 使用 appendonly 卷，故障时实例会用本地
+镜像继续出流量，恢复后自动回灌。
 
 ### systemd
 

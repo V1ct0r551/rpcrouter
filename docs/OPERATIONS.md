@@ -61,6 +61,10 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
 | `rpcrouter_chainlist_refresh_total` | Counter | `source` | network/not_modified/memory/disk/fixture/rejected 刷新次数 |
 | `rpcrouter_chain_activations_total` | Counter | — | dormant → hot 激活次数 |
 | `rpcrouter_chain_demotions_total` | Counter | `reason` | idle/lru/admin 降级次数 |
+| `rpcrouter_state_store_up` | Gauge | — | 持久状态存储可达性（1/0） |
+| `rpcrouter_state_flush_total` | Counter | `result` | write-behind flush 成功/失败 |
+| `rpcrouter_state_flush_duration_seconds` | Histogram | — | flush 延迟 |
+| `rpcrouter_state_dirty_endpoints` | Gauge | — | 等待 flush 的脏端点数 |
 
 ### 3. 语义边界：三类失败互斥（重要）
 
@@ -174,3 +178,21 @@ scripts/soak.sh --url http://127.0.0.1:8545 --duration 86400 --qps 3 \
 | 上游 429 率突增 | 是否触达端点 rps 上限（`default_rps` 或 `endpoint_overrides`）；用 `rpcrouter_endpoint_rate_limited_total` 按 endpoint 定位是哪个端点。 |
 | `/metrics` 抓取失败/401 | compose 默认未鉴权；若生产启用了 `server.metrics_auth_token`，需在 `prometheus.yml` 的 scrape 加 `authorization` 头（见文件内注释）。 |
 | soak 无 RSS 数据 | `--pid` 未生效或 `/proc/<pid>/status` 不可读（跨容器 PID 命名空间差异）；确认用宿主机侧 PID。 |
+
+## 9. 状态存储
+
+Redis 是默认持久镜像，key 使用 `{namespace}:` 前缀。内存仍是数据面唯一真相，响应缓存不
+写入 Redis。`required=false` 时 Redis 断连会自动切换到 `data/state.json`，告警
+`RpcrouterStateStoreDown`，重连后执行完整覆写；`required=true` 在启动阶段直接失败。
+
+`RPCROUTER_STATE_RESET=1`（或启动参数等价配置）会清空当前 namespace；`export/import/reset`
+库 API 用于运维脚本。健康快照按 `health_ttl_seconds` 过期，冷却中的端点重启恢复为 Cooling，
+其余端点恢复为 Probation，Active 必须重新通过探针。
+
+## 10. 扩容/缩容与故障接管
+
+使用 `docker compose --profile cluster up -d redis rpcrouter-1 rpcrouter-2 rpcrouter-3 nginx`
+启动 nginx（宿主机 18545）+ 3 实例。扩容流程：先加入新实例、
+健康检查 `/healthz`、再 reload nginx；缩容流程：先从 upstream 摘除、等待连接排空后停止。
+一致性哈希只迁移约 `1/N` 链；实例故障由 nginx `proxy_next_upstream` 交给环上下一实例，
+该实例从 Redis 健康镜像获知冷却端点并走冷启动 Probation 路径。
