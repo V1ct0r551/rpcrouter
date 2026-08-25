@@ -42,9 +42,12 @@ fn parse_bool(raw: &str, key: &str) -> Result<bool> {
 pub struct Config {
     pub listen: SocketAddr,
     pub metrics_enabled: bool,
+    /// 固定激活链（pinned），语义已从 v1 的"全部链"升级为"启动即激活、永不降级"。
+    /// `discovery.enabled = false` 时等价 v1 行为（只服务 pinned 链）。
     pub chains: Vec<u64>,
     pub server: ServerConfig,
     pub chainlist: ChainlistConfig,
+    pub discovery: DiscoveryConfig,
     pub upstream: UpstreamConfig,
     pub probe: ProbeConfig,
     pub cache: CacheConfig,
@@ -62,6 +65,7 @@ impl Default for Config {
             chains: vec![1, 143],
             server: ServerConfig::default(),
             chainlist: ChainlistConfig::default(),
+            discovery: DiscoveryConfig::default(),
             upstream: UpstreamConfig::default(),
             probe: ProbeConfig::default(),
             cache: CacheConfig::default(),
@@ -123,6 +127,19 @@ impl Config {
         if let Some(raw) = env_non_empty("RPCROUTER_CHAINLIST_CACHE_PATH") {
             self.chainlist.cache_path = PathBuf::from(raw);
         }
+        if let Some(raw) = env_non_empty("RPCROUTER_DISCOVERY_ENABLED") {
+            self.discovery.enabled = parse_bool(&raw, "RPCROUTER_DISCOVERY_ENABLED")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_DISCOVERY_MAX_HOT_CHAINS") {
+            self.discovery.max_hot_chains = raw
+                .parse()
+                .context("RPCROUTER_DISCOVERY_MAX_HOT_CHAINS is not a valid integer")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_DISCOVERY_IDLE_SECONDS") {
+            self.discovery.idle_seconds = raw
+                .parse()
+                .context("RPCROUTER_DISCOVERY_IDLE_SECONDS is not a valid integer")?;
+        }
         self.validate()
     }
 
@@ -133,9 +150,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.chains.is_empty() {
-            bail!("chains must not be empty");
+        // discovery.enabled=false 时 chains 必须非空（至少 pinned 链）。
+        if !self.discovery.enabled && self.chains.is_empty() {
+            bail!("chains must not be empty when discovery is disabled");
         }
+        // discovery.enabled=true 时 chains 允许为空（完全依赖目录动态激活）。
         let unique_chains: HashSet<_> = self.chains.iter().copied().collect();
         if unique_chains.len() != self.chains.len() {
             bail!("chains must not contain duplicates");
@@ -162,8 +181,6 @@ impl Config {
             if token.is_empty() {
                 bail!("server.metrics_auth_token must not be empty");
             }
-            // token 会被放进 Authorization: Bearer <token> 头，必须能用 HTTP header 值表达，
-            // 否则在构建 BearerAuth 时无法编码（会 panic）。
             if token.bytes().any(is_header_control) {
                 bail!(
                     "server.metrics_auth_token contains characters not allowed in an HTTP header value"
@@ -172,6 +189,12 @@ impl Config {
         }
         if self.chainlist.refresh_seconds == 0 {
             bail!("chainlist.refresh_seconds must be greater than zero");
+        }
+        if self.discovery.max_hot_chains == 0 {
+            bail!("discovery.max_hot_chains must be greater than zero");
+        }
+        if self.discovery.idle_seconds == 0 {
+            bail!("discovery.idle_seconds must be greater than zero");
         }
         if self.upstream.request_timeout_ms == 0 || self.upstream.deadline_ms == 0 {
             bail!("upstream timeouts must be greater than zero");
@@ -203,13 +226,8 @@ impl Config {
         {
             bail!("hedging requires a delay, max_percent 1..=10, and at least two endpoints");
         }
+        // chain_overrides 不再要求 chain_id 在 chains 列表中（动态链激活时生效）。
         for chain in &self.chain_overrides {
-            if !unique_chains.contains(&chain.chain_id) {
-                bail!(
-                    "chain override {} is not present in the chains allowlist",
-                    chain.chain_id
-                );
-            }
             for endpoint in &chain.endpoint_overrides {
                 if endpoint.rps == Some(0) || endpoint.concurrency == Some(0) {
                     bail!("endpoint limits must be greater than zero");
@@ -322,6 +340,7 @@ impl Default for PerIpRateLimitConfig {
 #[serde(default)]
 pub struct ChainlistConfig {
     pub url: String,
+    /// 刷新间隔秒数。默认 3600（1h），v1 是 21600（6h）。
     pub refresh_seconds: u64,
     pub stale_grace_seconds: u64,
     pub cache_path: PathBuf,
@@ -331,9 +350,37 @@ impl Default for ChainlistConfig {
     fn default() -> Self {
         Self {
             url: "https://chainlist.org/rpcs.json".to_owned(),
-            refresh_seconds: 6 * 60 * 60,
+            refresh_seconds: 3600,
             stale_grace_seconds: 24 * 60 * 60,
             cache_path: PathBuf::from("./data/rpcs.json"),
+        }
+    }
+}
+
+/// 动态全链目录配置。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct DiscoveryConfig {
+    /// 是否启用动态目录发现。false = 只服务 pinned 链（等价 v1 行为）。
+    pub enabled: bool,
+    /// 是否包含测试网链。
+    pub include_testnets: bool,
+    /// chainId 拒绝列表（403）。
+    pub deny: Vec<u64>,
+    /// 非 pinned 热链数量上限。默认 256。
+    pub max_hot_chains: usize,
+    /// 非 pinned 链无流量后降级秒数。默认 600（10 分钟）。
+    pub idle_seconds: u64,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include_testnets: true,
+            deny: Vec::new(),
+            max_hot_chains: 256,
+            idle_seconds: 600,
         }
     }
 }
@@ -514,6 +561,21 @@ mod tests {
         let config = Config::from_toml("chains = [1]").expect("single-chain config");
         assert_eq!(config.chains, [1]);
         assert!(config.chain_overrides.is_empty());
+    }
+
+    #[test]
+    fn discovery_enabled_allows_empty_chains() {
+        let config = Config::from_toml("chains = []\n[discovery]\nenabled = true")
+            .expect("discovery-only config");
+        assert!(config.chains.is_empty());
+        assert!(config.discovery.enabled);
+    }
+
+    #[test]
+    fn discovery_disabled_requires_non_empty_chains() {
+        let error = Config::from_toml("chains = []\n[discovery]\nenabled = false")
+            .expect_err("empty chains with discovery disabled should fail");
+        assert!(error.to_string().contains("chains must not be empty"));
     }
 
     #[test]

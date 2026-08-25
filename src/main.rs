@@ -31,7 +31,8 @@ async fn main() -> Result<()> {
     let chainlist = Arc::new(ChainlistLoader::new(&config)?);
     let registry = Arc::new(Registry::new(&config));
     let initial = chainlist.load().await?;
-    info!(source = ?initial.source, chains = initial.snapshot.chains.len(), "chainlist loaded");
+    info!(source = ?initial.source, chains = initial.catalog.chains.len(), "chainlist loaded");
+    registry.set_catalog(initial.catalog).await;
     registry.apply_snapshot(&initial.snapshot).await;
 
     spawn_chainlist_refresh(
@@ -41,6 +42,9 @@ async fn main() -> Result<()> {
     );
     let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
     spawn_probes(probes);
+
+    // 启动 housekeeping 后台任务（每 30s 一次）。
+    spawn_housekeeping(Arc::clone(&registry));
 
     let forwarder = Arc::new(Forwarder::new(Arc::clone(&registry), &config)?);
     let per_ip = if config.server.per_ip_rate_limit.enabled {
@@ -106,11 +110,24 @@ fn spawn_chainlist_refresh(
             interval.tick().await;
             match chainlist.load().await {
                 Ok(result) => {
+                    registry.set_catalog(result.catalog).await;
                     registry.apply_snapshot(&result.snapshot).await;
                     info!(source = ?result.source, "chainlist refresh completed");
                 }
                 Err(error) => error!(error = %error, "chainlist refresh exhausted all fallbacks"),
             }
+        }
+    });
+}
+
+/// 后台 housekeeping：每 30 秒执行一次 idle 降级 + LRU 淘汰。
+fn spawn_housekeeping(registry: Arc<Registry>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await; // 跳过第一次立即触发。
+        loop {
+            interval.tick().await;
+            registry.housekeeping().await;
         }
     });
 }

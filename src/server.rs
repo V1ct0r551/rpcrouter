@@ -148,6 +148,36 @@ async fn metrics(State(state): State<AppState>) -> Response {
 }
 
 async fn rpc(Path(chain_id): Path<u64>, State(state): State<AppState>, body: Bytes) -> Json<Value> {
+    // 路由层解析链一次（batch 也只做一次）。
+    let resolved = state.registry.resolve_for_request(chain_id).await;
+    let Some(chain_state) = resolved else {
+        // 未知链 → 404。
+        state.metrics.record_ingress_rejected("unknown_chain");
+        return Json(jsonrpc_error(
+            Value::Null,
+            -32000,
+            &format!("rpcrouter: unknown chain id {chain_id}"),
+        ));
+    };
+    if chain_state.state_label() == crate::registry::ChainStateLabel::Disabled {
+        state.metrics.record_ingress_rejected("chain_disabled");
+        return Json(jsonrpc_error(
+            Value::Null,
+            -32000,
+            &format!("rpcrouter: chain {chain_id} is disabled"),
+        ));
+    }
+    // 0 端点链 → 503。
+    let endpoint_count = state.registry.endpoint_count(chain_id).await;
+    if endpoint_count == 0 {
+        state.metrics.record_ingress_rejected("no_endpoints");
+        return Json(jsonrpc_error(
+            Value::Null,
+            -32000,
+            &format!("rpcrouter: chain {chain_id} has no public endpoints"),
+        ));
+    }
+
     let request: Box<RawValue> = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(_) => return Json(jsonrpc_error(Value::Null, -32700, "Parse error")),
@@ -184,6 +214,8 @@ async fn rpc(Path(chain_id): Path<u64>, State(state): State<AppState>, body: Byt
 }
 
 async fn execute_batch(chain_id: u64, state: &AppState, requests: Vec<Box<RawValue>>) -> Value {
+    // 解析链一次（batch 中共享），在调用方已解析。
+    let endpoint_count = state.registry.endpoint_count(chain_id).await;
     let mut results = vec![None; requests.len()];
     let request_ids: Vec<_> = requests.iter().map(|request| request_id(request)).collect();
     let mut tasks = JoinSet::new();
@@ -210,7 +242,15 @@ async fn execute_batch(chain_id: u64, state: &AppState, requests: Vec<Box<RawVal
             .enumerate()
             .map(|(index, response)| {
                 response.unwrap_or_else(|| {
-                    all_endpoints_exhausted(chain_id, request_ids[index].clone())
+                    if endpoint_count == 0 {
+                        jsonrpc_error(
+                            request_ids[index].clone(),
+                            -32000,
+                            &format!("rpcrouter: chain {chain_id} has no public endpoints"),
+                        )
+                    } else {
+                        all_endpoints_exhausted(chain_id, request_ids[index].clone())
+                    }
                 })
             })
             .collect(),

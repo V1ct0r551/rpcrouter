@@ -28,6 +28,7 @@ struct ChainCacheSettings {
 
 pub struct Classifier {
     chains: HashMap<u64, ChainCacheSettings>,
+    default_settings: ChainCacheSettings,
     immutable_ttl: Duration,
 }
 
@@ -47,8 +48,15 @@ impl Classifier {
                 )
             })
             .collect();
+        // 默认参数：64 块确认深度，tip TTL = min(block_time, 2s)，block_time 未知按 2s。
+        let default_block_time_ms = 2_000u64;
+        let default_tip_ttl = Duration::from_millis(default_block_time_ms.min(2_000));
         Self {
             chains,
+            default_settings: ChainCacheSettings {
+                confirmation_depth: 64,
+                tip_ttl: default_tip_ttl,
+            },
             immutable_ttl: Duration::from_secs(config.cache.immutable_ttl_seconds),
         }
     }
@@ -60,7 +68,7 @@ impl Classifier {
         params: Option<&RawValue>,
         head: u64,
     ) -> Option<CachePlan> {
-        let settings = self.chains.get(&chain_id)?;
+        let settings = self.chains.get(&chain_id).unwrap_or(&self.default_settings);
         let params_value = parse_params(params)?;
         let class = classify_method(method, &params_value, head, settings.confirmation_depth)?;
         let canonical_params = serde_json::to_vec(&params_value).ok()?;

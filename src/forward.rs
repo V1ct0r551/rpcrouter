@@ -101,6 +101,10 @@ impl Forwarder {
 
     pub async fn execute_raw(&self, chain_id: u64, request: &RawValue) -> Value {
         self.metrics.record_ingress(chain_id);
+
+        // 路由层解析：resolve_for_request 返回 None 表示未知链（404 已在 server 层处理）。
+        let _state = self.registry.resolve_for_request(chain_id).await;
+
         let started = Instant::now();
         let metadata: RawRequestMetadata<'_> = match serde_json::from_str(request.get()) {
             Ok(metadata) => metadata,

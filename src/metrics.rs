@@ -9,8 +9,8 @@ use std::{
 
 use dashmap::DashMap;
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry as PrometheusRegistry, TextEncoder,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry as PrometheusRegistry, TextEncoder,
 };
 
 use crate::registry::{EndpointStatsSnapshot, Registry};
@@ -38,6 +38,17 @@ pub struct Metrics {
     endpoint_state: IntGaugeVec,
     known_endpoints: Mutex<HashMap<(String, String), EndpointStatsSnapshot>>,
     hedge_totals: DashMap<u64, Arc<HedgeTotals>>,
+    // ── v2 新指标 ──
+    chain_state: IntGaugeVec,
+    chain_pinned: IntGaugeVec,
+    catalog_chains: IntGauge,
+    catalog_endpoints: IntGauge,
+    probe_queue_depth: IntGauge,
+    probe_in_flight: IntGauge,
+    chainlist_last_refresh: IntGauge,
+    chainlist_refresh_total: IntCounterVec,
+    chain_activations: IntCounter,
+    chain_demotions: IntCounterVec,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -68,11 +79,6 @@ impl Metrics {
             ),
             &["chain_id"],
         )?;
-        // 入口防护拒绝计数（过载/请求体过大/每 IP 限速）。注意：这些拒绝发生在
-        // 数据面转发之前，属于入口侧防护，**不**计入 user_visible_errors——后者是
-        // 上游侧承诺指标（请求已进入转发但所有上游端点耗尽）。告警规则若要表达
-        // “上游承诺失败”，只应看 user_visible_errors；ingress_rejected 是过载信号，
-        // 二者语义边界不可混淆。
         let ingress_rejected = IntCounterVec::new(
             Opts::new(
                 "rpcrouter_ingress_rejected_total",
@@ -199,6 +205,57 @@ impl Metrics {
             &["chain_id", "endpoint", "state"],
         )?;
 
+        // ── v2 新指标 ──
+        let chain_state = IntGaugeVec::new(
+            Opts::new("rpcrouter_chains", "Number of chains by lifecycle state."),
+            &["state"],
+        )?;
+        let chain_pinned = IntGaugeVec::new(
+            Opts::new(
+                "rpcrouter_chain_pinned",
+                "1 if the chain is pinned, 0 otherwise.",
+            ),
+            &["chain_id"],
+        )?;
+        let catalog_chains = IntGauge::new(
+            "rpcrouter_catalog_chains",
+            "Number of chains in the catalog.",
+        )?;
+        let catalog_endpoints = IntGauge::new(
+            "rpcrouter_catalog_endpoints",
+            "Number of endpoints in the catalog.",
+        )?;
+        let probe_queue_depth = IntGauge::new(
+            "rpcrouter_probe_queue_depth",
+            "Number of probe tasks waiting in the queue.",
+        )?;
+        let probe_in_flight = IntGauge::new(
+            "rpcrouter_probe_in_flight",
+            "Number of probes currently in flight.",
+        )?;
+        let chainlist_last_refresh = IntGauge::new(
+            "rpcrouter_chainlist_last_refresh_timestamp_seconds",
+            "Unix timestamp of the last successful chainlist refresh.",
+        )?;
+        let chainlist_refresh_total = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_chainlist_refresh_total",
+                "Chainlist refresh attempts by source.",
+            ),
+            &["source"],
+        )?;
+        let chain_activations = IntCounter::new(
+            "rpcrouter_chain_activations_total",
+            "Number of chain activations (dormant → hot).",
+        )?;
+        let chain_demotions = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_chain_demotions_total",
+                "Number of chain demotions by reason.",
+            ),
+            &["reason"],
+        )?;
+
         for collector in [
             Box::new(ingress.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(ingress_rejected.clone()),
@@ -219,6 +276,16 @@ impl Metrics {
             Box::new(endpoint_rate_limited.clone()),
             Box::new(endpoint_cooling_events.clone()),
             Box::new(endpoint_state.clone()),
+            Box::new(chain_state.clone()),
+            Box::new(chain_pinned.clone()),
+            Box::new(catalog_chains.clone()),
+            Box::new(catalog_endpoints.clone()),
+            Box::new(probe_queue_depth.clone()),
+            Box::new(probe_in_flight.clone()),
+            Box::new(chainlist_last_refresh.clone()),
+            Box::new(chainlist_refresh_total.clone()),
+            Box::new(chain_activations.clone()),
+            Box::new(chain_demotions.clone()),
         ] {
             registry.register(collector)?;
         }
@@ -246,6 +313,16 @@ impl Metrics {
             endpoint_state,
             known_endpoints: Mutex::new(HashMap::new()),
             hedge_totals: DashMap::new(),
+            chain_state,
+            chain_pinned,
+            catalog_chains,
+            catalog_endpoints,
+            probe_queue_depth,
+            probe_in_flight,
+            chainlist_last_refresh,
+            chainlist_refresh_total,
+            chain_activations,
+            chain_demotions,
         })
     }
 
@@ -255,8 +332,6 @@ impl Metrics {
             .inc();
     }
 
-    /// 入口防护拒绝计数。reason 取值：overload / body_too_large / rate_limited。
-    /// 此计数**不属于** user_visible_errors（上游侧承诺指标）。
     pub fn record_ingress_rejected(&self, reason: &str) {
         self.ingress_rejected.with_label_values(&[reason]).inc();
     }
@@ -346,6 +421,59 @@ impl Metrics {
         self.failover_depth
             .with_label_values(&[&chain_id.to_string()])
             .observe(depth as f64);
+    }
+
+    // ── v2 新方法 ──
+
+    pub fn set_chain_state_counts(&self, pinned: u64, hot: u64, dormant: u64, disabled: u64) {
+        self.chain_state
+            .with_label_values(&["pinned"])
+            .set(pinned as i64);
+        self.chain_state.with_label_values(&["hot"]).set(hot as i64);
+        self.chain_state
+            .with_label_values(&["dormant"])
+            .set(dormant as i64);
+        self.chain_state
+            .with_label_values(&["disabled"])
+            .set(disabled as i64);
+    }
+
+    pub fn set_chain_pinned(&self, chain_id: u64, pinned: bool) {
+        let chain = chain_id.to_string();
+        self.chain_pinned
+            .with_label_values(&[&chain])
+            .set(i64::from(pinned));
+    }
+
+    pub fn set_catalog_counts(&self, chains: u64, endpoints: u64) {
+        self.catalog_chains.set(chains as i64);
+        self.catalog_endpoints.set(endpoints as i64);
+    }
+
+    pub fn set_probe_queue_depth(&self, depth: u64) {
+        self.probe_queue_depth.set(depth as i64);
+    }
+
+    pub fn set_probe_in_flight(&self, in_flight: u64) {
+        self.probe_in_flight.set(in_flight as i64);
+    }
+
+    pub fn set_chainlist_last_refresh(&self, ts: u64) {
+        self.chainlist_last_refresh.set(ts as i64);
+    }
+
+    pub fn record_chainlist_refresh(&self, source: &str) {
+        self.chainlist_refresh_total
+            .with_label_values(&[source])
+            .inc();
+    }
+
+    pub fn record_chain_activation(&self) {
+        self.chain_activations.inc();
+    }
+
+    pub fn record_chain_demotion(&self, reason: &str) {
+        self.chain_demotions.with_label_values(&[reason]).inc();
     }
 
     pub fn chain_snapshot(&self, chain_id: u64) -> ChainMetricsSnapshot {

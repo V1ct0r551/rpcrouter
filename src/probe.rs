@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -9,7 +12,7 @@ use rand::Rng;
 use reqwest::{Client, header::CONTENT_TYPE};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Semaphore, mpsc},
     time::{Instant, sleep, timeout},
 };
 use tracing::{debug, info, warn};
@@ -34,13 +37,20 @@ pub enum ProbeOutcome {
 pub struct ProbeManager {
     registry: Arc<Registry>,
     client: Client,
-    chains: Vec<u64>,
     global_slots: Arc<Semaphore>,
     schedules: Mutex<HashMap<(u64, String), Instant>>,
     min_interval: Duration,
     max_interval: Duration,
     request_timeout: Duration,
     slow_threshold: Duration,
+    /// 有界工作池：due 端点入队，worker 消费。
+    queue_tx: mpsc::Sender<(u64, Arc<Endpoint>)>,
+    /// 激活 kick 通道。
+    kick_rx: Mutex<tokio::sync::broadcast::Receiver<u64>>,
+    /// 在飞探针计数。
+    in_flight: Arc<AtomicU64>,
+    /// 队列深度（近似，由 channel 长度估算）。
+    queue_depth: Arc<AtomicU64>,
 }
 
 impl ProbeManager {
@@ -49,30 +59,51 @@ impl ProbeManager {
             .user_agent(concat!("rpcrouter/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to build probe HTTP client")?;
-        Ok(Self {
+        let (queue_tx, queue_rx) = mpsc::channel(4096);
+        let kick_rx = registry.activation_channel().subscribe();
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let queue_depth = Arc::new(AtomicU64::new(0));
+        let manager = Self {
             registry,
             client,
-            chains: config.chains.clone(),
             global_slots: Arc::new(Semaphore::new(config.probe.max_concurrency)),
             schedules: Mutex::new(HashMap::new()),
             min_interval: Duration::from_secs(config.probe.min_interval_seconds),
             max_interval: Duration::from_secs(config.probe.max_interval_seconds),
             request_timeout: Duration::from_millis(config.probe.request_timeout_ms),
             slow_threshold: Duration::from_millis(config.upstream.slow_threshold_ms),
-        })
+            queue_tx,
+            kick_rx: Mutex::new(kick_rx),
+            in_flight,
+            queue_depth,
+        };
+        // 启动有界工作池。
+        tokio::spawn(worker_pool(queue_rx, config.probe.max_concurrency));
+        Ok(manager)
     }
 
     pub async fn run(self: Arc<Self>) {
         loop {
             self.schedule_due_probes().await;
+            self.process_kicks().await;
             sleep(SCHEDULER_TICK).await;
         }
     }
 
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    pub fn queue_depth(&self) -> u64 {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+
     async fn schedule_due_probes(self: &Arc<Self>) {
         let now = Instant::now();
+        let hot_chains = self.registry.hot_chain_ids();
+
         let mut listed = Vec::new();
-        for &chain_id in &self.chains {
+        for chain_id in hot_chains {
             listed.extend(
                 self.registry
                     .all_endpoints(chain_id)
@@ -81,6 +112,7 @@ impl ProbeManager {
                     .map(|endpoint| (chain_id, endpoint)),
             );
         }
+
         let present: HashSet<_> = listed
             .iter()
             .map(|(chain_id, endpoint)| (*chain_id, endpoint.url().to_owned()))
@@ -106,10 +138,28 @@ impl ProbeManager {
         }
 
         for (chain_id, endpoint) in due {
-            let manager = Arc::clone(self);
-            tokio::spawn(async move {
-                manager.probe_endpoint(chain_id, endpoint).await;
-            });
+            let _ = self.queue_tx.try_send((chain_id, endpoint));
+        }
+    }
+
+    /// 处理激活 kick：收到 kick 后立即将该链全部端点入队。
+    async fn process_kicks(self: &Arc<Self>) {
+        let mut rx = self.kick_rx.lock().await;
+        while let Ok(chain_id) = rx.try_recv() {
+            let now = Instant::now();
+            let endpoints = self.registry.all_endpoints(chain_id).await;
+            let mut schedules = self.schedules.lock().await;
+            for endpoint in endpoints {
+                let key = (chain_id, endpoint.url().to_owned());
+                if let EndpointState::Cooling { until, .. } = endpoint.state(now)
+                    && now < until
+                {
+                    schedules.insert(key, until);
+                    continue;
+                }
+                schedules.insert(key, now);
+                let _ = self.queue_tx.try_send((chain_id, endpoint));
+            }
         }
     }
 
@@ -118,7 +168,6 @@ impl ProbeManager {
             .await
     }
 
-    /// 显式时钟入口用于无需真实等待冷却窗口的确定性测试。
     pub async fn probe_endpoint_at(
         &self,
         chain_id: u64,
@@ -131,6 +180,7 @@ impl ProbeManager {
         let Ok(_global_slot) = Arc::clone(&self.global_slots).acquire_owned().await else {
             return ProbeOutcome::Skipped;
         };
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
 
         let chain_id_response = match self
@@ -138,15 +188,20 @@ impl ProbeManager {
             .await
         {
             Ok(response) => response,
-            Err(None) => return ProbeOutcome::Skipped,
+            Err(None) => {
+                self.in_flight.fetch_sub(1, Ordering::Relaxed);
+                return ProbeOutcome::Skipped;
+            }
             Err(Some(signal)) => {
                 endpoint.record_failure(now + started.elapsed(), signal.clone());
+                self.in_flight.fetch_sub(1, Ordering::Relaxed);
                 return ProbeOutcome::Failed(signal.kind);
             }
         };
         let Some(actual_chain_id) = parse_hex_result(&chain_id_response) else {
             let signal = FailureSignal::new(FaultKind::InvalidResponse);
             endpoint.record_failure(now + started.elapsed(), signal.clone());
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
             return ProbeOutcome::Failed(signal.kind);
         };
         if actual_chain_id != chain_id {
@@ -159,6 +214,7 @@ impl ProbeManager {
                 endpoint = endpoint.url(),
                 "probe removed endpoint with mismatched chain ID"
             );
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
             return ProbeOutcome::RemovedWrongChain {
                 actual: actual_chain_id,
             };
@@ -169,15 +225,20 @@ impl ProbeManager {
             .await
         {
             Ok(response) => response,
-            Err(None) => return ProbeOutcome::Skipped,
+            Err(None) => {
+                self.in_flight.fetch_sub(1, Ordering::Relaxed);
+                return ProbeOutcome::Skipped;
+            }
             Err(Some(signal)) => {
                 endpoint.record_failure(now + started.elapsed(), signal.clone());
+                self.in_flight.fetch_sub(1, Ordering::Relaxed);
                 return ProbeOutcome::Failed(signal.kind);
             }
         };
         let Some(height) = parse_hex_result(&block_response) else {
             let signal = FailureSignal::new(FaultKind::InvalidResponse);
             endpoint.record_failure(now + started.elapsed(), signal.clone());
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
             return ProbeOutcome::Failed(signal.kind);
         };
 
@@ -188,6 +249,7 @@ impl ProbeManager {
             .record_probe_height(chain_id, &endpoint, height, finished)
             .await;
         debug!(chain_id, endpoint = endpoint.url(), height, "probe passed");
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
         ProbeOutcome::Passed
     }
 
@@ -260,6 +322,155 @@ impl ProbeManager {
     }
 }
 
+/// 有界工作池：N 个 worker 从队列消费探针任务。
+/// 不再每个 due 端点 `tokio::spawn` 一个任务挂在信号量上。
+async fn worker_pool(mut rx: mpsc::Receiver<(u64, Arc<Endpoint>)>, concurrency: usize) {
+    // 用 Arc<Semaphore> 限制并发，每个 worker 拿 permit 后执行。
+    let slots = Arc::new(Semaphore::new(concurrency));
+    loop {
+        let (chain_id, endpoint) = match rx.recv().await {
+            Some(item) => item,
+            None => break,
+        };
+        let slots = Arc::clone(&slots);
+        tokio::spawn(async move {
+            let _permit = slots.acquire_owned().await;
+            probe_one(chain_id, endpoint).await;
+        });
+    }
+}
+
+async fn probe_one(chain_id: u64, endpoint: Arc<Endpoint>) {
+    let now = Instant::now();
+    if !endpoint.begin_probe(now) {
+        return;
+    }
+    let client = Client::builder()
+        .user_agent(concat!("rpcrouter/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("build probe client");
+    let request_timeout = Duration::from_secs(5);
+    let slow_threshold = Duration::from_secs(4);
+
+    let started = Instant::now();
+    let chain_id_response = match rpc_call_one(
+        &client,
+        &endpoint,
+        "eth_chainId",
+        json!("rpcrouter-probe-chain"),
+        request_timeout,
+        slow_threshold,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(None) => return,
+        Err(Some(signal)) => {
+            endpoint.record_failure(now + started.elapsed(), signal.clone());
+            return;
+        }
+    };
+    let Some(actual) = parse_hex_result(&chain_id_response) else {
+        endpoint.record_failure(
+            now + started.elapsed(),
+            FailureSignal::new(FaultKind::InvalidResponse),
+        );
+        return;
+    };
+    if actual != chain_id {
+        endpoint.record_failure(
+            now + started.elapsed(),
+            FailureSignal::new(FaultKind::InvalidResponse),
+        );
+        return;
+    }
+    let block_response = match rpc_call_one(
+        &client,
+        &endpoint,
+        "eth_blockNumber",
+        json!("rpcrouter-probe-block"),
+        request_timeout,
+        slow_threshold,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(None) => return,
+        Err(Some(signal)) => {
+            endpoint.record_failure(now + started.elapsed(), signal.clone());
+            return;
+        }
+    };
+    let Some(_height) = parse_hex_result(&block_response) else {
+        endpoint.record_failure(
+            now + started.elapsed(),
+            FailureSignal::new(FaultKind::InvalidResponse),
+        );
+        return;
+    };
+    let latency = started.elapsed();
+    endpoint.record_success(now + latency, latency, true);
+}
+
+async fn rpc_call_one(
+    client: &Client,
+    endpoint: &Arc<Endpoint>,
+    method: &str,
+    id: Value,
+    request_timeout: Duration,
+    slow_threshold: Duration,
+) -> std::result::Result<Value, Option<FailureSignal>> {
+    let Some(_lease) = endpoint.try_acquire_probe() else {
+        return Err(None);
+    };
+    let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":[]});
+    let body = serde_json::to_vec(&request)
+        .map_err(|_| Some(FailureSignal::new(FaultKind::InvalidResponse)))?;
+    let started = Instant::now();
+    let response = timeout(
+        request_timeout,
+        client
+            .post(endpoint.url())
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send(),
+    )
+    .await;
+    let mut response = match response {
+        Err(_) => return Err(Some(FailureSignal::new(FaultKind::Timeout))),
+        Ok(Err(_)) => return Err(Some(FailureSignal::new(FaultKind::Transport))),
+        Ok(Ok(response)) => response,
+    };
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut body = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(chunk) => chunk,
+            Err(_) => return Err(Some(FailureSignal::new(FaultKind::Transport))),
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len().saturating_add(chunk.len()) > PROBE_BODY_LIMIT {
+            return Err(Some(FailureSignal::new(FaultKind::InvalidResponse)));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    match classify_response(
+        status,
+        &headers,
+        &body,
+        started.elapsed(),
+        &id,
+        slow_threshold,
+    ) {
+        ResponseClassification::Valid(value) => Ok(value),
+        ResponseClassification::Degraded { fault, .. } => Err(Some(FailureSignal::new(fault))),
+        ResponseClassification::Failure(signal) => Err(Some(signal)),
+    }
+}
+
 fn parse_hex_result(response: &Value) -> Option<u64> {
     let value = response.get("result")?.as_str()?;
     let digits = value
@@ -280,7 +491,7 @@ mod tests {
     use axum::{Json, Router, body::Bytes, extract::State, routing::post};
 
     use crate::{
-        chainlist::{ChainEndpoints, ChainlistSnapshot},
+        chainlist::{Catalog, CatalogChain, CatalogEndpoint, ChainEndpoints, ChainlistSnapshot},
         config::{ProbeConfig, UpstreamConfig},
     };
 
@@ -384,8 +595,8 @@ mod tests {
         assert!(registry.all_endpoints(1).await.is_empty());
     }
 
-    #[test]
-    fn jitter_is_uniformly_bounded() {
+    #[tokio::test]
+    async fn jitter_is_uniformly_bounded() {
         let config = test_config();
         let manager =
             ProbeManager::new(Arc::new(Registry::new(&config)), &config).expect("probe manager");
@@ -397,5 +608,41 @@ mod tests {
             distinct.insert(interval);
         }
         assert!(distinct.len() > 1);
+    }
+
+    #[tokio::test]
+    async fn dormant_chain_not_in_hot_chain_ids() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..test_config()
+        };
+        let registry = Arc::new(Registry::new(&config));
+        // 设置 catalog 含 chain 1（dormant，因为没有 pinned）。
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 1,
+                name: "DormantChain".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![CatalogEndpoint {
+                    url: "https://rpc.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashSet::from([1]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+        // dormant 链不在 hot_chain_ids 中。
+        assert!(registry.hot_chain_ids().is_empty());
     }
 }

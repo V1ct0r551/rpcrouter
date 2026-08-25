@@ -3,7 +3,7 @@ use std::{
     num::NonZeroU32,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,12 +13,12 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use rand::Rng;
 use serde::Serialize;
 use tokio::{
-    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, broadcast},
     time::{Duration, Instant},
 };
 
 use crate::{
-    chainlist::{ChainEndpoints, ChainlistSnapshot},
+    chainlist::{Catalog, ChainEndpoints, ChainlistSnapshot},
     config::Config,
     signals::{FailureSignal, FaultKind},
 };
@@ -27,6 +27,8 @@ const ERROR_WINDOW: Duration = Duration::from_secs(60);
 const STRIKE_DECAY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const FAULTS_BEFORE_COOLING: u8 = 3;
 const PROBATION_PASSES_REQUIRED: u8 = 2;
+
+// ── 端点状态机（v1 不变） ──
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EndpointState {
@@ -394,42 +396,197 @@ impl EndpointLease {
     }
 }
 
-struct ChainState {
+// ── 链状态（v2：增加生命周期字段） ──
+
+/// 链的可见状态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChainStateLabel {
+    Pinned,
+    Hot,
+    Dormant,
+    Disabled,
+}
+
+pub(crate) struct ChainState {
     chain_id: u64,
     name: RwLock<String>,
     endpoints: RwLock<Vec<Arc<Endpoint>>>,
     rejected: RwLock<HashSet<String>>,
     head: AtomicU64,
+    /// pinned 链永不降级，启动即 materialize。
+    pinned: AtomicBool,
+    /// disabled 链拒绝流量（403）。
+    disabled: AtomicBool,
+    /// 最后一次入口请求的 Unix 秒时间戳（粗粒度，仅秒值变化时写入）。
+    last_ingress: AtomicU64,
 }
 
 impl ChainState {
-    fn new(chain_id: u64, name: String) -> Self {
+    fn new(chain_id: u64, name: String, pinned: bool) -> Self {
         Self {
             chain_id,
             name: RwLock::new(name),
             endpoints: RwLock::new(Vec::new()),
             rejected: RwLock::new(HashSet::new()),
             head: AtomicU64::new(0),
+            pinned: AtomicBool::new(pinned),
+            disabled: AtomicBool::new(false),
+            last_ingress: AtomicU64::new(0),
+        }
+    }
+
+    pub fn state_label(&self) -> ChainStateLabel {
+        if self.disabled.load(Ordering::Relaxed) {
+            ChainStateLabel::Disabled
+        } else if self.pinned.load(Ordering::Relaxed) {
+            ChainStateLabel::Pinned
+        } else if self.last_ingress.load(Ordering::Relaxed) > 0 {
+            ChainStateLabel::Hot
+        } else {
+            ChainStateLabel::Dormant
         }
     }
 }
 
+// ── Registry（v2） ──
+
+/// 激活通知：新链被 materialize 时发送 chain_id。
+pub type ActivationKick = broadcast::Sender<u64>;
+
 pub struct Registry {
     chains: DashMap<u64, Arc<ChainState>>,
+    catalog: RwLock<Option<Arc<Catalog>>>,
     config: Config,
     user_visible_errors: AtomicU64,
+    /// 链激活计数器。
+    chain_activations: AtomicU64,
+    /// 链降级计数器，按 reason。
+    chain_demotions_idle: AtomicU64,
+    chain_demotions_lru: AtomicU64,
+    chain_demotions_admin: AtomicU64,
+    /// 激活通知通道（探针调度器订阅）。
+    activation_tx: broadcast::Sender<u64>,
 }
 
 impl Registry {
     pub fn new(config: &Config) -> Self {
+        let (activation_tx, _) = broadcast::channel(256);
         Self {
             chains: DashMap::new(),
+            catalog: RwLock::new(None),
             config: config.clone(),
             user_visible_errors: AtomicU64::new(0),
+            chain_activations: AtomicU64::new(0),
+            chain_demotions_idle: AtomicU64::new(0),
+            chain_demotions_lru: AtomicU64::new(0),
+            chain_demotions_admin: AtomicU64::new(0),
+            activation_tx,
         }
     }
 
+    /// 设置目录（每次 chainlist 刷新整体替换）。
+    pub async fn set_catalog(&self, catalog: Arc<Catalog>) {
+        *self.catalog.write().await = Some(catalog);
+    }
+
+    /// 获取当前目录（只读）。
+    pub async fn catalog(&self) -> Option<Arc<Catalog>> {
+        self.catalog.read().await.clone()
+    }
+
+    /// 激活通知通道（探针订阅）。
+    pub fn activation_channel(&self) -> broadcast::Sender<u64> {
+        self.activation_tx.clone()
+    }
+
+    // ── 热路径：resolve_for_request ──
+
+    /// 热路径：解析 chain_id 并触达 ChainState。
+    /// DashMap get + 原子读；dormant 时才走慢路径 materialize。
+    /// 返回 `None` 表示未知链（不在目录也不在 pinned）。
+    pub(crate) async fn resolve_for_request(&self, chain_id: u64) -> Option<Arc<ChainState>> {
+        // 路由层用这个做语义判定：未知链 / 0端点 / disabled。
+        // 先查 DashMap（已 materialized 的链）。
+        if let Some(state) = self.chain(chain_id) {
+            // 更新 last_ingress：只在秒值变化时写入，避免 10k QPS 下缓存行争用。
+            let now_sec = unix_seconds();
+            let last = state.last_ingress.load(Ordering::Relaxed);
+            if now_sec != last {
+                state.last_ingress.store(now_sec, Ordering::Relaxed);
+            }
+            return Some(state);
+        }
+
+        // 未 materialized → 查目录。
+        let catalog = self.catalog.read().await;
+        let catalog_entry = catalog.as_ref().and_then(|c| c.lookup(chain_id));
+        let pinned = self.config.chains.contains(&chain_id);
+
+        if catalog_entry.is_none() && !pinned {
+            return None; // 未知链
+        }
+
+        // 慢路径：materialize。
+        drop(catalog);
+        let state = self.materialize(chain_id, pinned).await?;
+        Some(state)
+    }
+
+    /// 慢路径：materialize 链（从 Catalog 取端点 + 配置叠加）。
+    async fn materialize(&self, chain_id: u64, pinned: bool) -> Option<Arc<ChainState>> {
+        let catalog = self.catalog.read().await;
+        let catalog_entry = catalog.as_ref().and_then(|c| c.lookup(chain_id));
+
+        let name = catalog_entry
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| format!("Chain {chain_id}"));
+        let state = Arc::new(ChainState::new(chain_id, name, pinned));
+
+        // 构建端点池：目录端点 + extra_endpoints - disabled_endpoints - rejected。
+        let mut desired_urls: Vec<String> = Vec::new();
+        if let Some(entry) = catalog_entry {
+            desired_urls.extend(entry.endpoints.iter().map(|e| e.url.clone()));
+        }
+        if let Some(chain_override) = self.config.chain_override(chain_id) {
+            desired_urls.extend(chain_override.extra_endpoints.iter().cloned());
+        }
+
+        let chain_override = self.config.chain_override(chain_id);
+        let disabled: HashSet<&str> = chain_override
+            .into_iter()
+            .flat_map(|chain| chain.disabled_endpoints.iter().map(String::as_str))
+            .collect();
+
+        let now = unix_seconds();
+        let mut seen = HashSet::new();
+        let mut endpoints = Vec::new();
+        for url in desired_urls {
+            if disabled.contains(url.as_str()) || !seen.insert(url.clone()) {
+                continue;
+            }
+            let (rps, concurrency) = self.config.endpoint_limits(chain_id, &url);
+            endpoints.push(Arc::new(Endpoint::new(url, rps, concurrency, now)));
+        }
+        *state.endpoints.write().await = endpoints;
+
+        // 插入 DashMap。
+        self.chains.insert(chain_id, Arc::clone(&state));
+        self.chain_activations.fetch_add(1, Ordering::Relaxed);
+
+        // 更新 last_ingress。
+        state.last_ingress.store(now, Ordering::Relaxed);
+
+        // 通知探针调度器。
+        let _ = self.activation_tx.send(chain_id);
+
+        Some(state)
+    }
+
+    // ── 兼容旧接口：apply_snapshot ──
+
     /// 刷新时复用同 URL 的端点对象，避免丢失健康与出站限流状态。
+    /// 新端点从 Probation 起步，消失端点宽限 24h。
     pub async fn apply_snapshot(&self, snapshot: &ChainlistSnapshot) {
         let source_by_chain: HashMap<_, _> = snapshot
             .chains
@@ -438,6 +595,7 @@ impl Registry {
             .collect();
         let now = unix_seconds();
 
+        // 旧行为：只为 config.chains 中的链合并。
         for &chain_id in &self.config.chains {
             let source = source_by_chain.get(&chain_id).copied();
             let name = source
@@ -446,7 +604,7 @@ impl Registry {
             let state = self
                 .chains
                 .entry(chain_id)
-                .or_insert_with(|| Arc::new(ChainState::new(chain_id, name.clone())))
+                .or_insert_with(|| Arc::new(ChainState::new(chain_id, name.clone(), true)))
                 .clone();
             if source.is_some() {
                 *state.name.write().await = name;
@@ -512,6 +670,107 @@ impl Registry {
         *state.endpoints.write().await = merged;
     }
 
+    // ── 生命周期控制 ──
+
+    /// demote：将 hot 链降级为 dormant（丢弃端点运行态）。
+    pub async fn demote(&self, chain_id: u64, reason: &str) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        if state.pinned.load(Ordering::Relaxed) {
+            return false; // pinned 不降级
+        }
+        // 先标记为 dormant（清 last_ingress）。
+        state.last_ingress.store(0, Ordering::Relaxed);
+        // 丢弃端点运行态。
+        *state.endpoints.write().await = Vec::new();
+        match reason {
+            "idle" => self.chain_demotions_idle.fetch_add(1, Ordering::Relaxed),
+            "lru" => self.chain_demotions_lru.fetch_add(1, Ordering::Relaxed),
+            _ => self.chain_demotions_admin.fetch_add(1, Ordering::Relaxed),
+        };
+        true
+    }
+
+    /// 设置 disabled 状态。
+    pub async fn set_disabled(&self, chain_id: u64, disabled: bool) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        state.disabled.store(disabled, Ordering::Relaxed);
+        true
+    }
+
+    /// 设置 pinned 状态。
+    pub async fn set_pinned(&self, chain_id: u64, pinned: bool) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        state.pinned.store(pinned, Ordering::Relaxed);
+        true
+    }
+
+    /// 已 materialized 的热链 id 列表（pinned + hot）。
+    pub fn hot_chain_ids(&self) -> Vec<u64> {
+        self.chains
+            .iter()
+            .filter(|entry| {
+                let state = entry.value();
+                let label = state.state_label();
+                matches!(label, ChainStateLabel::Pinned | ChainStateLabel::Hot)
+            })
+            .map(|entry| *entry.key())
+            .collect()
+    }
+
+    /// housekeeping：idle 降级 + LRU 淘汰。
+    pub async fn housekeeping(&self) {
+        let now_sec = unix_seconds();
+        let idle_seconds = self.config.discovery.idle_seconds;
+        let max_hot = self.config.discovery.max_hot_chains;
+
+        // 收集 hot 链（非 pinned、非 disabled）。
+        let mut hot_entries: Vec<(u64, u64)> = self
+            .chains
+            .iter()
+            .filter(|entry| {
+                let state = entry.value();
+                !state.pinned.load(Ordering::Relaxed)
+                    && !state.disabled.load(Ordering::Relaxed)
+                    && state.last_ingress.load(Ordering::Relaxed) > 0
+            })
+            .map(|entry| {
+                let last = entry.value().last_ingress.load(Ordering::Relaxed);
+                (*entry.key(), last)
+            })
+            .collect();
+
+        // idle 降级：last_ingress 超过 idle_seconds 的链。
+        for (chain_id, last) in &hot_entries {
+            if now_sec.saturating_sub(*last) > idle_seconds {
+                self.demote(*chain_id, "idle").await;
+            }
+        }
+
+        // 重新收集（idle 降级后）。
+        hot_entries.retain(|(chain_id, _)| {
+            self.chains
+                .get(chain_id)
+                .is_some_and(|state| state.last_ingress.load(Ordering::Relaxed) > 0)
+        });
+
+        // LRU 淘汰：超过 max_hot 时按 last_ingress 升序淘汰最久未用的。
+        if hot_entries.len() > max_hot {
+            hot_entries.sort_by_key(|(_, last)| *last);
+            let to_evict = hot_entries.len() - max_hot;
+            for (chain_id, _) in hot_entries.iter().take(to_evict) {
+                self.demote(*chain_id, "lru").await;
+            }
+        }
+    }
+
+    // ── 查询接口 ──
+
     /// 优先对 Active 集执行 P2C；冷启动无 Active 时回退到 Probation 集。
     pub async fn candidates(&self, chain_id: u64) -> Vec<Arc<Endpoint>> {
         let endpoints = self.all_endpoints(chain_id).await;
@@ -551,6 +810,26 @@ impl Registry {
             return Vec::new();
         };
         state.endpoints.read().await.clone()
+    }
+
+    /// 端点数量（materialized 链）。
+    pub async fn endpoint_count(&self, chain_id: u64) -> usize {
+        self.all_endpoints(chain_id).await.len()
+    }
+
+    /// 链是否为 disabled。
+    pub fn is_disabled(&self, chain_id: u64) -> bool {
+        self.chain(chain_id)
+            .is_some_and(|state| state.disabled.load(Ordering::Relaxed))
+    }
+
+    /// 链是否在目录中。
+    pub async fn chain_in_catalog(&self, chain_id: u64) -> bool {
+        self.catalog
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|c| c.by_id.contains(&chain_id))
     }
 
     pub async fn healthy_for_hedging(&self, chain_id: u64, minimum_active: usize) -> bool {
@@ -626,6 +905,20 @@ impl Registry {
         self.user_visible_errors.load(Ordering::Relaxed)
     }
 
+    pub fn chain_activations(&self) -> u64 {
+        self.chain_activations.load(Ordering::Relaxed)
+    }
+
+    pub fn chain_demotions(&self) -> (u64, u64, u64) {
+        (
+            self.chain_demotions_idle.load(Ordering::Relaxed),
+            self.chain_demotions_lru.load(Ordering::Relaxed),
+            self.chain_demotions_admin.load(Ordering::Relaxed),
+        )
+    }
+
+    // ── summaries（v2：增加 state 字段） ──
+
     pub async fn summaries(&self) -> Vec<ChainSummary> {
         let mut states: Vec<_> = self
             .chains
@@ -657,9 +950,39 @@ impl Registry {
                 cooling,
                 probation,
                 head: state.head.load(Ordering::Relaxed),
+                state: state.state_label(),
             });
         }
         summaries
+    }
+
+    /// 链数量统计（按状态）。
+    pub async fn chain_counts(&self) -> ChainCounts {
+        let mut pinned = 0u64;
+        let mut hot = 0u64;
+        let mut dormant = 0u64;
+        let mut disabled = 0u64;
+        for entry in self.chains.iter() {
+            match entry.value().state_label() {
+                ChainStateLabel::Pinned => pinned += 1,
+                ChainStateLabel::Hot => hot += 1,
+                ChainStateLabel::Dormant => dormant += 1,
+                ChainStateLabel::Disabled => disabled += 1,
+            }
+        }
+        let catalog_count = self
+            .catalog
+            .read()
+            .await
+            .as_ref()
+            .map_or(0, |c| c.chains.len() as u64);
+        ChainCounts {
+            catalog: catalog_count,
+            pinned,
+            hot,
+            dormant,
+            disabled,
+        }
     }
 
     pub async fn endpoint_metric_snapshots(&self) -> Vec<EndpointMetricSnapshot> {
@@ -696,6 +1019,8 @@ impl Registry {
     }
 }
 
+// ── 汇总类型 ──
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainSummary {
@@ -706,6 +1031,17 @@ pub struct ChainSummary {
     pub cooling: usize,
     pub probation: usize,
     pub head: u64,
+    /// v2: 链生命周期状态。
+    pub state: ChainStateLabel,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChainCounts {
+    pub catalog: u64,
+    pub pinned: u64,
+    pub hot: u64,
+    pub dormant: u64,
+    pub disabled: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -715,6 +1051,8 @@ pub struct EndpointMetricSnapshot {
     pub state: &'static str,
     pub stats: EndpointStatsSnapshot,
 }
+
+// ── 工具函数 ──
 
 pub fn cooldown_for_strikes(strikes: u32) -> Duration {
     let seconds = match strikes {
@@ -756,6 +1094,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::chainlist::CatalogChain;
+
     use super::*;
 
     fn snapshot(urls: &[&str]) -> ChainlistSnapshot {
@@ -963,5 +1303,57 @@ mod tests {
         assert_eq!(trimmed_max(&[10, 11]), Some(11));
         assert_eq!(trimmed_max(&[100, 101, 10_000]), Some(101));
         assert_eq!(trimmed_max(&[98, 99, 100, 101, 10_000]), Some(101));
+    }
+
+    // ── v2 生命周期测试 ──
+
+    #[tokio::test]
+    async fn resolve_for_request_returns_none_for_unknown_chain() {
+        let config = Config {
+            chains: vec![1],
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        // 没有 catalog，也没有 pinned 999999。
+        assert!(registry.resolve_for_request(999999).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_for_request_materializes_dormant_chain() {
+        let config = Config {
+            chains: vec![1],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        // 设置 catalog（含 chain 1）。
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 1,
+                name: "Test".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashSet::from([1]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        let state = registry.resolve_for_request(1).await.expect("chain 1");
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned); // pinned because in config.chains
+        assert_eq!(registry.all_endpoints(1).await.len(), 1);
+        assert_eq!(registry.chain_activations(), 1);
     }
 }
