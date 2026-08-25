@@ -24,7 +24,7 @@ describe('public pages', () => {
     });
     renderWithRouter(<PublicHomePage />);
     await waitFor(() => expect(screen.getByText('Ethereum')).toBeInTheDocument());
-    expect(screen.getByText('Chains serving')).toBeInTheDocument(); expect(screen.getByText('123')).toBeInTheDocument(); expect(fetchMock).toHaveBeenCalled();
+    expect(screen.getByText('Chains serving')).toBeInTheDocument(); expect(screen.getByText('123')).toBeInTheDocument(); expect(screen.getAllByRole('button', { name: 'Copy' }).length).toBeGreaterThan(1); expect(fetchMock).toHaveBeenCalled();
   });
   it('renders chain curl example with rpc path', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(chains.items[0]), { status: 200 }));
