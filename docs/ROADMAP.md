@@ -53,7 +53,7 @@
 1. **W5 动态目录与链生命周期**（✅ 2026-08-25 合入）：Catalog 全量解析；链 pinned/hot/dormant/disabled 生命周期
    （按需激活、idle 降级、LRU 上限）；未知链 404 / 无端点 503 / 禁用 403 且不计
    `user_visible_errors`；探针有界工作池只覆盖激活链；chainlist 刷新 1h + 状态可观测。
-2. **W6 状态存储层（Redis）+ Admin REST API**：`StateStore`（Redis / file / memory）持久化运行时
+2. **W6 状态存储层（Redis）+ Admin REST API**（✅ 2026-08-25 合入）：`StateStore`（Redis / file / memory）持久化运行时
    覆写、端点健康快照、热链集合与审计，支持从零初始化 / 整体覆盖导入 / 重置，Redis 不可用可降级；
    `/admin/api/*` 只读 + 控制接口，bearer 鉴权（无 token 则控制接口 403），可选托管前端静态产物。
 3. **W7 React Dashboard**：总览 / 链列表 / 链详情 / 设置；亮暗主题；CI 前端 job；镜像内置。

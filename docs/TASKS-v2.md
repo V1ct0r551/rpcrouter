@@ -53,7 +53,8 @@
 - g) 性能：`scripts/ci-smoke.sh` 通过；本机 `cargo run --release --bin loadtest`（10k×60s）
      与 loadtest-phase3.md 对比 p99 无明显退化（±20% 内），结果写进交付说明。
 
-## W6 — 状态存储层（Redis）+ Admin REST API（分支 `w6-state-admin`，基于 W5 合入后的 main）
+## W6 — 状态存储层（Redis）+ Admin REST API（分支 `w6-state-admin`）✅ 2026-08-25 合入 main
+（133 用例 + 6 ignored；两轮 checker 共 17 条 must-fix 全修；报告 docs/reports/w6-state-admin.md）
 
 > 2026-08-25 增补：用户决定用 Redis 做持久状态（重启不丢），要求支持从 0 初始化与整体覆盖，
 > 方案见 DESIGN-v2 §11。本工作流拆两段串行交付：**W6a 状态存储层** → **W6b Admin REST API**，
