@@ -142,6 +142,26 @@ pub struct ChainRow {
     pub endpoint_rows: Option<Vec<EndpointRow>>,
 }
 
+/// 默认排序键：生命周期优先（pinned > hot > dormant > disabled）→ 有活跃端点 / 有端点者优先
+/// → 主网优先于测试网 → 流量降序 → chainId 升序兜底。
+fn priority_key(r: &ChainRow) -> (u8, bool, bool, bool, std::cmp::Reverse<u64>, u64) {
+    let rank = match r.state.as_str() {
+        "pinned" => 0,
+        "hot" => 1,
+        "dormant" => 2,
+        "disabled" => 3,
+        _ => 4,
+    };
+    (
+        rank,
+        r.active == 0,
+        r.endpoints == 0,
+        r.is_testnet,
+        std::cmp::Reverse(r.ingress_total),
+        r.chain_id,
+    )
+}
+
 fn err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     (
         status,
@@ -350,7 +370,8 @@ async fn chains(
     match query.sort.as_deref() {
         Some("name") => rows.sort_by_key(|r| r.name.clone()),
         Some("traffic") => rows.sort_by_key(|r| std::cmp::Reverse(r.ingress_total)),
-        _ => rows.sort_by_key(|r| r.chain_id),
+        Some("chainId") => rows.sort_by_key(|r| r.chain_id),
+        _ => rows.sort_by_key(priority_key),
     }
     let total = rows.len();
     let offset = query.offset.unwrap_or(0).min(total);
@@ -1168,4 +1189,62 @@ async fn build_endpoint_rows(
         let _ = h;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(
+        chain_id: u64,
+        state: &str,
+        active: usize,
+        endpoints: usize,
+        testnet: bool,
+        ingress: u64,
+    ) -> ChainRow {
+        ChainRow {
+            chain_id,
+            name: format!("Chain {chain_id}"),
+            short_name: None,
+            is_testnet: testnet,
+            status: None,
+            state: state.to_owned(),
+            pinned: state == "pinned",
+            disabled: state == "disabled",
+            catalog_endpoints: endpoints,
+            endpoints,
+            active,
+            cooling: 0,
+            probation: 0,
+            head: 0,
+            last_ingress_unix: 0,
+            ingress_total: ingress,
+            cache_hits_total: 0,
+            cache_lookups_total: 0,
+            upstream_total: 0,
+            user_visible_errors_total: 0,
+            settings: Value::Null,
+            endpoint_rows: None,
+        }
+    }
+
+    #[test]
+    fn priority_sort_puts_pinned_hot_and_endpoint_backed_chains_first() {
+        let mut rows = [
+            row(5, "dormant", 0, 0, false, 0),
+            row(4, "disabled", 3, 3, false, 900),
+            row(3, "hot", 0, 2, false, 50),
+            row(2, "hot", 2, 2, false, 10),
+            row(1, "pinned", 1, 3, false, 0),
+            row(6, "dormant", 0, 0, false, 5),
+            row(7, "hot", 2, 2, true, 999),
+            row(8, "pinned", 0, 0, false, 100),
+        ];
+        rows.sort_by_key(priority_key);
+        let ids: Vec<u64> = rows.iter().map(|r| r.chain_id).collect();
+        // pinned(有活跃) > pinned(无端点) > hot 主网有活跃 > hot 测试网有活跃 > hot 无活跃但有端点
+        // > dormant 按流量 > disabled 垫底
+        assert_eq!(ids, vec![1, 8, 2, 7, 3, 6, 5, 4]);
+    }
 }
