@@ -1,0 +1,2 @@
+import { describe, expect, it, vi } from 'vitest'; import { confirmAction } from './confirm';
+describe('dangerous confirmation',()=>{it('runs only after confirmation',()=>{const action=vi.fn();vi.spyOn(window,'confirm').mockReturnValue(false);confirmAction('Danger?',action);expect(action).not.toHaveBeenCalled();vi.mocked(window.confirm).mockReturnValue(true);confirmAction('Danger?',action);expect(action).toHaveBeenCalledOnce()})});

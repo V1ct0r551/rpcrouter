@@ -1,0 +1,13 @@
+button:disabled,
+.button.disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.warning {
+  background: color-mix(in srgb, #fab219 12%, transparent);
+  border: 1px solid #fab219;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+}
