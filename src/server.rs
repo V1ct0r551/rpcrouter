@@ -14,6 +14,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::error;
 
 use crate::{
+    admin::AdminState,
     forward::{Forwarder, all_endpoints_exhausted},
     guard::{self, BearerAuth, IpRateLimiter},
     metrics::Metrics,
@@ -31,6 +32,7 @@ pub struct AppState {
     concurrency: Arc<Semaphore>,
     rate_limiter: Option<Arc<IpRateLimiter>>,
     metrics_auth: Option<BearerAuth>,
+    admin: Option<AdminState>,
 }
 
 impl AppState {
@@ -48,6 +50,7 @@ impl AppState {
             )),
             rate_limiter: None,
             metrics_auth: None,
+            admin: None,
         }
     }
 
@@ -74,6 +77,11 @@ impl AppState {
         self.metrics_auth = metrics_auth_token.map(|token| BearerAuth::new(&token));
         self
     }
+
+    pub fn with_admin(mut self, admin: AdminState) -> Self {
+        self.admin = Some(admin);
+        self
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -89,7 +97,12 @@ pub fn router(state: AppState) -> Router {
         router = router.route("/metrics", get(metrics));
     }
 
-    router.with_state(state)
+    let admin = state.admin.clone();
+    let mut router = router.with_state(state);
+    if let Some(admin) = admin {
+        router = router.merge(crate::admin::router(admin));
+    }
+    router
 }
 
 /// 构建带入口防护层（请求体上限/并发背压/每 IP 限速）的服务。

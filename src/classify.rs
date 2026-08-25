@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use std::{collections::HashMap, time::Duration};
 
 use serde_json::{Value, value::RawValue};
@@ -28,14 +29,15 @@ struct ChainCacheSettings {
 }
 
 pub struct Classifier {
-    chains: HashMap<u64, ChainCacheSettings>,
+    chains: DashMap<u64, ChainCacheSettings>,
+    configured_chains: HashMap<u64, ChainCacheSettings>,
     default_settings: ChainCacheSettings,
     immutable_ttl: Duration,
 }
 
 impl Classifier {
     pub fn new(config: &Config) -> Self {
-        let chains = config
+        let configured_chains = config
             .chains
             .iter()
             .copied()
@@ -49,12 +51,17 @@ impl Classifier {
                     },
                 )
             })
+            .collect::<HashMap<_, _>>();
+        let chains = configured_chains
+            .iter()
+            .map(|(id, value)| (*id, *value))
             .collect();
         // 默认参数：64 块确认深度，tip TTL = min(block_time, 2s)，block_time 未知按 2s。
         let default_block_time_ms = 2_000u64;
         let default_tip_ttl = Duration::from_millis(default_block_time_ms.min(2_000));
         Self {
             chains,
+            configured_chains,
             default_settings: ChainCacheSettings {
                 confirmation_depth: 64,
                 tip_ttl: default_tip_ttl,
@@ -63,9 +70,13 @@ impl Classifier {
         }
     }
 
-    pub fn apply_overrides(&mut self, overrides: &Overrides) {
+    pub fn apply_overrides(&self, overrides: &Overrides) {
+        self.chains.clear();
+        for (id, value) in &self.configured_chains {
+            self.chains.insert(*id, *value);
+        }
         for (chain_id, value) in &overrides.chains {
-            let entry = self.chains.entry(*chain_id).or_insert(ChainCacheSettings {
+            let mut entry = self.chains.entry(*chain_id).or_insert(ChainCacheSettings {
                 confirmation_depth: 64,
                 tip_ttl: Duration::from_secs(2),
             });
@@ -78,6 +89,24 @@ impl Classifier {
         }
     }
 
+    pub fn set_chain_settings(
+        &self,
+        chain_id: u64,
+        confirmation_depth: Option<u64>,
+        tip_ttl_ms: Option<u64>,
+    ) {
+        let mut entry = self.chains.entry(chain_id).or_insert(ChainCacheSettings {
+            confirmation_depth: 64,
+            tip_ttl: Duration::from_secs(2),
+        });
+        if let Some(v) = confirmation_depth {
+            entry.confirmation_depth = v;
+        }
+        if let Some(v) = tip_ttl_ms {
+            entry.tip_ttl = Duration::from_millis(v);
+        }
+    }
+
     pub fn cache_plan(
         &self,
         chain_id: u64,
@@ -85,7 +114,11 @@ impl Classifier {
         params: Option<&RawValue>,
         head: u64,
     ) -> Option<CachePlan> {
-        let settings = self.chains.get(&chain_id).unwrap_or(&self.default_settings);
+        let settings = self
+            .chains
+            .get(&chain_id)
+            .map(|v| *v)
+            .unwrap_or(self.default_settings);
         let params_value = parse_params(params)?;
         let class = classify_method(method, &params_value, head, settings.confirmation_depth)?;
         let canonical_params = serde_json::to_vec(&params_value).ok()?;

@@ -54,6 +54,7 @@ pub struct Config {
     pub hedging: HedgingConfig,
     pub chain_overrides: Vec<ChainOverride>,
     pub state: StateConfig,
+    pub admin: AdminConfig,
 }
 
 impl Default for Config {
@@ -73,6 +74,7 @@ impl Default for Config {
             hedging: HedgingConfig::default(),
             chain_overrides: Vec::new(),
             state: StateConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 }
@@ -160,6 +162,12 @@ impl Config {
         if let Some(raw) = env_non_empty("RPCROUTER_STATE_REQUIRED") {
             self.state.required = parse_bool(&raw, "RPCROUTER_STATE_REQUIRED")?;
         }
+        if let Some(raw) = env_non_empty("RPCROUTER_ADMIN_TOKEN") {
+            self.admin.auth_token = Some(raw);
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_ADMIN_STATIC_DIR") {
+            self.admin.static_dir = Some(PathBuf::from(raw));
+        }
         self.validate()
     }
 
@@ -232,6 +240,11 @@ impl Config {
         }
         if self.state.flush_interval_ms == 0 || self.state.health_ttl_seconds == 0 {
             bail!("state intervals must be greater than zero");
+        }
+        if let Some(token) = &self.admin.auth_token
+            && (token.is_empty() || token.bytes().any(is_header_control))
+        {
+            bail!("admin.auth_token is not a valid HTTP header value");
         }
         if self.discovery.idle_seconds == 0 {
             bail!("discovery.idle_seconds must be greater than zero");
@@ -530,6 +543,26 @@ pub struct StateConfig {
     pub file_path: PathBuf,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct AdminConfig {
+    pub enabled: bool,
+    pub auth_token: Option<String>,
+    pub static_dir: Option<PathBuf>,
+    pub cors_allow_origins: Vec<String>,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auth_token: None,
+            static_dir: None,
+            cors_allow_origins: Vec::new(),
+        }
+    }
+}
+
 impl Default for StateConfig {
     fn default() -> Self {
         Self {
@@ -748,6 +781,27 @@ mod tests {
                 assert_eq!(
                     config.chainlist.cache_path,
                     std::path::PathBuf::from("/tmp/rpcrs.json")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn env_overrides_admin_settings() {
+        with_env(
+            &[
+                ("RPCROUTER_ADMIN_TOKEN", "secret"),
+                ("RPCROUTER_ADMIN_STATIC_DIR", "/tmp/dashboard"),
+            ],
+            || {
+                let mut config = Config::default();
+                config
+                    .apply_env_overrides()
+                    .expect("admin env overrides should apply");
+                assert_eq!(config.admin.auth_token.as_deref(), Some("secret"));
+                assert_eq!(
+                    config.admin.static_dir,
+                    Some(std::path::PathBuf::from("/tmp/dashboard"))
                 );
             },
         );

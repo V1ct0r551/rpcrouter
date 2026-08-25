@@ -69,8 +69,18 @@ impl Forwarder {
         Arc::clone(&self.metrics)
     }
 
-    pub fn apply_state_overrides(&mut self, overrides: &crate::state::Overrides) {
+    pub fn apply_state_overrides(&self, overrides: &crate::state::Overrides) {
         self.classifier.apply_overrides(overrides);
+    }
+
+    pub fn apply_chain_settings(
+        &self,
+        chain_id: u64,
+        confirmation_depth: Option<u64>,
+        tip_ttl_ms: Option<u64>,
+    ) {
+        self.classifier
+            .set_chain_settings(chain_id, confirmation_depth, tip_ttl_ms);
     }
 
     pub fn cache(&self) -> &ResponseCache {

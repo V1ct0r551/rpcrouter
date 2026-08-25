@@ -96,6 +96,12 @@ pub trait StateStore: Send + Sync {
     fn call_count(&self) -> u64 {
         0
     }
+    fn backend_name(&self) -> &'static str {
+        "unknown"
+    }
+    fn audit_count(&self) -> u64 {
+        0
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -282,6 +288,12 @@ impl StateStore for MemoryStore {
     fn call_count(&self) -> u64 {
         self.calls.load(Ordering::Relaxed)
     }
+    fn backend_name(&self) -> &'static str {
+        "memory"
+    }
+    fn audit_count(&self) -> u64 {
+        self.inner.try_lock().map_or(0, |d| d.audit.len() as u64)
+    }
 }
 
 #[derive(Clone)]
@@ -453,6 +465,12 @@ impl StateStore for FileStore {
     }
     fn call_count(&self) -> u64 {
         self.calls.load(Ordering::Relaxed)
+    }
+    fn backend_name(&self) -> &'static str {
+        "file"
+    }
+    fn audit_count(&self) -> u64 {
+        self.inner.try_lock().map_or(0, |d| d.audit.len() as u64)
     }
 }
 
@@ -797,6 +815,9 @@ impl StateStore for RedisStore {
     fn call_count(&self) -> u64 {
         self.calls.load(Ordering::Relaxed)
     }
+    fn backend_name(&self) -> &'static str {
+        "redis"
+    }
 }
 
 pub fn endpoint_key(chain_id: u64, url: &str) -> String {
@@ -977,6 +998,12 @@ impl StateStore for ResilientStore {
         self.primary()
             .await
             .is_some_and(|p| p.health_ttl_seconds > 0)
+    }
+    fn backend_name(&self) -> &'static str {
+        "redis"
+    }
+    fn audit_count(&self) -> u64 {
+        self.fallback.audit_count()
     }
 }
 

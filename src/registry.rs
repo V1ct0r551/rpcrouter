@@ -457,6 +457,26 @@ impl Endpoint {
         self.dirty.store(false, Ordering::Release);
     }
 
+    pub fn reset_health(&self) {
+        let mut health = lock(&self.health);
+        health.status = HealthStatus::Probation { passes: 0 };
+        health.strikes = 0;
+        health.consecutive_faults = 0;
+        health.last_fault = None;
+        health.healthy_since = None;
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    pub fn cool_for(&self, duration: Duration) {
+        let mut health = lock(&self.health);
+        health.status = HealthStatus::Cooling {
+            until: Instant::now() + duration,
+        };
+        health.strikes = health.strikes.saturating_add(1);
+        health.healthy_since = None;
+        self.dirty.store(true, Ordering::Release);
+    }
+
     fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::AcqRel)
     }
@@ -520,7 +540,7 @@ pub enum ChainStateLabel {
     Disabled,
 }
 
-pub(crate) struct ChainState {
+pub struct ChainState {
     chain_id: u64,
     name: RwLock<String>,
     endpoints: RwLock<Vec<Arc<Endpoint>>>,
@@ -650,6 +670,14 @@ impl Registry {
     pub async fn apply_overrides(&self, overrides: &Overrides) {
         self.runtime_chain_overrides.clear();
         self.runtime_endpoint_overrides.clear();
+        self.runtime_pinned.clear();
+        for entry in &self.chains {
+            entry
+                .value()
+                .pinned
+                .store(self.config.chains.contains(entry.key()), Ordering::Relaxed);
+            entry.value().disabled.store(false, Ordering::Relaxed);
+        }
         for (id, value) in &overrides.chains {
             self.runtime_chain_overrides.insert(*id, value.clone());
             if let Some(pinned) = value.pinned {
@@ -690,7 +718,7 @@ impl Registry {
     /// 热路径：解析 chain_id 并触达 ChainState。
     /// DashMap get + 原子读；dormant 时才走慢路径 materialize。
     /// 返回 `None` 表示未知链（不在目录也不在 pinned）。
-    pub(crate) async fn resolve_for_request(&self, chain_id: u64) -> Option<Arc<ChainState>> {
+    pub async fn resolve_for_request(&self, chain_id: u64) -> Option<Arc<ChainState>> {
         // 路由层用这个做语义判定：未知链 / 0端点 / disabled。
         // 先查 DashMap（已 materialized 的链）。
         if let Some(state) = self.chain(chain_id) {
@@ -974,12 +1002,30 @@ impl Registry {
             {
                 continue;
             }
+            let runtime = self
+                .runtime_endpoint_overrides
+                .get(&crate::state::endpoint_key(state.chain_id, &url))
+                .map(|entry| entry.clone());
+            if runtime
+                .as_ref()
+                .is_some_and(|entry| entry.disabled == Some(true))
+            {
+                continue;
+            }
             if let Some(endpoint) = previous_by_url.get(&url) {
                 endpoint.last_seen.store(now, Ordering::Relaxed);
                 merged.push(Arc::clone(endpoint));
             } else {
                 let (rps, concurrency) = self.config.endpoint_limits(state.chain_id, &url);
-                merged.push(Arc::new(Endpoint::new(url, rps, concurrency, now)));
+                merged.push(Arc::new(Endpoint::new(
+                    url,
+                    runtime.as_ref().and_then(|entry| entry.rps).unwrap_or(rps),
+                    runtime
+                        .as_ref()
+                        .and_then(|entry| entry.concurrency)
+                        .unwrap_or(concurrency),
+                    now,
+                )));
             }
         }
 
@@ -1036,8 +1082,12 @@ impl Registry {
 
     /// 设置 disabled 状态。
     pub async fn set_disabled(&self, chain_id: u64, disabled: bool) -> bool {
-        let Some(state) = self.chain(chain_id) else {
-            return false;
+        let state = match self.chain(chain_id) {
+            Some(state) => state,
+            None => match self.resolve_for_request(chain_id).await {
+                Some(state) => state,
+                None => return false,
+            },
         };
         state.disabled.store(disabled, Ordering::Relaxed);
         true
@@ -1045,8 +1095,12 @@ impl Registry {
 
     /// 设置 pinned 状态。
     pub async fn set_pinned(&self, chain_id: u64, pinned: bool) -> bool {
-        let Some(state) = self.chain(chain_id) else {
-            return false;
+        let state = match self.chain(chain_id) {
+            Some(state) => state,
+            None => match self.resolve_for_request(chain_id).await {
+                Some(state) => state,
+                None => return false,
+            },
         };
         self.runtime_pinned.insert(chain_id, pinned);
         state.pinned.store(pinned, Ordering::Relaxed);
@@ -1066,6 +1120,16 @@ impl Registry {
                 matches!(label, ChainStateLabel::Pinned | ChainStateLabel::Hot)
             })
             .map(|entry| *entry.key())
+            .collect()
+    }
+
+    pub fn hot_chain_snapshot(&self) -> Vec<(u64, u64)> {
+        self.chains
+            .iter()
+            .filter_map(|entry| {
+                let last = entry.value().last_ingress.load(Ordering::Relaxed);
+                (last > 0).then_some((*entry.key(), last))
+            })
             .collect()
     }
 
@@ -1308,6 +1372,92 @@ impl Registry {
         endpoints.len() != previous_len
     }
 
+    pub async fn set_endpoint_override(&self, chain_id: u64, value: EndpointOverrideState) -> bool {
+        let key = crate::state::endpoint_key(chain_id, &value.url);
+        self.runtime_endpoint_overrides.insert(key, value.clone());
+        if let Some(state) = self.chain(chain_id) {
+            let mut endpoints = state.endpoints.write().await;
+            if value.disabled == Some(true) {
+                endpoints.retain(|e| e.url() != value.url);
+            } else if let Some(existing) = endpoints.iter_mut().find(|e| e.url() == value.url) {
+                if value.rps.is_some() || value.concurrency.is_some() {
+                    let (rps, concurrency) = self.config.endpoint_limits(chain_id, &value.url);
+                    let replacement = Arc::new(Endpoint::new(
+                        value.url.clone(),
+                        value.rps.unwrap_or(rps),
+                        value.concurrency.unwrap_or(concurrency),
+                        unix_seconds(),
+                    ));
+                    *existing = replacement;
+                }
+            } else {
+                let (rps, concurrency) = self.config.endpoint_limits(chain_id, &value.url);
+                endpoints.push(Arc::new(Endpoint::new(
+                    value.url.clone(),
+                    value.rps.unwrap_or(rps),
+                    value.concurrency.unwrap_or(concurrency),
+                    unix_seconds(),
+                )));
+            }
+        }
+        true
+    }
+
+    pub async fn add_runtime_endpoint(&self, chain_id: u64, url: String) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        let (rps, concurrency) = self.config.endpoint_limits(chain_id, &url);
+        let mut endpoints = state.endpoints.write().await;
+        if endpoints.iter().any(|e| e.url() == url) {
+            return true;
+        }
+        endpoints.push(Arc::new(Endpoint::new(
+            url,
+            rps,
+            concurrency,
+            unix_seconds(),
+        )));
+        true
+    }
+
+    pub async fn remove_runtime_endpoint(&self, chain_id: u64, url: &str) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        let key = crate::state::endpoint_key(chain_id, url);
+        if self.runtime_endpoint_overrides.remove(&key).is_none() {
+            return false;
+        }
+        let mut endpoints = state.endpoints.write().await;
+        let old = endpoints.len();
+        endpoints.retain(|e| e.url() != url);
+        old != endpoints.len()
+    }
+
+    pub async fn runtime_endpoint_exists(&self, chain_id: u64, url: &str) -> bool {
+        if !self
+            .runtime_endpoint_overrides
+            .contains_key(&crate::state::endpoint_key(chain_id, url))
+        {
+            return false;
+        }
+        if self
+            .config
+            .chain_override(chain_id)
+            .is_some_and(|value| value.extra_endpoints.iter().any(|item| item == url))
+        {
+            return false;
+        }
+        !self
+            .catalog
+            .read()
+            .await
+            .as_ref()
+            .and_then(|catalog| catalog.lookup(chain_id))
+            .is_some_and(|chain| chain.endpoints.iter().any(|item| item.url == url))
+    }
+
     pub async fn record_probe_height(
         &self,
         chain_id: u64,
@@ -1399,6 +1549,39 @@ impl Registry {
     /// v2 指标：chainlist 最近刷新来源。
     pub fn chainlist_refresh_source_str(&self) -> String {
         lock(&self.chainlist_refresh_source).clone()
+    }
+
+    pub fn chain_settings(&self, chain_id: u64) -> (u64, u64, u64, u64, &'static str) {
+        if let Some(v) = self.runtime_chain_overrides.get(&chain_id) {
+            return (
+                v.block_time_ms
+                    .unwrap_or_else(|| self.config.block_time_ms(chain_id)),
+                v.confirmation_depth
+                    .unwrap_or_else(|| self.config.confirmation_depth(chain_id)),
+                v.tip_ttl_ms
+                    .unwrap_or_else(|| self.config.tip_ttl_ms(chain_id)),
+                v.max_block_lag
+                    .unwrap_or_else(|| self.config.lag_threshold(chain_id)),
+                "runtime",
+            );
+        }
+        let source = if self.config.chain_override(chain_id).is_some() {
+            "config"
+        } else {
+            "default"
+        };
+        (
+            self.config.block_time_ms(chain_id),
+            self.config.confirmation_depth(chain_id),
+            self.config.tip_ttl_ms(chain_id),
+            self.config.lag_threshold(chain_id),
+            source,
+        )
+    }
+
+    pub fn chain_last_ingress(&self, chain_id: u64) -> u64 {
+        self.chain(chain_id)
+            .map_or(0, |state| state.last_ingress.load(Ordering::Relaxed))
     }
 
     // ── summaries（v2：增加 state 字段） ──

@@ -3,6 +3,7 @@ use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result, bail};
 use axum::ServiceExt;
 use rpcrouter::{
+    admin::AdminState,
     chainlist::ChainlistLoader,
     config::Config,
     forward::Forwarder,
@@ -30,6 +31,11 @@ async fn main() -> Result<()> {
     config.apply_env_overrides()?;
     if env::args().any(|arg| arg == "--reset-state") {
         config.state.reset = true;
+    }
+    if let Some(dir) = &config.admin.static_dir
+        && !dir.is_dir()
+    {
+        tracing::warn!(path = %dir.display(), "admin static directory does not exist");
     }
     info!(path = %config_path.display(), listen = %config.listen, "configuration loaded");
 
@@ -104,7 +110,7 @@ async fn main() -> Result<()> {
     if initial_is_fresh {
         registry.record_chainlist_refresh(unix_seconds(), initial.source.label());
     }
-    let mut forwarder_value = Forwarder::new(Arc::clone(&registry), &config)?;
+    let forwarder_value = Forwarder::new(Arc::clone(&registry), &config)?;
     forwarder_value.apply_state_overrides(&boot.overrides);
     let forwarder = Arc::new(forwarder_value);
     let metrics = forwarder.metrics();
@@ -112,7 +118,7 @@ async fn main() -> Result<()> {
         spawn_state_reconnect(resilient, Arc::clone(&metrics));
     }
     let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
-    spawn_probes(probes, Arc::clone(&metrics));
+    spawn_probes(Arc::clone(&probes), Arc::clone(&metrics));
     metrics.set_state_store_up(store.health().await);
     // 启动 housekeeping 后台任务（每 30s 一次）。
     spawn_housekeeping(Arc::clone(&registry), Arc::clone(&metrics));
@@ -141,8 +147,19 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let admin_state = AdminState {
+        registry: Arc::clone(&registry),
+        forwarder: Arc::clone(&forwarder),
+        metrics: Arc::clone(&metrics),
+        store: Arc::clone(&store),
+        chainlist: Some(Arc::clone(&chainlist)),
+        probe: Some(Arc::clone(&probes)),
+        config: config.clone(),
+        started: std::time::Instant::now(),
+    };
     let app = guarded_service_from_state(
         AppState::new(registry, forwarder, config.server.batch_limit)
+            .with_admin(admin_state)
             .with_metrics_enabled(config.metrics_enabled)
             .with_hardening(
                 config.server.max_body_bytes,

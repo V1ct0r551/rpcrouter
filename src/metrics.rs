@@ -597,6 +597,24 @@ impl Metrics {
         }
     }
 
+    pub fn in_flight(&self) -> i64 {
+        self.in_flight.get()
+    }
+
+    pub fn ingress_rejected_total(&self) -> u64 {
+        [
+            "unknown_chain",
+            "chain_disabled",
+            "no_endpoints",
+            "overload",
+            "body_too_large",
+            "rate_limited",
+        ]
+        .iter()
+        .map(|reason| self.ingress_rejected.with_label_values(&[*reason]).get())
+        .sum()
+    }
+
     pub async fn encode(&self, rpc_registry: &Registry) -> prometheus::Result<String> {
         self.sync_endpoints(rpc_registry).await;
         self.sync_v2_gauges(rpc_registry).await;
