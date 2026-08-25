@@ -151,7 +151,7 @@ impl Metrics {
         let user_visible_errors = IntCounterVec::new(
             Opts::new(
                 "rpcrouter_user_visible_errors_total",
-                "Requests exhausting all upstream endpoints.",
+                "Requests with an active upstream promise that exhaust all endpoints.",
             ),
             &["chain_id"],
         )?;
