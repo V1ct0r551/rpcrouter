@@ -304,3 +304,38 @@ Probation 起步——不恢复 Active（探针必须重新证明）。
   `rpcrouter_state_flush_duration_seconds`、`rpcrouter_state_dirty_endpoints`。
 - docker-compose：新增 `redis:7-alpine` 服务（`--appendonly yes` + 卷）；网关默认
   `RPCROUTER_REDIS_URL=redis://redis:6379/0`。
+
+## 12. 多实例与横向扩展路线（2026-08-25 增补）
+
+> 用户问题：部署 rpcrouter 的机器要扛住所有链的访问，流量单点怎么办？更平滑的横向扩展方式？
+
+**原则：按 chainId 一致性哈希分片 + 无状态实例 + Redis 共享镜像。** 不用轮询：轮询会把每条链的
+缓存/折叠/健康学习/每端点出站限流复制 N 份，缓存命中率下降、公共节点实际承受 N×15 rps、探针 ×N。
+
+### Phase A（零代码改动，部署即得）
+- N 个实例（同一 config + 同一 Redis）放在 nginx/HAProxy/云 LB 后，LB 对 `/rpc/{chainId}` 做
+  **一致性哈希**（样例 `deploy/nginx-shard.conf`）。每条链固定落一个实例：
+  - 缓存与 in-flight 折叠局部性最好；每端点 15 rps / 8 并发上限仍然准确（不随实例数放大）；
+  - v2 的按需激活让每个实例只探测自己分到的链（无需分片配置）；pinned 链会被所有实例探测，
+    N≤5 时可接受，更多实例时把 pinned 改成「只 pin 本实例分片内的链」（Phase B）；
+  - 加节点只迁移 ~1/N 的链；节点故障时环上下一个实例接管，冷启动路径 + Redis 健康快照
+    （已知冷却端点不再撞）让接管近乎无感。
+- 单实例容量：本机 10k QPS p99 4ms（loadtest-phase3），N 实例 ≈ N×10k；LB 层 nginx 单机
+  5–10 万 rps 以上；LB 自身用 keepalived/云 LB/多 A 记录做 HA；跨地域用 GeoDNS 分集群。
+- Redis HA 用 Sentinel/托管服务；因 `state.required=false` 降级模式，Redis 故障不影响出流量。
+
+### Phase B（P5 代码项，按需）
+1. **实例注册与集群视图**：`{ns}:instance:{id}` 心跳 hash（TTL 15s）+ 各实例摘要；
+   `GET /admin/api/cluster` 任一实例返回全集群；dashboard 集群页。
+2. **覆写广播**：管理操作写 Redis 后 `PUBLISH {ns}:events`，所有实例订阅并即时应用
+   （dashboard 改一次，全集群生效）；端点冷却事件同样广播，避免多个实例各撞一次 429。
+3. **分布式每端点令牌桶**（Redis Lua，原子）：只在一条链跨多实例（超热链副本、或 LB 非哈希）
+   时启用；只有缓存未命中流量调用（10k QPS 下约 200 rps），不进命中路径。
+4. **L2 共享响应缓存**（可选）：L1 moka 未命中再查 Redis（≤1ms），跨实例去重上游请求。
+5. **自路由模式**（可选，面向 K8s Service/普通轮询 LB）：实例收到不属于自己分片的链时按
+   Redis 里的 peer 列表转发给 owner，代价是多一跳；分片函数与心跳集合共同决定归属。
+6. pinned 分片感知：`pinned` 只对本实例分片内的链生效，避免探针 ×N。
+
+### 容量与告警
+- 每实例 `rpcrouter_in_flight_requests`、`ingress_rejected{overload}` 是扩容信号；
+  `rpcrouter_chains{state="hot"}` 与探针队列深度反映分片是否失衡。
