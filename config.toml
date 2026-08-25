@@ -21,9 +21,16 @@ burst = 40
 
 [chainlist]
 url = "https://chainlist.org/rpcs.json"
-refresh_seconds = 21600
+refresh_seconds = 3600
 stale_grace_seconds = 86400
 cache_path = "./data/rpcs.json"
+
+[discovery]
+enabled = true
+include_testnets = true
+deny = []
+max_hot_chains = 256
+idle_seconds = 600
 
 [upstream]
 request_timeout_ms = 5000
