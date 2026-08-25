@@ -978,5 +978,42 @@
     ],
     "tvl": 283154059.94288343,
     "isTestnet": false
+  },
+  {
+    "name": "Tolerant Metadata Chain",
+    "chain": "TOL",
+    "chainId": 990001,
+    "chainSlug": "tolerant-metadata",
+    "networkId": null,
+    "rpc": ["https://tolerant.example/rpc"],
+    "nativeCurrency": {"symbol": "TOL"},
+    "explorers": ["https://explorer.tolerant.example"],
+    "icon": {"url": "https://icons.example/tol.svg"},
+    "faucets": "https://faucet.tolerant.example",
+    "status": "active",
+    "tvl": 42,
+    "isTestnet": false
+  },
+  {
+    "name": "Tolerant Explorer Object Chain",
+    "chainId": 990002,
+    "chainSlug": "tolerant-explorer-object",
+    "networkId": null,
+    "rpc": [{"url": "https://tolerant-object.example/rpc", "tracking": "fixture"}],
+    "explorers": [{"name": "Explorer", "url": "https://explorer.object.example"}],
+    "tvl": 12.5,
+    "isTestnet": false
+  },
+  {
+    "name": "Tolerant Missing Metadata Chain",
+    "chainId": 990003,
+    "rpc": [],
+    "tvl": null,
+    "isTestnet": false
+  },
+  {
+    "name": "Malformed Chain Id Fixture Record",
+    "chainId": "not-a-number",
+    "rpc": []
   }
 ]

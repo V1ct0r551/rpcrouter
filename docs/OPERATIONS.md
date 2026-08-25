@@ -53,6 +53,7 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
 | `rpcrouter_chain_pinned` | Gauge | `chain_id` | materialized 链是否 pinned（1/0） |
 | `rpcrouter_catalog_chains` | Gauge | — | 目录链数量（含 dormant/0 端点链） |
 | `rpcrouter_catalog_endpoints` | Gauge | — | 目录过滤后的公开端点数量 |
+| `rpcrouter_catalog_records_skipped_total` | Counter | — | 容错解析时跳过的畸形 chainlist 记录累计数 |
 | `rpcrouter_probe_queue_depth` | Gauge | — | 等待探测的有界队列深度 |
 | `rpcrouter_probe_in_flight` | Gauge | — | 当前在飞探针数 |
 | `rpcrouter_chainlist_last_refresh_timestamp_seconds` | Gauge | — | 最近一次新鲜 chainlist 刷新 Unix 时间 |

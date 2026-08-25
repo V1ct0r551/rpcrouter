@@ -43,6 +43,7 @@ pub struct Metrics {
     chain_pinned: IntGaugeVec,
     catalog_chains: IntGauge,
     catalog_endpoints: IntGauge,
+    catalog_records_skipped: IntCounter,
     probe_queue_depth: IntGauge,
     probe_in_flight: IntGauge,
     chainlist_last_refresh: IntGauge,
@@ -234,6 +235,10 @@ impl Metrics {
             "rpcrouter_catalog_endpoints",
             "Number of endpoints in the catalog.",
         )?;
+        let catalog_records_skipped = IntCounter::new(
+            "rpcrouter_catalog_records_skipped_total",
+            "Number of malformed chainlist records skipped during tolerant parsing.",
+        )?;
         let probe_queue_depth = IntGauge::new(
             "rpcrouter_probe_queue_depth",
             "Number of probe tasks waiting in the queue.",
@@ -289,6 +294,7 @@ impl Metrics {
             Box::new(chain_pinned.clone()),
             Box::new(catalog_chains.clone()),
             Box::new(catalog_endpoints.clone()),
+            Box::new(catalog_records_skipped.clone()),
             Box::new(probe_queue_depth.clone()),
             Box::new(probe_in_flight.clone()),
             Box::new(chainlist_last_refresh.clone()),
@@ -326,6 +332,7 @@ impl Metrics {
             chain_pinned,
             catalog_chains,
             catalog_endpoints,
+            catalog_records_skipped,
             probe_queue_depth,
             probe_in_flight,
             chainlist_last_refresh,
@@ -458,6 +465,10 @@ impl Metrics {
     pub fn set_catalog_counts(&self, chains: u64, endpoints: u64) {
         self.catalog_chains.set(chains as i64);
         self.catalog_endpoints.set(endpoints as i64);
+    }
+
+    pub fn record_catalog_records_skipped(&self, count: usize) {
+        self.catalog_records_skipped.inc_by(count as u64);
     }
 
     pub fn set_probe_queue_depth(&self, depth: u64) {

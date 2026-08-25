@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
     let forwarder = Arc::new(Forwarder::new(Arc::clone(&registry), &config)?);
     let metrics = forwarder.metrics();
     metrics.record_chainlist_refresh(initial.source.label());
+    metrics.record_catalog_records_skipped(initial.records_skipped);
     spawn_chainlist_refresh(
         Arc::clone(&chainlist),
         Arc::clone(&registry),
@@ -131,6 +132,7 @@ fn spawn_chainlist_refresh(
                         registry.record_chainlist_refresh(unix_seconds(), result.source.label());
                     }
                     metrics.record_chainlist_refresh(result.source.label());
+                    metrics.record_catalog_records_skipped(result.records_skipped);
                     info!(source = ?result.source, "chainlist refresh completed");
                 }
                 Ok(None) => info!("chainlist refresh skipped because another refresh is running"),

@@ -11,8 +11,9 @@ use reqwest::{
     header::{ETAG, HeaderValue, IF_NONE_MATCH},
 };
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::Config;
 
@@ -124,6 +125,14 @@ pub struct LoadResult {
     pub source: RefreshSource,
     /// 旧兼容字段。
     pub snapshot: Arc<ChainlistSnapshot>,
+    pub records_skipped: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CatalogParseStats {
+    pub records_total: usize,
+    pub records_accepted: usize,
+    pub records_skipped: usize,
 }
 
 #[derive(Default)]
@@ -217,19 +226,22 @@ impl ChainlistLoader {
                     catalog,
                     snapshot,
                     source: RefreshSource::Memory,
+                    records_skipped: 0,
                 });
             }
         }
 
         match tokio::fs::read(&self.cache_path).await {
-            Ok(bytes) => match parse_catalog(
+            Ok(bytes) => match parse_catalog_with_stats(
                 &bytes,
                 self.discovery_enabled,
                 self.include_testnets,
                 &self.pinned_chains,
             ) {
-                Ok((catalog, snapshot)) => {
-                    return Ok(self.remember(catalog, snapshot, RefreshSource::Disk).await);
+                Ok((catalog, snapshot, stats)) => {
+                    return Ok(self
+                        .remember(catalog, snapshot, stats, RefreshSource::Disk)
+                        .await);
                 }
                 Err(error) => warn!(
                     path = %self.cache_path.display(),
@@ -245,7 +257,7 @@ impl ChainlistLoader {
             ),
         }
 
-        let (catalog, snapshot) = parse_catalog(
+        let (catalog, snapshot, stats) = parse_catalog_with_stats(
             BUILTIN_FIXTURE,
             self.discovery_enabled,
             self.include_testnets,
@@ -253,7 +265,7 @@ impl ChainlistLoader {
         )
         .context("built-in chainlist fixture is invalid")?;
         Ok(self
-            .remember(catalog, snapshot, RefreshSource::Fixture)
+            .remember(catalog, snapshot, stats, RefreshSource::Fixture)
             .await)
     }
 
@@ -323,6 +335,7 @@ impl ChainlistLoader {
                 catalog,
                 snapshot,
                 source: RefreshSource::NotModified,
+                records_skipped: 0,
             });
         }
         if !response.status().is_success() {
@@ -334,7 +347,7 @@ impl ChainlistLoader {
             .bytes()
             .await
             .context("failed to read chainlist response")?;
-        let (catalog, snapshot) = parse_catalog(
+        let (catalog, snapshot, stats) = parse_catalog_with_stats(
             &bytes,
             self.discovery_enabled,
             self.include_testnets,
@@ -362,6 +375,7 @@ impl ChainlistLoader {
             catalog,
             snapshot,
             source: RefreshSource::Network,
+            records_skipped: stats.records_skipped,
         })
     }
 
@@ -369,6 +383,7 @@ impl ChainlistLoader {
         &self,
         catalog: Catalog,
         snapshot: ChainlistSnapshot,
+        stats: CatalogParseStats,
         source: RefreshSource,
     ) -> LoadResult {
         let catalog = Arc::new(catalog);
@@ -382,6 +397,7 @@ impl ChainlistLoader {
             catalog,
             snapshot,
             source,
+            records_skipped: stats.records_skipped,
         }
     }
 }
@@ -419,18 +435,50 @@ pub fn parse_catalog(
     include_testnets: bool,
     pinned_chains: &HashSet<u64>,
 ) -> Result<(Catalog, ChainlistSnapshot)> {
-    let document: ChainlistDocument =
-        serde_json::from_slice(bytes).context("invalid chainlist JSON")?;
-    let records = match document {
-        ChainlistDocument::List(records) => records,
-        ChainlistDocument::Wrapped { chains } => chains,
-    };
+    let (catalog, snapshot, _) =
+        parse_catalog_with_stats(bytes, discovery_enabled, include_testnets, pinned_chains)?;
+    Ok((catalog, snapshot))
+}
 
-    let all_chains: Vec<CatalogChain> = records
+pub fn parse_catalog_with_stats(
+    bytes: &[u8],
+    discovery_enabled: bool,
+    include_testnets: bool,
+    pinned_chains: &HashSet<u64>,
+) -> Result<(Catalog, ChainlistSnapshot, CatalogParseStats)> {
+    let document: Value = serde_json::from_slice(bytes).context("invalid chainlist JSON")?;
+    let records = match document {
+        Value::Array(records) => records,
+        Value::Object(mut object) => object
+            .remove("chains")
+            .and_then(|chains| chains.as_array().cloned())
+            .context("chainlist object must contain a chains array")?,
+        _ => bail!("chainlist document must be an array or an object containing a chains array"),
+    };
+    let records_total = records.len();
+    let mut records_skipped = 0usize;
+    let mut parsed = Vec::with_capacity(records_total);
+    for value in records {
+        let chain_id = value.get("chainId").cloned().unwrap_or(Value::Null);
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>")
+            .to_owned();
+        match serde_json::from_value::<ChainRecord>(value) {
+            Ok(record) => parsed.push(record),
+            Err(error) => {
+                records_skipped += 1;
+                warn!(chain_id = %chain_id, name, error = %error, "skipping invalid chainlist record");
+            }
+        }
+    }
+
+    let all_chains: Vec<CatalogChain> = parsed
         .into_iter()
         .filter(|record| {
             let pinned = pinned_chains.contains(&record.chain_id);
-            let is_testnet = record.is_testnet.unwrap_or(false);
+            let is_testnet = value_bool(&record.is_testnet).unwrap_or(false);
             // pinned 始终保留；discovery 开启时按 include_testnets 决定是否纳入 testnet。
             pinned || (discovery_enabled && (include_testnets || !is_testnet))
         })
@@ -455,16 +503,14 @@ pub fn parse_catalog(
             CatalogChain {
                 chain_id: record.chain_id,
                 name: record.name,
-                short_name: record.short_name,
-                chain: record.chain,
-                slug: record.slug,
-                is_testnet: record.is_testnet.unwrap_or(false),
-                native_symbol: record.native_currency.and_then(|c| c.symbol),
-                explorer_url: record
-                    .explorers
-                    .and_then(|e| e.first().map(|x| x.url.clone())),
-                status: record.status,
-                tvl: record.tvl,
+                short_name: value_string(record.short_name),
+                chain: value_string(record.chain),
+                slug: value_string(record.slug),
+                is_testnet: value_bool(&record.is_testnet).unwrap_or(false),
+                native_symbol: object_string(record.native_currency, "symbol"),
+                explorer_url: first_explorer_url(record.explorers),
+                status: value_string(record.status),
+                tvl: record.tvl.and_then(|value| value.as_f64()),
                 endpoints,
             }
         })
@@ -493,7 +539,44 @@ pub fn parse_catalog(
     let snapshot = ChainlistSnapshot {
         chains: snapshot_chains,
     };
-    Ok((catalog, snapshot))
+    let stats = CatalogParseStats {
+        records_total,
+        records_accepted: catalog.chains.len(),
+        records_skipped,
+    };
+    info!(
+        records_total = stats.records_total,
+        records_accepted = stats.records_accepted,
+        records_skipped = stats.records_skipped,
+        "chainlist catalog parsed"
+    );
+    Ok((catalog, snapshot, stats))
+}
+
+fn value_string(value: Option<Value>) -> Option<String> {
+    value.and_then(|value| value.as_str().map(ToOwned::to_owned))
+}
+
+fn value_bool(value: &Option<Value>) -> Option<bool> {
+    value.as_ref().and_then(Value::as_bool)
+}
+
+fn object_string(value: Option<Value>, key: &str) -> Option<String> {
+    value
+        .and_then(|value| value.get(key).cloned())
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+}
+
+fn first_explorer_url(value: Option<Value>) -> Option<String> {
+    let first = value?.as_array()?.first()?.clone();
+    match first {
+        Value::String(url) => Some(url),
+        Value::Object(object) => object
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
 }
 
 /// 旧版 parse_and_filter（兼容现有测试）。始终解析全部链，按 allowed_chains 过滤。
@@ -517,49 +600,31 @@ fn normalize_public_https_url(raw: &str) -> Option<String> {
 // ── JSON 反序列化结构 ──
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum ChainlistDocument {
-    List(Vec<ChainRecord>),
-    Wrapped { chains: Vec<ChainRecord> },
-}
-
-#[derive(Deserialize)]
 struct ChainRecord {
     name: String,
     #[serde(rename = "chainId")]
     chain_id: u64,
     #[serde(default)]
     #[serde(rename = "shortName")]
-    short_name: Option<String>,
+    short_name: Option<Value>,
     #[serde(default)]
-    chain: Option<String>,
+    chain: Option<Value>,
     #[serde(default)]
-    slug: Option<String>,
+    #[serde(rename = "chainSlug")]
+    slug: Option<Value>,
     #[serde(default)]
     #[serde(rename = "isTestnet")]
-    is_testnet: Option<bool>,
+    is_testnet: Option<Value>,
     #[serde(default)]
     #[serde(rename = "nativeCurrency")]
-    native_currency: Option<NativeCurrency>,
+    native_currency: Option<Value>,
     #[serde(default)]
-    explorers: Option<Vec<Explorer>>,
+    explorers: Option<Value>,
     #[serde(default)]
-    status: Option<String>,
+    status: Option<Value>,
     #[serde(default)]
-    tvl: Option<f64>,
-    #[serde(default)]
+    tvl: Option<Value>,
     rpc: Vec<RpcEntry>,
-}
-
-#[derive(Deserialize)]
-struct NativeCurrency {
-    #[serde(default)]
-    symbol: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Explorer {
-    url: String,
 }
 
 #[derive(Deserialize)]
@@ -849,6 +914,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fixture_tolerates_malformed_metadata_and_skips_bad_record() {
+        let (catalog, _, stats) =
+            parse_catalog_with_stats(BUILTIN_FIXTURE, true, true, &HashSet::new())
+                .expect("parse tolerant fixture");
+        let tolerant = catalog.lookup(990001).expect("tolerant chain");
+        assert_eq!(tolerant.slug.as_deref(), Some("tolerant-metadata"));
+        assert_eq!(
+            tolerant.explorer_url.as_deref(),
+            Some("https://explorer.tolerant.example")
+        );
+        assert_eq!(tolerant.native_symbol.as_deref(), Some("TOL"));
+        assert_eq!(tolerant.tvl, Some(42.0));
+        let object_explorer = catalog.lookup(990002).expect("object explorer chain");
+        assert_eq!(
+            object_explorer.explorer_url.as_deref(),
+            Some("https://explorer.object.example")
+        );
+        assert!(catalog.lookup(990003).is_some());
+        assert!(catalog.lookup(990004).is_none());
+        assert_eq!(stats.records_skipped, 1);
+        assert_eq!(stats.records_total, 19);
+    }
+
+    #[test]
+    #[ignore = "requires local data/rpcs.json; never accesses the network"]
+    fn parses_full_local_chainlist_if_present() {
+        let path = Path::new("data/rpcs.json");
+        if !path.exists() {
+            return;
+        }
+        let bytes = std::fs::read(path).expect("read local chainlist");
+        let (catalog, _, stats) = parse_catalog_with_stats(&bytes, true, true, &HashSet::new())
+            .expect("parse local chainlist");
+        let endpoints: usize = catalog
+            .chains
+            .iter()
+            .map(|chain| chain.endpoints.len())
+            .sum();
+        println!(
+            "local chainlist parsed: chains={} endpoints={} skipped={}",
+            catalog.chains.len(),
+            endpoints,
+            stats.records_skipped
+        );
+        assert!(
+            catalog.chains.len() >= 2_500,
+            "only {} chains",
+            catalog.chains.len()
+        );
+        assert_eq!(stats.records_skipped, 0);
+        assert!(endpoints >= 5_000, "only {endpoints} endpoints");
     }
 
     #[tokio::test]
