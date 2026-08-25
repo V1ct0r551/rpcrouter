@@ -429,6 +429,9 @@ fn subtract_metrics(
         user_visible_errors: current
             .user_visible_errors
             .saturating_sub(baseline.user_visible_errors),
+        cold_start_failures: current
+            .cold_start_failures
+            .saturating_sub(baseline.cold_start_failures),
         hedges: current.hedges.saturating_sub(baseline.hedges),
     }
 }

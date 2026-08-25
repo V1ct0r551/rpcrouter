@@ -122,14 +122,46 @@ async fn cooling_and_empty_pools_still_return_gateway_error() {
     let cooling_response = cooling_forwarder.execute(1, uncached_request(2)).await;
     assert_eq!(cooling_response["error"]["code"], -32000);
     assert_eq!(upstream.request_count(), 0);
-    assert_eq!(cooling_registry.user_visible_errors(), 1);
+    assert_eq!(cooling_response["error"]["data"]["reason"], "cold_start");
+    assert_eq!(cooling_registry.user_visible_errors(), 0);
+    let cooling_metrics = cooling_forwarder
+        .metrics()
+        .encode(&cooling_registry)
+        .await
+        .expect("metrics");
+    assert!(cooling_metrics.contains("rpcrouter_cold_start_failures_total{chain_id=\"1\"} 1"));
 
     let empty_registry = setup_registry(&config, &[]).await;
     let empty_forwarder =
         Forwarder::new(Arc::clone(&empty_registry), &config).expect("empty forwarder");
     let empty_response = empty_forwarder.execute(1, uncached_request(3)).await;
     assert_eq!(empty_response["error"]["code"], -32000);
-    assert_eq!(empty_registry.user_visible_errors(), 1);
+    assert_eq!(empty_registry.user_visible_errors(), 0);
+}
+
+#[tokio::test]
+async fn active_pool_failure_is_user_visible_not_cold_start() {
+    let (url, _upstream) = spawn_mock(MockBehavior {
+        status_5xx: Some(503),
+        ..MockBehavior::default()
+    })
+    .await;
+    let config = phase2_config();
+    let registry = setup_registry(&config, std::slice::from_ref(&url)).await;
+    let endpoint = registry.endpoint(1, &url).await.expect("endpoint");
+    activate(&endpoint, Duration::from_millis(1));
+    let forwarder = Forwarder::new(Arc::clone(&registry), &config).expect("forwarder");
+    let response = forwarder.execute(1, uncached_request(4)).await;
+    assert_eq!(response["error"]["code"], -32000);
+    assert!(response["error"].get("data").is_none());
+    assert_eq!(registry.user_visible_errors(), 1);
+    let metrics = forwarder
+        .metrics()
+        .encode(&registry)
+        .await
+        .expect("metrics");
+    assert!(metrics.contains("rpcrouter_user_visible_errors_total{chain_id=\"1\"} 1"));
+    assert!(!metrics.contains("rpcrouter_cold_start_failures_total{chain_id=\"1\"} 1"));
 }
 
 #[tokio::test]

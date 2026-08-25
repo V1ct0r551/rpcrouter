@@ -28,6 +28,7 @@ pub struct Metrics {
     coalesce_ratio: GaugeVec,
     upstream: IntCounterVec,
     user_visible_errors: IntCounterVec,
+    cold_start_failures: IntCounterVec,
     latency: HistogramVec,
     failover_depth: HistogramVec,
     hedge_attempts: IntCounterVec,
@@ -62,6 +63,7 @@ pub struct ChainMetricsSnapshot {
     pub coalesced: u64,
     pub upstream: u64,
     pub user_visible_errors: u64,
+    pub cold_start_failures: u64,
     pub hedges: u64,
 }
 
@@ -150,6 +152,13 @@ impl Metrics {
             Opts::new(
                 "rpcrouter_user_visible_errors_total",
                 "Requests exhausting all upstream endpoints.",
+            ),
+            &["chain_id"],
+        )?;
+        let cold_start_failures = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_cold_start_failures_total",
+                "Requests exhausting a chain without any active endpoint at ingress.",
             ),
             &["chain_id"],
         )?;
@@ -282,6 +291,7 @@ impl Metrics {
             Box::new(coalesce_ratio.clone()),
             Box::new(upstream.clone()),
             Box::new(user_visible_errors.clone()),
+            Box::new(cold_start_failures.clone()),
             Box::new(latency.clone()),
             Box::new(failover_depth.clone()),
             Box::new(hedge_attempts.clone()),
@@ -318,6 +328,7 @@ impl Metrics {
             coalesce_ratio,
             upstream,
             user_visible_errors,
+            cold_start_failures,
             latency,
             failover_depth,
             hedge_attempts,
@@ -428,6 +439,12 @@ impl Metrics {
             .inc();
     }
 
+    pub fn record_cold_start_failure(&self, chain_id: u64) {
+        self.cold_start_failures
+            .with_label_values(&[&chain_id.to_string()])
+            .inc();
+    }
+
     pub fn record_latency(&self, chain_id: u64, latency: Duration) {
         self.latency
             .with_label_values(&[&chain_id.to_string()])
@@ -508,6 +525,7 @@ impl Metrics {
             coalesced: self.coalesced.with_label_values(&[&chain]).get(),
             upstream: hedge_totals.upstream.load(Ordering::Relaxed),
             user_visible_errors: self.user_visible_errors.with_label_values(&[&chain]).get(),
+            cold_start_failures: self.cold_start_failures.with_label_values(&[&chain]).get(),
             hedges: hedge_totals.hedges.load(Ordering::Relaxed),
         }
     }
