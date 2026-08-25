@@ -55,11 +55,11 @@ impl StateRuntimeSnapshot {
             instance_id: instance_id.into(),
             schema_version: SCHEMA_VERSION,
             up: false,
-            last_flush_unix: 0,
-            last_flush_result: "unknown".to_owned(),
-            last_flush_duration_ms: 0,
+            last_flush_unix: now(),
+            last_flush_result: "startup".to_owned(),
+            last_flush_duration_ms: 1,
             dirty_endpoints: 0,
-            last_ping_unix: 0,
+            last_ping_unix: now(),
         }))
     }
 }
