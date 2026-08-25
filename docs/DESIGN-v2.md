@@ -131,6 +131,7 @@ refresh_seconds = 3600    # 默认由 21600 改为 3600
 
 [admin]
 enabled = true
+public_site = true         # false：关闭公共主页与 /api/public/*，保留 /dashboard/*
 # auth_token = "..."      # 未配置：只读接口开放、控制接口 403；配置后 /admin/api/* 全部需 Bearer
 # static_dir = "./dashboard/dist"   # 可选：托管前端构建产物到 /dashboard/
 # cors_allow_origins = ["http://localhost:5173"]   # 可选：前端独立域名/开发服务器（不允许与 auth_token 同时用 "*"）
@@ -147,6 +148,7 @@ health_ttl_seconds = 86400
 
 环境变量：`RPCROUTER_DISCOVERY_ENABLED`、`RPCROUTER_DISCOVERY_MAX_HOT_CHAINS`、
 `RPCROUTER_DISCOVERY_IDLE_SECONDS`、`RPCROUTER_ADMIN_TOKEN`、`RPCROUTER_ADMIN_STATIC_DIR`、
+`RPCROUTER_ADMIN_PUBLIC_SITE`、
 `RPCROUTER_STATE_BACKEND`、`RPCROUTER_REDIS_URL`、`RPCROUTER_STATE_NAMESPACE`、`RPCROUTER_STATE_RESET`。
 校验：`discovery.enabled=false` 时 `chains` 不得为空；`enabled=true` 时允许为空。
 
@@ -405,6 +407,15 @@ Phase B 各项仅作为 P5 备选，按需再立项。** 不用轮询：轮询�
 - 端点 `probe` 在无 ProbeManager 的进程内测试环境返回 503；生产主进程始终注入探针管理器。
 - 最近 flush 时间在 Admin state 摘要中暂以 0 表示，详细时间仍可由 Prometheus flush 指标
   查询；后续可在 StateStore 接口增加只读元数据 getter。
+
+### W8 偏差记录
+
+- 公共 overview 的统计直接从内存 registry/metrics 快照聚合，未新增指标序列或状态存储读取；
+  公共链目录通过 `PublicChainRow` 显式映射裁剪，端点 URL、健康明细、settings 与用户可见错误不出站。
+- 根路径与 `/chain/{id}` 复用现有 `read_static_file` 的 canonicalize 校验，仅额外挂载 index.html
+  路由；Vite `base=/dashboard/` 保持不变，因此根页资源仍使用绝对 `/dashboard/assets/...` 路径。
+- 公共接口当前与 admin router 共用 CORS layer；公共响应固定 `Cache-Control: public, max-age=5`，
+  入口级 body/并发/IP 防护继续由 server 外层统一提供。
 
 ## 14. 公共只读主页（Public Site，2026-08-26 增补）
 
