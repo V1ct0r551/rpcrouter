@@ -347,7 +347,9 @@ async fn override_export_import_reset_round_trip() {
         )
         .await
         .unwrap();
-    let export = json_body(exported).await;
+    let mut export = json_body(exported).await;
+    let endpoint_url = registry.all_endpoints(1).await[0].url().to_owned();
+    export["health"] = json!([{"chainId":1,"url":endpoint_url,"state":"cooling","coolingUntilUnix":rpcrouter::registry::unix_seconds()+60,"strikes":3,"latencyEwmaUs":0,"lag":0}]);
     let r = service
         .clone()
         .oneshot(request(
@@ -366,6 +368,10 @@ async fn override_export_import_reset_round_trip() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     assert_eq!(registry.chain_settings(1).2, 777);
+    assert!(matches!(
+        registry.all_endpoints(1).await[0].state(Instant::now()),
+        EndpointState::Cooling { .. }
+    ));
     assert!(store.audit_count() >= 1);
 }
 
@@ -374,6 +380,10 @@ async fn static_spa_fallback_and_disabled_admin() {
     let dir = std::env::temp_dir().join(format!("rpcrouter-admin-{}", std::process::id()));
     tokio::fs::create_dir_all(&dir).await.unwrap();
     tokio::fs::write(dir.join("index.html"), "hello")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(dir.join("assets")).await.unwrap();
+    tokio::fs::write(dir.join("assets/app.js"), "ok")
         .await
         .unwrap();
     let (url, _) = mock().await;
@@ -405,7 +415,9 @@ async fn static_spa_fallback_and_disabled_admin() {
         started: std::time::Instant::now(),
         state_runtime: StateRuntimeSnapshot::new("memory", "test", "test-1"),
     };
-    let r = app_router(AppState::new(registry, f, 10).with_admin(admin))
+    let service = app_router(AppState::new(registry, f, 10).with_admin(admin));
+    let r = service
+        .clone()
         .oneshot(
             Request::get("/dashboard/chains/1")
                 .body(Body::empty())
@@ -415,5 +427,172 @@ async fn static_spa_fallback_and_disabled_admin() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     assert_eq!(to_bytes(r.into_body(), usize::MAX).await.unwrap(), "hello");
+    for path in [
+        "/dashboard//etc/passwd",
+        "/dashboard///etc/passwd",
+        "/dashboard/%2e%2e/etc/passwd",
+        "/dashboard/assets/missing.js",
+    ] {
+        let response = service
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let response = service
+        .oneshot(
+            Request::get("/dashboard/assets/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[CONTENT_TYPE],
+        "text/javascript; charset=utf-8"
+    );
     tokio::fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_limits_and_settings_are_rejected_before_persistence() {
+    let (service, _, store, _) = app(Some("secret"), true).await;
+    let before = store.call_count();
+    for (uri, body) in [
+        (
+            "/admin/api/chains/1/endpoints/limits",
+            json!({"url":"http://127.0.0.1/","rps":0}),
+        ),
+        ("/admin/api/chains/1/settings", json!({"tipTtlMs":1})),
+        ("/admin/api/chains/1/settings", json!({"unknown":1})),
+    ] {
+        let method = if uri.ends_with("settings") {
+            "PUT"
+        } else {
+            "POST"
+        };
+        let response = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(AUTHORIZATION, "Bearer secret")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(store.call_count(), before);
+}
+
+#[tokio::test]
+async fn read_only_admin_endpoints_do_not_call_store() {
+    let (service, _, store, _) = app(None, true).await;
+    let before = store.call_count();
+    for _ in 0..100 {
+        for uri in [
+            "/admin/api/overview",
+            "/admin/api/chains",
+            "/admin/api/state",
+        ] {
+            assert_eq!(
+                service
+                    .clone()
+                    .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+    }
+    assert_eq!(store.call_count(), before);
+}
+
+#[tokio::test]
+async fn chains_listing_does_not_increase_metrics_cardinality() {
+    let (service, _, _, _) = app(None, true).await;
+    let metrics = |service: Router| async move {
+        let response = service
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .count()
+    };
+    let before = metrics(service.clone()).await;
+    assert_eq!(
+        service
+            .clone()
+            .oneshot(
+                Request::get("/admin/api/chains?state=all")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(metrics(service).await, before);
+}
+
+#[tokio::test]
+async fn settings_null_deletes_override_and_pin_uses_two_store_calls() {
+    let (service, registry, store, _) = app(Some("secret"), true).await;
+    let request = |method: &str, uri: &str, value: Value| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, "Bearer secret")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap()
+    };
+    assert_eq!(
+        service
+            .clone()
+            .oneshot(request(
+                "PUT",
+                "/admin/api/chains/1/settings",
+                json!({"tipTtlMs":777})
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        service
+            .clone()
+            .oneshot(request(
+                "PUT",
+                "/admin/api/chains/1/settings",
+                json!({"tipTtlMs":null})
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_ne!(registry.chain_settings(1).2, 777);
+    let before = store.call_count();
+    assert_eq!(
+        service
+            .oneshot(request("POST", "/admin/api/chains/1/pin", json!({})))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(store.call_count() - before <= 2);
 }

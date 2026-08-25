@@ -246,6 +246,10 @@ impl Config {
         {
             bail!("admin.auth_token is not a valid HTTP header value");
         }
+        if self.admin.auth_token.is_some() && self.admin.cors_allow_origins.iter().any(|x| x == "*")
+        {
+            bail!("admin.cors_allow_origins '*' cannot be used with admin.auth_token");
+        }
         if self.discovery.idle_seconds == 0 {
             bail!("discovery.idle_seconds must be greater than zero");
         }
@@ -550,6 +554,7 @@ pub struct AdminConfig {
     pub auth_token: Option<String>,
     pub static_dir: Option<PathBuf>,
     pub cors_allow_origins: Vec<String>,
+    pub allow_private_endpoints: bool,
 }
 
 impl Default for AdminConfig {
@@ -559,6 +564,7 @@ impl Default for AdminConfig {
             auth_token: None,
             static_dir: None,
             cors_allow_origins: Vec::new(),
+            allow_private_endpoints: false,
         }
     }
 }

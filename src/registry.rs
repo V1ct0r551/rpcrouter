@@ -30,6 +30,17 @@ const STRIKE_DECAY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const FAULTS_BEFORE_COOLING: u8 = 3;
 const PROBATION_PASSES_REQUIRED: u8 = 2;
 
+fn valid_chain_override(value: &ChainOverrideState) -> bool {
+    value
+        .block_time_ms
+        .is_none_or(|v| (100..=600_000).contains(&v))
+        && value
+            .confirmation_depth
+            .is_none_or(|v| (1..=100_000).contains(&v))
+        && value.tip_ttl_ms.is_none_or(|v| (100..=60_000).contains(&v))
+        && value.max_block_lag.is_none_or(|v| v <= 10_000)
+}
+
 // ── 端点状态机（v1 不变） ──
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,6 +210,8 @@ pub struct Endpoint {
 
 impl Endpoint {
     fn new(url: String, rps: u32, concurrency: usize, now: u64) -> Self {
+        let rps = rps.clamp(1, 100);
+        let concurrency = concurrency.clamp(1, 64);
         let quota = Quota::per_second(NonZeroU32::new(rps).expect("validated nonzero RPS"))
             .allow_burst(NonZeroU32::new(rps).expect("validated nonzero RPS"));
         Self {
@@ -681,6 +694,10 @@ impl Registry {
             entry.value().disabled.store(false, Ordering::Relaxed);
         }
         for (id, value) in &overrides.chains {
+            if !valid_chain_override(value) {
+                tracing::warn!(chain_id = *id, "invalid runtime chain override ignored");
+                continue;
+            }
             self.runtime_chain_overrides.insert(*id, value.clone());
             if let Some(pinned) = value.pinned {
                 self.runtime_pinned.insert(*id, pinned);
@@ -695,6 +712,12 @@ impl Registry {
             }
         }
         for (key, value) in &overrides.endpoints {
+            if value.rps.is_some_and(|v| !(1..=100).contains(&v))
+                || value.concurrency.is_some_and(|v| !(1..=64).contains(&v))
+            {
+                tracing::warn!(override_key=%key, "invalid runtime endpoint override ignored");
+                continue;
+            }
             self.runtime_endpoint_overrides
                 .insert(key.clone(), value.clone());
             self.set_endpoint_override(
@@ -721,6 +744,59 @@ impl Registry {
                 state.disabled.store(disabled, Ordering::Relaxed);
             }
         }
+    }
+
+    pub fn runtime_chain_override(&self, chain_id: u64) -> ChainOverrideState {
+        self.runtime_chain_overrides
+            .get(&chain_id)
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn runtime_overrides(&self) -> Overrides {
+        Overrides {
+            chains: self
+                .runtime_chain_overrides
+                .iter()
+                .map(|v| (*v.key(), v.value().clone()))
+                .collect(),
+            endpoints: self
+                .runtime_endpoint_overrides
+                .iter()
+                .map(|v| (v.key().clone(), v.value().clone()))
+                .collect(),
+        }
+    }
+
+    pub fn runtime_endpoint_override(
+        &self,
+        chain_id: u64,
+        url: &str,
+    ) -> Option<EndpointOverrideState> {
+        self.runtime_endpoint_overrides
+            .get(&crate::state::endpoint_key(chain_id, url))
+            .map(|v| v.clone())
+    }
+
+    pub async fn endpoint_known(&self, chain_id: u64, url: &str) -> bool {
+        if self.endpoint(chain_id, url).await.is_some()
+            || self.runtime_endpoint_override(chain_id, url).is_some()
+        {
+            return true;
+        }
+        if self
+            .catalog
+            .read()
+            .await
+            .as_ref()
+            .and_then(|catalog| catalog.lookup(chain_id))
+            .is_some_and(|chain| chain.endpoints.iter().any(|endpoint| endpoint.url == url))
+        {
+            return true;
+        }
+        self.config
+            .chain_override(chain_id)
+            .is_some_and(|chain| chain.extra_endpoints.iter().any(|endpoint| endpoint == url))
     }
 
     // ── 热路径：resolve_for_request ──
@@ -843,6 +919,15 @@ impl Registry {
         if let Some(chain_override) = self.config.chain_override(chain_id) {
             desired_urls.extend(chain_override.extra_endpoints.iter().cloned());
         }
+        desired_urls.extend(
+            self.runtime_endpoint_overrides
+                .iter()
+                .filter(|entry| {
+                    entry.key().starts_with(&format!("{chain_id}:"))
+                        && entry.value().disabled != Some(true)
+                })
+                .map(|entry| entry.value().url.clone()),
+        );
 
         let runtime = self
             .runtime_chain_overrides
@@ -950,6 +1035,11 @@ impl Registry {
         // pinned 链始终合并；动态发现模式下，已 materialized 的 hot 链也必须在刷新时
         // 保留健康运行态并合并新增/消失端点。dormant 链保持零成本，不创建端点对象。
         let mut materialized_ids: HashSet<u64> = self.config.chains.iter().copied().collect();
+        materialized_ids.extend(
+            self.runtime_pinned
+                .iter()
+                .filter_map(|entry| (*entry.value()).then_some(*entry.key())),
+        );
         materialized_ids.extend(self.chains.iter().filter_map(|entry| {
             matches!(
                 entry.value().state_label(),
@@ -1010,6 +1100,15 @@ impl Registry {
         if let Some(chain) = chain_override {
             desired.extend(chain.extra_endpoints.iter().cloned());
         }
+        desired.extend(
+            self.runtime_endpoint_overrides
+                .iter()
+                .filter(|entry| {
+                    entry.key().starts_with(&format!("{}:", state.chain_id))
+                        && entry.value().disabled != Some(true)
+                })
+                .map(|entry| entry.value().url.clone()),
+        );
 
         let mut present = HashSet::new();
         let mut merged = Vec::new();

@@ -171,7 +171,7 @@ impl ChainlistLoader {
         Self::with_client(
             Client::builder()
                 .user_agent(concat!("rpcrouter/", env!("CARGO_PKG_VERSION")))
-                .timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(2))
                 .build()
                 .context("failed to build chainlist HTTP client")?,
             config.chainlist.url.clone(),

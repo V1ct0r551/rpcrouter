@@ -36,6 +36,7 @@ pub struct StateRuntimeSnapshot {
     pub instance_id: String,
     pub schema_version: u32,
     pub up: bool,
+    pub writable: bool,
     pub last_flush_unix: u64,
     pub last_flush_result: String,
     pub last_flush_duration_ms: u64,
@@ -55,6 +56,7 @@ impl StateRuntimeSnapshot {
             instance_id: instance_id.into(),
             schema_version: SCHEMA_VERSION,
             up: false,
+            writable: false,
             last_flush_unix: now(),
             last_flush_result: "startup".to_owned(),
             last_flush_duration_ms: 1,
@@ -66,6 +68,7 @@ impl StateRuntimeSnapshot {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+#[serde(rename_all = "camelCase")]
 pub struct ChainOverrideState {
     pub pinned: Option<bool>,
     pub disabled: Option<bool>,
@@ -76,6 +79,7 @@ pub struct ChainOverrideState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct EndpointOverrideState {
     pub url: String,
     pub disabled: Option<bool>,
@@ -84,6 +88,7 @@ pub struct EndpointOverrideState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthSnapshot {
     pub chain_id: u64,
     pub url: String,
@@ -114,9 +119,10 @@ pub struct BootstrapState {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct StateExport {
     pub schema_version: u32,
+    #[serde(skip_serializing, default)]
     pub catalog: Option<Value>,
     pub overrides: Overrides,
     pub health: Vec<HealthSnapshot>,
@@ -151,6 +157,9 @@ pub trait StateStore: Send + Sync {
     async fn import(&self, value: &StateExport) -> Result<()>;
     async fn reset(&self) -> Result<()>;
     async fn health(&self) -> bool;
+    async fn writable(&self) -> bool {
+        true
+    }
     fn call_count(&self) -> u64 {
         0
     }
@@ -197,7 +206,9 @@ pub fn instance_id() -> String {
             format!(
                 "{}-{}",
                 std::env::var("HOSTNAME").unwrap_or_else(|_| "rpcrouter".into()),
-                std::process::id()
+                std::env::var("RPCROUTER_LISTEN")
+                    .unwrap_or_else(|_| "0.0.0.0:8545".into())
+                    .replace([':', '.'], "-")
             )
         })
 }
@@ -213,6 +224,11 @@ fn gunzip_json(bytes: &[u8]) -> Result<Value> {
     let mut raw = Vec::new();
     decoder.read_to_end(&mut raw)?;
     serde_json::from_slice(&raw).context("Redis catalog JSON is invalid")
+}
+
+fn health_key(prefix: &str, chain_id: u64, url: &str) -> String {
+    let hash = blake3::hash(url.as_bytes()).to_hex();
+    format!("{prefix}:health:{chain_id}:{}", &hash[..16])
 }
 
 #[derive(Clone)]
@@ -355,7 +371,7 @@ impl StateStore for MemoryStore {
         let d = self.inner.lock().await;
         Ok(StateExport {
             schema_version: d.schema_version,
-            catalog: d.catalog.clone(),
+            catalog: None,
             overrides: d.overrides.clone(),
             health: d.health.clone(),
             hot_chains: d.hot_chains.clone(),
@@ -370,7 +386,9 @@ impl StateStore for MemoryStore {
         }
         let mut d = self.inner.lock().await;
         d.schema_version = v.schema_version;
-        d.catalog = v.catalog.clone();
+        if v.catalog.is_some() {
+            d.catalog = v.catalog.clone();
+        }
         d.overrides = v.overrides.clone();
         d.health = v.health.clone();
         d.hot_chains = v.hot_chains.clone();
@@ -575,7 +593,7 @@ impl StateStore for FileStore {
         let d = self.inner.lock().await;
         Ok(StateExport {
             schema_version: d.schema_version,
-            catalog: d.catalog.clone(),
+            catalog: None,
             overrides: d.overrides.clone(),
             health: d.health.clone(),
             hot_chains: d.hot_chains.clone(),
@@ -590,7 +608,9 @@ impl StateStore for FileStore {
         }
         let mut d = self.inner.lock().await;
         d.schema_version = v.schema_version;
-        d.catalog = v.catalog.clone();
+        if v.catalog.is_some() {
+            d.catalog = v.catalog.clone();
+        }
         d.overrides = v.overrides.clone();
         d.health = v.health.clone();
         d.hot_chains = v.hot_chains.clone();
@@ -681,21 +701,18 @@ impl RedisStore {
         let keys: Vec<String> = timeout(Duration::from_secs(5), c.smembers(self.key(index)))
             .await
             .context("Redis index read timed out")??;
-        let mut out = Vec::new();
-        for key in keys {
-            let raw: Option<String> = timeout(
-                Duration::from_secs(5),
-                redis::cmd("HGET")
-                    .arg(&key)
-                    .arg("json")
-                    .query_async(&mut *c),
-            )
-            .await
-            .context("Redis indexed value read timed out")??;
-            if let Some(raw) = raw {
-                out.push((key, raw));
-            }
+        let mut p = pipe();
+        for key in &keys {
+            p.cmd("HGET").arg(key).arg("json");
         }
+        let values: Vec<Option<String>> = timeout(Duration::from_secs(5), p.query_async(&mut *c))
+            .await
+            .context("Redis indexed values read timed out")??;
+        let out = keys
+            .into_iter()
+            .zip(values)
+            .filter_map(|(key, raw)| raw.map(|raw| (key, raw)))
+            .collect();
         Ok(out)
     }
     async fn scan_namespace(&self) -> Result<Vec<String>> {
@@ -912,13 +929,7 @@ impl StateStore for RedisStore {
         self.bump();
         let mut p = pipe();
         for h in b {
-            let key = self.key(&format!(
-                "health:{}:{}",
-                h.chain_id,
-                endpoint_key(h.chain_id, &h.url)
-                    .split_once(':')
-                    .map_or("unknown", |x| x.1)
-            ));
+            let key = health_key(&self.prefix, h.chain_id, &h.url);
             p.cmd("HSET")
                 .arg(&key)
                 .arg("json")
@@ -982,7 +993,7 @@ impl StateStore for RedisStore {
         let d = self.bootstrap().await?;
         Ok(StateExport {
             schema_version: d.schema_version,
-            catalog: d.catalog,
+            catalog: None,
             overrides: d.overrides,
             health: d.health,
             hot_chains: d.hot_chains,
@@ -999,7 +1010,9 @@ impl StateStore for RedisStore {
         let mut p = pipe();
         p.atomic();
         for key in old_keys {
-            p.cmd("DEL").arg(key);
+            if !key.starts_with(&self.key("catalog")) {
+                p.cmd("DEL").arg(key);
+            }
         }
         p.cmd("HSET")
             .arg(self.key("meta"))
@@ -1039,11 +1052,7 @@ impl StateStore for RedisStore {
                 .arg(&key);
         }
         for health in &v.health {
-            let key = self.key(&format!(
-                "health:{}:{}",
-                health.chain_id,
-                endpoint_key(health.chain_id, &health.url)
-            ));
+            let key = health_key(&self.prefix, health.chain_id, &health.url);
             p.cmd("HSET")
                 .arg(&key)
                 .arg("json")
@@ -1188,7 +1197,7 @@ impl StateStore for ResilientStore {
         if let Some(p) = self.primary().await
             && p.set_catalog(v).await.is_err()
         {
-            self.failed().await
+            self.failed().await;
         }
         Ok(())
     }
@@ -1204,7 +1213,7 @@ impl StateStore for ResilientStore {
         if let Some(p) = self.primary().await
             && p.set_catalog_metadata(v, etag, fetched_at).await.is_err()
         {
-            self.failed().await
+            self.failed().await;
         }
         Ok(())
     }
@@ -1218,39 +1227,51 @@ impl StateStore for ResilientStore {
         self.fallback.load_overrides().await
     }
     async fn put_chain_override(&self, id: u64, v: &ChainOverrideState) -> Result<()> {
-        self.fallback.put_chain_override(id, v).await?;
-        if let Some(p) = self.primary().await
-            && p.put_chain_override(id, v).await.is_err()
-        {
-            self.failed().await
+        let p = self
+            .primary()
+            .await
+            .context("Redis state store is unavailable")?;
+        if let Err(error) = p.put_chain_override(id, v).await {
+            self.failed().await;
+            return Err(error);
         }
+        self.fallback.put_chain_override(id, v).await?;
         Ok(())
     }
     async fn delete_chain_override(&self, id: u64) -> Result<()> {
-        self.fallback.delete_chain_override(id).await?;
-        if let Some(p) = self.primary().await
-            && p.delete_chain_override(id).await.is_err()
-        {
-            self.failed().await
+        let p = self
+            .primary()
+            .await
+            .context("Redis state store is unavailable")?;
+        if let Err(error) = p.delete_chain_override(id).await {
+            self.failed().await;
+            return Err(error);
         }
+        self.fallback.delete_chain_override(id).await?;
         Ok(())
     }
     async fn put_endpoint_override(&self, k: &str, v: &EndpointOverrideState) -> Result<()> {
-        self.fallback.put_endpoint_override(k, v).await?;
-        if let Some(p) = self.primary().await
-            && p.put_endpoint_override(k, v).await.is_err()
-        {
-            self.failed().await
+        let p = self
+            .primary()
+            .await
+            .context("Redis state store is unavailable")?;
+        if let Err(error) = p.put_endpoint_override(k, v).await {
+            self.failed().await;
+            return Err(error);
         }
+        self.fallback.put_endpoint_override(k, v).await?;
         Ok(())
     }
     async fn delete_endpoint_override(&self, k: &str) -> Result<()> {
-        self.fallback.delete_endpoint_override(k).await?;
-        if let Some(p) = self.primary().await
-            && p.delete_endpoint_override(k).await.is_err()
-        {
-            self.failed().await
+        let p = self
+            .primary()
+            .await
+            .context("Redis state store is unavailable")?;
+        if let Err(error) = p.delete_endpoint_override(k).await {
+            self.failed().await;
+            return Err(error);
         }
+        self.fallback.delete_endpoint_override(k).await?;
         Ok(())
     }
     async fn flush_health(&self, b: &[HealthSnapshot]) -> Result<()> {
@@ -1296,21 +1317,27 @@ impl StateStore for ResilientStore {
         self.fallback.export().await
     }
     async fn import(&self, v: &StateExport) -> Result<()> {
-        self.fallback.import(v).await?;
-        if let Some(p) = self.primary().await
-            && p.import(v).await.is_err()
-        {
-            self.failed().await
+        let p = self
+            .primary()
+            .await
+            .context("Redis state store is unavailable")?;
+        if let Err(error) = p.import(v).await {
+            self.failed().await;
+            return Err(error);
         }
+        self.fallback.import(v).await?;
         Ok(())
     }
     async fn reset(&self) -> Result<()> {
-        self.fallback.reset().await?;
-        if let Some(p) = self.primary().await
-            && p.reset().await.is_err()
-        {
-            self.failed().await
+        let p = self
+            .primary()
+            .await
+            .context("Redis state store is unavailable")?;
+        if let Err(error) = p.reset().await {
+            self.failed().await;
+            return Err(error);
         }
+        self.fallback.reset().await?;
         Ok(())
     }
     async fn health(&self) -> bool {
@@ -1318,6 +1345,9 @@ impl StateStore for ResilientStore {
             Some(primary) => primary.health().await,
             None => false,
         }
+    }
+    async fn writable(&self) -> bool {
+        self.primary().await.is_some()
     }
     fn backend_name(&self) -> &'static str {
         "redis"
@@ -1390,6 +1420,37 @@ mod tests {
             .unwrap();
         assert_eq!(boot.catalog, Some(value));
         assert_eq!(boot.catalog_etag.as_deref(), Some("file-etag"));
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn degraded_resilient_store_rejects_control_writes() {
+        let path = std::env::temp_dir().join(format!("rpcrouter-degraded-{}.json", now()));
+        let store = ResilientStore::open("redis://127.0.0.1:1/0", "degraded-test", 60, &path)
+            .await
+            .unwrap();
+        assert!(!store.writable().await);
+        assert!(
+            store
+                .put_chain_override(
+                    1,
+                    &ChainOverrideState {
+                        pinned: Some(true),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .fallback
+                .load_overrides()
+                .await
+                .unwrap()
+                .chains
+                .is_empty()
+        );
         let _ = tokio::fs::remove_file(path).await;
     }
 
