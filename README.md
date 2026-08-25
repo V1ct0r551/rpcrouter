@@ -72,6 +72,7 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 `/metrics` 包含按链的入口、缓存命中/折叠、上游、用户可见错误、延迟、failover 和 hedge
 指标，以及按端点的请求、429、冷却事件与状态。JSON-RPC 上游耗尽仍使用 HTTP 200，响应体为
 code `-32000` 的标准 JSON-RPC error。
+冷启动时若尚无 Active 端点，耗尽错误会在同一错误体中附带 `data.reason="cold_start"`，且不计入用户可见错误承诺指标。
 
 未知链返回 HTTP 404，目录中无公开端点的已知链返回 HTTP 503，deny/disabled 链返回 HTTP
 403；这些入口拒绝计入 `ingress_rejected{reason}`，不计入 `user_visible_errors`。

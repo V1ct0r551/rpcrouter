@@ -41,6 +41,7 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
 | `rpcrouter_coalesce_ratio` | Gauge | `chain_id` | 折叠占比 = coalesced/misses |
 | `rpcrouter_chain_upstream_requests_total` | Counter | `chain_id,endpoint` | 数据面上游请求（`rate()` = 上游 QPS） |
 | `rpcrouter_user_visible_errors_total` | Counter | `chain_id` | **上游承诺**失败（请求耗尽所有端点） |
+| `rpcrouter_cold_start_failures_total` | Counter | `chain_id` | 冷启动失败（请求时没有 Active 端点）；不计入 UVE |
 | `rpcrouter_request_latency_seconds` | Histogram | `chain_id` | 端到端请求延迟（p50/p99 用 `histogram_quantile`） |
 | `rpcrouter_failover_depth` | Histogram | `chain_id` | 完成前失败上游尝试次数 |
 | `rpcrouter_hedge_attempts_total` | Counter | `chain_id` | 二次 hedge 请求数 |
@@ -61,12 +62,15 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
 | `rpcrouter_chain_activations_total` | Counter | — | dormant → hot 激活次数 |
 | `rpcrouter_chain_demotions_total` | Counter | `reason` | idle/lru/admin 降级次数 |
 
-### 3. 语义边界：`ingress_rejected` ≠ `user_visible_errors`（重要）
+### 3. 语义边界：三类失败互斥（重要）
 
 这是本项目最容易混淆的一对，代码注释与告警注释均强调：
 
-- **`rpcrouter_user_visible_errors_total`** 是**上游承诺**指标：请求**已进入数据面转发**，
+- **`rpcrouter_user_visible_errors_total`** 是**上游承诺**指标：请求**已进入数据面转发**且至少有一个 Active 端点，
   但所有上游端点耗尽，调用方收到 `-32000`。它是项目对调用方唯一「硬承诺」的成败指标。
+- **`rpcrouter_cold_start_failures_total`** 是冷启动失败指标：请求进入数据面时没有 Active 端点，
+  仅尝试 Probation/可恢复池或全部 Cooling，失败时仍返回 HTTP 200/-32000，但错误体附带
+  `data.reason="cold_start"`。
 - **`rpcrouter_ingress_rejected_total`** 是**入口侧防护**指标：请求在转发**之前**被入口层拒绝。
   原因（`reason` 标签）：
   - `overload`：全局并发超限（默认 1024 在飞），HTTP 503。
@@ -76,7 +80,8 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
   - `no_endpoints`：已知链没有公开端点，HTTP 503。
   - `chain_disabled`：链被 deny/运行时禁用，HTTP 403。
 
-**两者完全独立、不可混算。** 查询「调用方是否受损」只看 `user_visible_errors`；
+三者完全独立、不可混算：入口拒绝、冷启动失败、上游承诺失败分别只进入各自指标。
+查询「调用方是否受损」只看 `user_visible_errors`；
 查询「网关是否过载/配置过紧」看 `ingress_rejected`。Grafana 也分面板展示。
 
 ## 4. 告警规则（ops/prometheus/alerts.yml）
@@ -88,6 +93,8 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
 | `RpcrouterCacheHitRatioDropped` | `max_over_time(rpcrouter_cache_hit_ratio[1m]) < 0.8` 持续 5m | warning | 缓存命中率骤降，数据面压力放大 |
 | `RpcrouterUpstreamRateLimitedSpike` | 429 速率 / 上游速率 > 10% 持续 5m | warning | 上游限频占比突增 |
 | `RpcrouterIngressRejectionsSpiking` | `sum by(reason)(rate(rpcrouter_ingress_rejected_total[3m])) > 0` 持续 3m | warning | 入口防护持续拒绝请求 |
+| `RpcrouterChainlistRefreshStale` | `time() - rpcrouter_chainlist_last_refresh_timestamp_seconds > 7200` 持续 5m | warning | 目录成功刷新已超过 2 小时 |
+| `RpcrouterProbeQueueBackingUp` | `rpcrouter_probe_queue_depth > 128` 持续 5m | warning | 探针有界队列持续积压 |
 
 阈值默认值均附中文注释理由（`alerts.yml` 内）。修改后可用 `promtool` 校验（见 §6）。
 

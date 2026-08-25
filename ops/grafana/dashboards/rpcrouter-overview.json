@@ -389,6 +389,11 @@
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "expr": "sum(rate(rpcrouter_user_visible_errors_total[$__rate_interval])) by (chain_id)",
           "legendFormat": "chain {{ chain_id }} user_visible_errors"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(rpcrouter_cold_start_failures_total[$__rate_interval])) by (chain_id)",
+          "legendFormat": "chain {{ chain_id }} cold_start_failures"
         }
       ],
       "title": "用户可见错误（上游承诺失败）",
