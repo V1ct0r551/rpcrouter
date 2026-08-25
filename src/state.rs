@@ -561,6 +561,13 @@ impl RedisStore {
     fn bump(&self) {
         self.calls.fetch_add(1, Ordering::Relaxed);
     }
+    pub async fn initialized(&self) -> Result<bool> {
+        let mut c = self.manager.lock().await;
+        let exists: bool = timeout(Duration::from_secs(3), c.exists(self.key("meta")))
+            .await
+            .context("Redis metadata check timed out")??;
+        Ok(exists)
+    }
     async fn indexed_json(&self, index: &str) -> Result<Vec<(String, String)>> {
         let mut c = self.manager.lock().await;
         let keys: Vec<String> = timeout(Duration::from_secs(5), c.smembers(self.key(index)))
@@ -1010,14 +1017,18 @@ impl ResilientStore {
             RedisStore::connect_with_ttl(&self.url, &self.namespace, self.health_ttl_seconds)
                 .await?,
         );
-        // Redis is authoritative once it has a schema marker; never import the local
-        // fallback over a non-empty Redis namespace.
-        let _ = redis.bootstrap().await?;
+        let initialized = redis.initialized().await?;
         let local = self.fallback.export().await?;
-        if !local.health.is_empty() {
-            redis.flush_health(&local.health).await?;
+        if initialized {
+            let _ = redis.bootstrap().await?;
+            if !local.health.is_empty() {
+                redis.flush_health(&local.health).await?;
+            }
+            info!("Redis state reconnected; local fallback was not imported over Redis");
+        } else {
+            redis.import(&local).await?;
+            info!("empty Redis namespace seeded from local fallback");
         }
-        info!("Redis state reconnected; local fallback was not imported over Redis");
         *self.primary.write().await = Some(redis);
         Ok(true)
     }
