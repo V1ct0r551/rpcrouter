@@ -55,6 +55,9 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 `chains` 是 pinned 链列表：启动即激活且永不因 idle/LRU 降级。动态目录链首个请求才激活，
 随后无流量自动降级为 dormant；`discovery.deny` 链返回 403。
 
+容器部署可用 `RPCROUTER_DISCOVERY_ENABLED`、`RPCROUTER_DISCOVERY_MAX_HOT_CHAINS` 和
+`RPCROUTER_DISCOVERY_IDLE_SECONDS` 覆写动态目录策略。
+
 仓库配置使用偏保守的缓存确认深度。BSC 按 Maxwell 升级后的约 750ms 出块配置；Polygon
 约 2s、Arbitrum 约 250ms，Base、OP 与 Avalanche 约 2s。tip TTL 不超过对应块时间和 2s。
 附加公开端点前应先确认其服务条款，并通过 `endpoint_overrides` 下调供应商声明的额度。

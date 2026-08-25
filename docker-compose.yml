@@ -25,6 +25,9 @@ services:
       RPCROUTER_METRICS_ENABLED: "true"
       RPCROUTER_CHAINLIST_REFRESH_SECONDS: "3600"
       RPCROUTER_CHAINLIST_CACHE_PATH: "/app/data/rpcs.json"
+      RPCROUTER_DISCOVERY_ENABLED: "true"
+      RPCROUTER_DISCOVERY_MAX_HOT_CHAINS: "256"
+      RPCROUTER_DISCOVERY_IDLE_SECONDS: "600"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8545/healthz"]
       interval: 30s
