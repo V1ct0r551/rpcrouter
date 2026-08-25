@@ -71,6 +71,14 @@ impl Forwarder {
 
     pub fn apply_state_overrides(&self, overrides: &crate::state::Overrides) {
         self.classifier.apply_overrides(overrides);
+        for chain_id in overrides.chains.keys() {
+            let settings = self.registry.chain_settings(*chain_id);
+            self.classifier.set_chain_settings(
+                *chain_id,
+                Some(settings.1),
+                Some(settings.2.min(settings.0)),
+            );
+        }
     }
 
     pub fn apply_chain_settings(

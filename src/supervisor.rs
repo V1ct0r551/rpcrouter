@@ -14,12 +14,16 @@ where
     tokio::spawn(async move {
         let mut backoff = Duration::from_millis(100);
         loop {
+            let started = tokio::time::Instant::now();
             let result = std::panic::AssertUnwindSafe(factory()).catch_unwind().await;
             match result {
                 Ok(()) => error!(task = name, "background task exited unexpectedly"),
                 Err(_) => error!(task = name, "background task panicked"),
             }
             metrics.record_background_task_restart(name);
+            if started.elapsed() >= Duration::from_secs(5 * 60) {
+                backoff = Duration::from_millis(100);
+            }
             warn!(
                 task = name,
                 backoff_ms = backoff.as_millis(),

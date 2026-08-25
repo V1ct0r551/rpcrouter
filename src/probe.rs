@@ -64,7 +64,7 @@ pub struct ProbeManager {
     /// 有界工作池：due 端点入队，worker 消费。
     queue_tx: mpsc::Sender<(u64, Arc<Endpoint>)>,
     /// 工作池接收端（在 start_workers 中取出）。
-    queue_rx: Mutex<Option<ProbeQueueRx>>,
+    queue_rx: Arc<Mutex<ProbeQueueRx>>,
     /// 激活 kick 通道。
     kick_rx: Mutex<tokio::sync::broadcast::Receiver<u64>>,
     /// 在飞探针计数。
@@ -96,22 +96,13 @@ impl ProbeManager {
             request_timeout: Duration::from_millis(config.probe.request_timeout_ms),
             slow_threshold: Duration::from_millis(config.upstream.slow_threshold_ms),
             queue_tx,
-            queue_rx: Mutex::new(Some(queue_rx)),
+            queue_rx: Arc::new(Mutex::new(queue_rx)),
             kick_rx: Mutex::new(kick_rx),
             in_flight,
             queue_depth,
             queued: StdMutex::new(HashSet::new()),
             max_concurrency: config.probe.max_concurrency,
         })
-    }
-
-    /// 取出并启动有界工作池（必须在 manager 被 Arc 包装后调用，仅一次）。
-    fn take_worker_pool(self: &Arc<Self>) -> ProbeQueueRx {
-        self.queue_rx
-            .try_lock()
-            .expect("queue_rx lock")
-            .take()
-            .expect("workers already started")
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -387,14 +378,14 @@ impl ProbeManager {
 }
 
 /// 有界工作池：最多 N 个探针任务同时运行；不会为每个排队项创建等待信号量的任务。
-async fn worker_pool(manager: Arc<ProbeManager>, mut rx: ProbeQueueRx) {
+async fn worker_pool(manager: Arc<ProbeManager>, rx: Arc<Mutex<ProbeQueueRx>>) {
     let mut active = JoinSet::new();
     loop {
         while active.len() >= manager.max_concurrency {
             let _ = active.join_next().await;
         }
         tokio::select! {
-            item = rx.recv() => {
+            item = async { rx.lock().await.recv().await } => {
                 let Some((chain_id, endpoint)) = item else { break };
                 manager.mark_received();
                 let manager = Arc::clone(&manager);
@@ -440,19 +431,12 @@ pub fn spawn(manager: Arc<ProbeManager>) {
 }
 
 pub fn spawn_supervised(manager: Arc<ProbeManager>, metrics: Arc<crate::metrics::Metrics>) {
-    let rx = manager.take_worker_pool();
-    let worker_rx = Arc::new(StdMutex::new(Some(rx)));
+    let worker_rx = Arc::clone(&manager.queue_rx);
     let worker_manager = Arc::clone(&manager);
     crate::supervisor::spawn("probe-worker", Arc::clone(&metrics), move || {
         let manager = Arc::clone(&worker_manager);
-        let rx = worker_rx.lock().unwrap_or_else(|p| p.into_inner()).take();
-        async move {
-            if let Some(rx) = rx {
-                worker_pool(manager, rx).await
-            } else {
-                std::future::pending::<()>().await
-            }
-        }
+        let rx = Arc::clone(&worker_rx);
+        async move { worker_pool(manager, rx).await }
     });
     crate::supervisor::spawn("probe-scheduler", metrics, move || {
         let manager = Arc::clone(&manager);

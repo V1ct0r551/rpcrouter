@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
         _ => unreachable!(),
     };
     if config.state.reset {
+        tracing::warn!("state reset requested at startup");
         store.reset().await.context("failed to reset state store")?;
     }
     let boot = match store.bootstrap().await {
@@ -96,8 +97,8 @@ async fn main() -> Result<()> {
             )?)
             .await?;
     }
-    registry.apply_snapshot(&initial.snapshot).await;
     registry.apply_overrides(&boot.overrides).await;
+    registry.apply_snapshot(&initial.snapshot).await;
     if config.state.restore_hot {
         registry.activate_restored_hot(&boot.hot_chains).await;
     }
@@ -115,7 +116,12 @@ async fn main() -> Result<()> {
     let forwarder = Arc::new(forwarder_value);
     let metrics = forwarder.metrics();
     if let Some(resilient) = resilient {
-        spawn_state_reconnect(resilient, Arc::clone(&metrics));
+        spawn_state_reconnect(
+            resilient,
+            Arc::clone(&registry),
+            Arc::clone(&forwarder),
+            Arc::clone(&metrics),
+        );
     }
     let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
     spawn_probes(Arc::clone(&probes), Arc::clone(&metrics));
@@ -290,7 +296,6 @@ fn spawn_state_flush(
                 }
                 .await;
                 metrics.set_state_dirty_endpoints(registry.dirty_endpoint_count().await);
-                metrics.set_state_store_up(result.is_ok());
                 metrics.record_state_flush(
                     if result.is_ok() { "success" } else { "error" },
                     started.elapsed(),
@@ -303,9 +308,16 @@ fn spawn_state_flush(
     });
 }
 
-fn spawn_state_reconnect(store: Arc<ResilientStore>, metrics: Arc<rpcrouter::metrics::Metrics>) {
+fn spawn_state_reconnect(
+    store: Arc<ResilientStore>,
+    registry: Arc<Registry>,
+    forwarder: Arc<Forwarder>,
+    metrics: Arc<rpcrouter::metrics::Metrics>,
+) {
     supervisor::spawn("state-reconnect", metrics.clone(), move || {
         let store = Arc::clone(&store);
+        let registry = Arc::clone(&registry);
+        let forwarder = Arc::clone(&forwarder);
         let metrics = Arc::clone(&metrics);
         async move {
             let mut delay = Duration::from_secs(1);
@@ -319,7 +331,11 @@ fn spawn_state_reconnect(store: Arc<ResilientStore>, metrics: Arc<rpcrouter::met
                 metrics.set_state_store_up(false);
                 match store.reconnect().await {
                     Ok(true) => {
-                        info!("state store reconnected and full snapshot flushed");
+                        if let Ok(overrides) = store.load_overrides().await {
+                            registry.apply_overrides(&overrides).await;
+                            forwarder.apply_state_overrides(&overrides);
+                        }
+                        info!("state store reconnected and Redis overrides applied");
                         metrics.set_state_store_up(true);
                         delay = Duration::from_secs(1);
                     }

@@ -592,6 +592,7 @@ pub struct Registry {
     runtime_pinned: DashMap<u64, bool>,
     runtime_chain_overrides: DashMap<u64, ChainOverrideState>,
     runtime_endpoint_overrides: DashMap<String, EndpointOverrideState>,
+    restored_health: DashMap<String, HealthSnapshot>,
     catalog: RwLock<Option<Arc<Catalog>>>,
     config: Config,
     user_visible_errors: AtomicU64,
@@ -624,6 +625,7 @@ impl Registry {
             runtime_pinned: DashMap::new(),
             runtime_chain_overrides: DashMap::new(),
             runtime_endpoint_overrides: DashMap::new(),
+            restored_health: DashMap::new(),
             catalog: RwLock::new(None),
             config: config.clone(),
             user_visible_errors: AtomicU64::new(0),
@@ -695,6 +697,14 @@ impl Registry {
         for (key, value) in &overrides.endpoints {
             self.runtime_endpoint_overrides
                 .insert(key.clone(), value.clone());
+            self.set_endpoint_override(
+                key.split(':')
+                    .next()
+                    .and_then(|id| id.parse().ok())
+                    .unwrap_or_default(),
+                value.clone(),
+            )
+            .await;
         }
     }
 
@@ -869,6 +879,14 @@ impl Registry {
             endpoints.push(Arc::new(Endpoint::new(url, rps, concurrency, now)));
         }
         *state.endpoints.write().await = endpoints;
+        for endpoint in state.endpoints.read().await.iter() {
+            if let Some(snapshot) = self
+                .restored_health
+                .get(&crate::state::endpoint_key(chain_id, endpoint.url()))
+            {
+                endpoint.restore_health(&snapshot);
+            }
+        }
         if let Some(value) = runtime
             && let Some(disabled) = value.disabled
         {
@@ -1013,8 +1031,27 @@ impl Registry {
                 continue;
             }
             if let Some(endpoint) = previous_by_url.get(&url) {
-                endpoint.last_seen.store(now, Ordering::Relaxed);
-                merged.push(Arc::clone(endpoint));
+                let (configured_rps, configured_concurrency) =
+                    self.config.endpoint_limits(state.chain_id, &url);
+                let desired_rps = runtime
+                    .as_ref()
+                    .and_then(|entry| entry.rps)
+                    .unwrap_or(configured_rps);
+                let desired_concurrency = runtime
+                    .as_ref()
+                    .and_then(|entry| entry.concurrency)
+                    .unwrap_or(configured_concurrency);
+                if endpoint.rps() == desired_rps && endpoint.concurrency() == desired_concurrency {
+                    endpoint.last_seen.store(now, Ordering::Relaxed);
+                    merged.push(Arc::clone(endpoint));
+                } else {
+                    merged.push(Arc::new(Endpoint::new(
+                        url,
+                        desired_rps,
+                        desired_concurrency,
+                        now,
+                    )));
+                }
             } else {
                 let (rps, concurrency) = self.config.endpoint_limits(state.chain_id, &url);
                 merged.push(Arc::new(Endpoint::new(
@@ -1041,6 +1078,14 @@ impl Registry {
             }
         }
         *state.endpoints.write().await = merged;
+        for endpoint in state.endpoints.read().await.iter() {
+            if let Some(snapshot) = self
+                .restored_health
+                .get(&crate::state::endpoint_key(state.chain_id, endpoint.url()))
+            {
+                endpoint.restore_health(&snapshot);
+            }
+        }
     }
 
     // ── 生命周期控制 ──
@@ -1160,6 +1205,10 @@ impl Registry {
 
     pub async fn restore_health(&self, snapshots: &[HealthSnapshot]) {
         for snapshot in snapshots {
+            self.restored_health.insert(
+                crate::state::endpoint_key(snapshot.chain_id, &snapshot.url),
+                snapshot.clone(),
+            );
             if let Some(endpoint) = self
                 .all_endpoints(snapshot.chain_id)
                 .await
@@ -1487,7 +1536,7 @@ impl Registry {
                 item.dirty.store(true, Ordering::Release);
             }
         }
-        if head.abs_diff(height) > self.config.lag_threshold(chain_id) {
+        if head.abs_diff(height) > self.runtime_lag_threshold(chain_id) {
             endpoint.record_failure(now, FailureSignal::new(FaultKind::Lagging));
         }
     }
@@ -1577,6 +1626,13 @@ impl Registry {
             self.config.lag_threshold(chain_id),
             source,
         )
+    }
+
+    fn runtime_lag_threshold(&self, chain_id: u64) -> u64 {
+        self.runtime_chain_overrides
+            .get(&chain_id)
+            .and_then(|value| value.max_block_lag)
+            .unwrap_or_else(|| self.config.lag_threshold(chain_id))
     }
 
     pub fn chain_last_ingress(&self, chain_id: u64) -> u64 {
