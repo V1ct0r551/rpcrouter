@@ -493,10 +493,23 @@ impl Metrics {
 
     pub async fn encode(&self, rpc_registry: &Registry) -> prometheus::Result<String> {
         self.sync_endpoints(rpc_registry).await;
+        self.sync_v2_gauges(rpc_registry).await;
         let families = self.registry.gather();
         let mut buffer = Vec::new();
         TextEncoder::new().encode(&families, &mut buffer)?;
         Ok(String::from_utf8_lossy(&buffer).into_owned())
+    }
+
+    async fn sync_v2_gauges(&self, rpc_registry: &Registry) {
+        let counts = rpc_registry.chain_counts().await;
+        self.set_chain_state_counts(counts.pinned, counts.hot, counts.dormant, counts.disabled);
+        self.set_catalog_counts(
+            rpc_registry.catalog_chain_count(),
+            rpc_registry.catalog_endpoint_count(),
+        );
+        self.set_probe_queue_depth(rpc_registry.probe_queue_depth.load(Ordering::Relaxed));
+        self.set_probe_in_flight(rpc_registry.probe_in_flight.load(Ordering::Relaxed));
+        self.set_chainlist_last_refresh(rpc_registry.chainlist_last_refresh());
     }
 
     async fn sync_endpoints(&self, rpc_registry: &Registry) {

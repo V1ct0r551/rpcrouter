@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -124,6 +124,12 @@ struct LoaderState {
     last_snapshot: Option<Arc<ChainlistSnapshot>>,
     /// 刷新锁：manual refresh 与周期刷新互斥。
     refreshing: bool,
+    /// 最近一次成功刷新的 Unix 秒时间戳。
+    last_refresh_unix: u64,
+    /// 最近一次成功刷新的来源。
+    last_source: Option<RefreshSource>,
+    /// 最近一次错误消息。
+    last_error: Option<String>,
 }
 
 pub struct ChainlistLoader {
@@ -254,12 +260,15 @@ impl ChainlistLoader {
             })
             .unwrap_or((0, 0));
         RefreshState {
-            source: RefreshSource::Network, // 由调用方覆盖
-            last_refresh_unix: 0,           // 由调用方覆盖
-            etag: None,
+            source: state.last_source.unwrap_or(RefreshSource::Fixture),
+            last_refresh_unix: state.last_refresh_unix,
+            etag: state
+                .etag
+                .as_ref()
+                .and_then(|v| v.to_str().ok().map(String::from)),
             catalog_chains,
             catalog_endpoints,
-            last_error: None,
+            last_error: state.last_error.clone(),
             refreshing: state.refreshing,
         }
     }
@@ -273,7 +282,9 @@ impl ChainlistLoader {
 
         let response = request.send().await.context("chainlist request failed")?;
         if response.status() == StatusCode::NOT_MODIFIED {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
+            state.last_refresh_unix = unix_ts();
+            state.last_source = Some(RefreshSource::NotModified);
             let catalog = state
                 .last_success
                 .clone()
@@ -314,6 +325,9 @@ impl ChainlistLoader {
         state.etag = response_etag;
         state.last_success = Some(Arc::clone(&catalog));
         state.last_snapshot = Some(Arc::clone(&snapshot));
+        state.last_refresh_unix = unix_ts();
+        state.last_source = Some(RefreshSource::Network);
+        state.last_error = None;
         Ok(LoadResult {
             catalog,
             snapshot,
@@ -332,12 +346,20 @@ impl ChainlistLoader {
         let mut state = self.state.lock().await;
         state.last_success = Some(Arc::clone(&catalog));
         state.last_snapshot = Some(Arc::clone(&snapshot));
+        state.last_refresh_unix = unix_ts();
+        state.last_source = Some(source);
         LoadResult {
             catalog,
             snapshot,
             source,
         }
     }
+}
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 async fn persist_cache(path: &Path, bytes: &[u8]) -> Result<()> {

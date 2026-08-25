@@ -67,8 +67,9 @@ impl ProbeManager {
             .context("failed to build probe HTTP client")?;
         let (queue_tx, queue_rx) = mpsc::channel(4096);
         let kick_rx = registry.activation_channel().subscribe();
-        let in_flight = Arc::new(AtomicU64::new(0));
-        let queue_depth = Arc::new(AtomicU64::new(0));
+        // 共享 Registry 的原子计数器，使 metrics encode 能读到最新值。
+        let in_flight = Arc::clone(&registry.probe_in_flight);
+        let queue_depth = Arc::clone(&registry.probe_queue_depth);
         Ok(Self {
             registry,
             client,

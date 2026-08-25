@@ -7,7 +7,7 @@ use rpcrouter::{
     config::Config,
     forward::Forwarder,
     probe::{ProbeManager, spawn as spawn_probes},
-    registry::Registry,
+    registry::{Registry, unix_seconds},
     server::{AppState, guarded_service_from_state},
 };
 use tracing::{error, info};
@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
     info!(source = ?initial.source, chains = initial.catalog.chains.len(), "chainlist loaded");
     registry.set_catalog(initial.catalog).await;
     registry.apply_snapshot(&initial.snapshot).await;
+    registry.record_chainlist_refresh(unix_seconds(), &format!("{:?}", initial.source));
 
     spawn_chainlist_refresh(
         Arc::clone(&chainlist),
@@ -112,6 +113,8 @@ fn spawn_chainlist_refresh(
                 Ok(result) => {
                     registry.set_catalog(result.catalog).await;
                     registry.apply_snapshot(&result.snapshot).await;
+                    registry
+                        .record_chainlist_refresh(unix_seconds(), &format!("{:?}", result.source));
                     info!(source = ?result.source, "chainlist refresh completed");
                 }
                 Err(error) => error!(error = %error, "chainlist refresh exhausted all fallbacks"),

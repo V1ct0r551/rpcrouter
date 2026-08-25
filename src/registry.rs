@@ -467,6 +467,16 @@ pub struct Registry {
     chain_demotions_admin: AtomicU64,
     /// 激活通知通道（探针调度器订阅）。
     activation_tx: broadcast::Sender<u64>,
+    /// v2 指标快照：目录链/端点数量（由 set_catalog 更新）。
+    catalog_chains_count: AtomicU64,
+    catalog_endpoints_count: AtomicU64,
+    /// v2 指标快照：chainlist 最近刷新时间戳（由 main 刷新循环更新）。
+    chainlist_last_refresh_unix: AtomicU64,
+    /// v2 指标快照：chainlist 最近刷新来源（由 main 刷新循环更新）。
+    chainlist_refresh_source: RwLock<String>,
+    /// v2 指标快照：探针在飞/队列深度（由 ProbeManager 共享更新）。
+    pub probe_in_flight: Arc<AtomicU64>,
+    pub probe_queue_depth: Arc<AtomicU64>,
 }
 
 impl Registry {
@@ -482,11 +492,27 @@ impl Registry {
             chain_demotions_lru: AtomicU64::new(0),
             chain_demotions_admin: AtomicU64::new(0),
             activation_tx,
+            catalog_chains_count: AtomicU64::new(0),
+            catalog_endpoints_count: AtomicU64::new(0),
+            chainlist_last_refresh_unix: AtomicU64::new(0),
+            chainlist_refresh_source: RwLock::new(String::new()),
+            probe_in_flight: Arc::new(AtomicU64::new(0)),
+            probe_queue_depth: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// 设置目录（每次 chainlist 刷新整体替换）。
     pub async fn set_catalog(&self, catalog: Arc<Catalog>) {
+        let chain_count = catalog.chains.len() as u64;
+        let endpoint_count: u64 = catalog
+            .chains
+            .iter()
+            .map(|ch| ch.endpoints.len() as u64)
+            .sum();
+        self.catalog_chains_count
+            .store(chain_count, Ordering::Relaxed);
+        self.catalog_endpoints_count
+            .store(endpoint_count, Ordering::Relaxed);
         *self.catalog.write().await = Some(catalog);
     }
 
@@ -530,6 +556,12 @@ impl Registry {
         // 慢路径：materialize。
         drop(catalog);
         let state = self.materialize(chain_id, pinned).await?;
+
+        // discovery.deny 链 materialize 后立即标记为 disabled。
+        if self.config.discovery.deny.contains(&chain_id) {
+            state.disabled.store(true, Ordering::Relaxed);
+        }
+
         Some(state)
     }
 
@@ -917,6 +949,38 @@ impl Registry {
         )
     }
 
+    /// v2 指标：目录链数量。
+    pub fn catalog_chain_count(&self) -> u64 {
+        self.catalog_chains_count.load(Ordering::Relaxed)
+    }
+
+    /// v2 指标：目录端点总数。
+    pub fn catalog_endpoint_count(&self) -> u64 {
+        self.catalog_endpoints_count.load(Ordering::Relaxed)
+    }
+
+    /// v2 指标：chainlist 最近刷新时间戳。
+    pub fn chainlist_last_refresh(&self) -> u64 {
+        self.chainlist_last_refresh_unix.load(Ordering::Relaxed)
+    }
+
+    /// v2 指标：设置 chainlist 刷新信息（由 main 刷新循环调用）。
+    pub fn record_chainlist_refresh(&self, unix_ts: u64, source: &str) {
+        self.chainlist_last_refresh_unix
+            .store(unix_ts, Ordering::Relaxed);
+        if let Ok(mut s) = self.chainlist_refresh_source.try_write() {
+            *s = source.to_owned();
+        }
+    }
+
+    /// v2 指标：chainlist 最近刷新来源。
+    pub fn chainlist_refresh_source_str(&self) -> String {
+        self.chainlist_refresh_source
+            .try_read()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
     // ── summaries（v2：增加 state 字段） ──
 
     pub async fn summaries(&self) -> Vec<ChainSummary> {
@@ -1080,7 +1144,7 @@ pub fn trimmed_max(heights: &[u64]) -> Option<u64> {
     heights.get(heights.len() - 1 - trim).copied()
 }
 
-fn unix_seconds() -> u64 {
+pub fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
