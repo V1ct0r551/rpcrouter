@@ -28,6 +28,14 @@ const SCHEDULER_TICK: Duration = Duration::from_millis(250);
 
 type ProbeQueueRx = mpsc::Receiver<(u64, Arc<Endpoint>)>;
 
+struct ProbeGuard<'a>(&'a Endpoint);
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.end_probe();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeOutcome {
     Passed,
@@ -193,6 +201,7 @@ impl ProbeManager {
         if !endpoint.begin_probe(now) {
             return ProbeOutcome::Skipped;
         }
+        let _probe_guard = ProbeGuard(&endpoint);
         let Ok(_global_slot) = Arc::clone(&self.global_slots).acquire_owned().await else {
             return ProbeOutcome::Skipped;
         };

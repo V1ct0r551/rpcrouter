@@ -157,6 +157,8 @@ pub struct Endpoint {
     lag: AtomicU64,
     height_observation: Mutex<Option<(u64, Instant)>>,
     stats: EndpointStats,
+    /// 同一端点同一时刻至多一个在飞探针（防止 kick 与周期调度重复入队）。
+    probing: AtomicBool,
 }
 
 impl Endpoint {
@@ -176,6 +178,7 @@ impl Endpoint {
             lag: AtomicU64::new(0),
             height_observation: Mutex::new(None),
             stats: EndpointStats::default(),
+            probing: AtomicBool::new(false),
         }
     }
 
@@ -213,10 +216,17 @@ impl Endpoint {
     }
 
     pub fn begin_probe(&self, now: Instant) -> bool {
+        // 同一端点同一时刻至多一个在飞探针。
+        if self.probing.swap(true, Ordering::AcqRel) {
+            return false;
+        }
         let mut health = lock(&self.health);
         health.decay_strikes(now);
         match health.status {
-            HealthStatus::Cooling { until } if now < until => false,
+            HealthStatus::Cooling { until } if now < until => {
+                self.probing.store(false, Ordering::Release);
+                false
+            }
             HealthStatus::Cooling { .. } => {
                 health.status = HealthStatus::Probation { passes: 0 };
                 health.consecutive_faults = 0;
@@ -225,6 +235,11 @@ impl Endpoint {
             }
             HealthStatus::Active | HealthStatus::Probation { .. } => true,
         }
+    }
+
+    /// 标记探针结束（探测者必须在探针完成/跳过后调用，释放 per-endpoint 探针位）。
+    pub fn end_probe(&self) {
+        self.probing.store(false, Ordering::Release);
     }
 
     pub fn try_acquire(self: &Arc<Self>) -> Option<EndpointLease> {
@@ -1224,6 +1239,7 @@ mod tests {
             assert!(endpoint.begin_probe(now));
             endpoint.record_success(now, Duration::from_millis(10), true);
             endpoint.record_success(now, Duration::from_millis(10), true);
+            endpoint.end_probe();
         }
     }
 
@@ -1237,6 +1253,7 @@ mod tests {
         assert!(endpoint.begin_probe(recovered));
         endpoint.record_success(recovered, Duration::from_millis(10), true);
         endpoint.record_success(recovered, Duration::from_millis(10), true);
+        endpoint.end_probe();
         let later = recovered + STRIKE_DECAY_INTERVAL + Duration::from_secs(1);
         endpoint.record_failure(later, FailureSignal::new(FaultKind::RateLimited));
         let EndpointState::Cooling { until, strikes } = endpoint.state(later) else {
