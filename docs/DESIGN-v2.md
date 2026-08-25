@@ -133,7 +133,8 @@ refresh_seconds = 3600    # 默认由 21600 改为 3600
 enabled = true
 # auth_token = "..."      # 未配置：只读接口开放、控制接口 403；配置后 /admin/api/* 全部需 Bearer
 # static_dir = "./dashboard/dist"   # 可选：托管前端构建产物到 /dashboard/
-# cors_allow_origins = ["http://localhost:5173"]   # 可选：前端独立域名/开发服务器
+# cors_allow_origins = ["http://localhost:5173"]   # 可选：前端独立域名/开发服务器（不允许与 auth_token 同时用 "*"）
+# allow_private_endpoints = false   # endpoints/add 是否允许 loopback/私网 URL（测试用）
 
 [state]                   # 持久状态存储（§11）
 backend = "redis"         # "redis" | "file"（file = data/state.json，单机零依赖回退）
@@ -163,7 +164,7 @@ POST/PUT/DELETE 一律 403 `admin_disabled`。`[admin].enabled=false` → 整个
 |---|---|
 | `GET /admin/api/overview` | 进程（version/uptime）、chainlist（source/lastRefreshUnix/etag/catalogChains/catalogEndpoints/refreshSeconds/lastError/refreshing）、链计数（catalog/pinned/hot/dormant/disabled）、端点计数（materialized/active/cooling/probation）、流量累计（ingressTotal/cacheHitsTotal/cacheLookupsTotal/coalescedTotal/upstreamTotal/userVisibleErrorsTotal/ingressRejectedTotal/hedgesTotal/inFlight）、探针（queueDepth/inFlight/maxConcurrency）、缓存（entries/weightedBytes/maxBytes） |
 | `GET /admin/api/chains?state=all|pinned|hot|dormant|disabled&q=<子串匹配 name/shortName/chainId>&testnet=true|false&sort=traffic|chainId|name&limit=&offset=` | `{total, items:[ChainRow]}`；ChainRow = chainId,name,shortName,isTestnet,status,state,pinned,disabled,catalogEndpoints,endpoints,active,cooling,probation,head,lastIngressUnix,ingressTotal,cacheHitsTotal,cacheLookupsTotal,upstreamTotal,userVisibleErrorsTotal,settings{blockTimeMs,confirmationDepth,tipTtlMs,maxBlockLag,source:"default|config|runtime"} |
-| `GET /admin/api/chains/{id}` | ChainRow + `endpoints:[EndpointRow]`；EndpointRow = url,tracking,state,strikes,coolingUntilUnix,latencyEwmaMs,lag,rps,concurrency,disabled,source:"chainlist|config|runtime",lastFault,stats{outboundRequests,failures,rateLimited,coolingEvents,probeSuccesses} |
+| `GET /admin/api/chains/{id}` | ChainRow（其中端点计数字段名为 `endpointCount`，避免与数组同名）+ `endpoints:[EndpointRow]`（含被 disable 的端点，`state="disabled"`，便于 re-enable）；EndpointRow = url,tracking,state,strikes,coolingUntilUnix,latencyEwmaMs,lag,rps,concurrency,disabled,source:"chainlist|config|runtime",lastFault,stats{outboundRequests,failures,rateLimited,coolingEvents,probeSuccesses} |
 | `GET /admin/api/overrides` | 当前持久化的运行时覆写文档 |
 
 控制（全部幂等，返回操作后的对象）：
@@ -178,7 +179,19 @@ POST/PUT/DELETE 一律 403 `admin_disabled`。`[admin].enabled=false` → 整个
 
 运行时覆写经 **状态存储层（§11）** 持久化（默认 Redis；`state.backend="file"` 时为
 `data/state.json` 原子写），启动时加载并叠加在 config.toml 之上（优先级：runtime > config >
-default）。另有状态管理接口：`GET /admin/api/state`（后端/连通性/schema/最近 flush）、
+default）。控制接口约定（2026-08-25 第二轮审查后固化）：
+- **持久化成功才改内存**；主存储（Redis）不可达时所有控制写返回 503 `state_store_unavailable`
+  且内存不变（降级期只允许读；`GET /admin/api/state` 的 `writable=false`）。
+- **输入校验与上限**：rps 1..=100、concurrency 1..=64、cool 1..=604800s、tip_ttl_ms 100..=60000、
+  confirmation_depth 1..=100000、block_time_ms 100..=600000、max_block_lag 0..=10000；
+  settings 的 `null` 表示删除该项覆写；未知字段 400；加载到非法覆写时 warn 并忽略，绝不 panic。
+- **端点 URL**：`add` 只接受 https、无 userinfo、无 `${`、去 fragment，默认拒绝 loopback/链路本地/
+  私网（`admin.allow_private_endpoints=true` 放行）；`enable/disable/limits` 只接受目录、config
+  或 runtime 已知 URL；dormant 链的端点覆写照常持久化（materialize 时生效）。
+- export/import 不含 catalog；`POST /admin/api/state/import` 单独放宽 body 上限到 8 MiB；import 在
+  事务内先清后写并立即应用到内存（含 health 恢复与预激活）。
+- 鉴权中间件在 body/Path 解析之前执行；token 常量时间比较；所有错误（含提取失败）统一 JSON 错误体。
+- 管理面读接口只读内存快照，不触发 store 调用，也不得创建新的指标序列。另有状态管理接口：`GET /admin/api/state`（后端/连通性/schema/最近 flush）、
 `GET /admin/api/state/export`（全量 JSON 导出）、`POST /admin/api/state/import`（整体覆盖导入）、
 `POST /admin/api/state/reset`（清空本命名空间并从零重新初始化，需 token + `{"confirm":true}`）。
 `/chains`、`/healthz`、`/metrics` 保持不变（`/chains` 增加 `state` 字段）。
@@ -307,7 +320,8 @@ Probation 起步——不恢复 Active（探针必须重新证明）。
   `tokio::time::timeout`（bootstrap 3s、单次 flush 5s）。`required=false` 时 Redis 拒连或黑洞都必须
   ≤3s 内监听并服务；断连期间 flush 不阻塞，脏集合上限 20000（超出只保留最新，计数指标）。
 - **D5 hot 集合按实例写**：`{ns}:hot:{instance_id}`（ZADD/ZREM 增量，实例心跳 TTL 60s），预激活
-  只读本实例集合；`instance_id` 来自 `RPCROUTER_INSTANCE_ID` 或主机名+pid。
+  只读本实例集合；`instance_id` 来自 `RPCROUTER_INSTANCE_ID`，默认主机名 + listen 端口
+  （必须跨重启稳定，不能含 pid）。
 - **D6 本地文件写策略**：紧凑 JSON、只在内容变化时写、原子写；损坏/旧 schema 文件在 optional 模式
   下改名 `.corrupt-<unix>` 并 warn 后按空库起。
 - `state::StateStore` trait（async）：`bootstrap()`, `load_overrides()`, `put_chain_override()`,
