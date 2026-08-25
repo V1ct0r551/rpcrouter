@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{
         HeaderMap, Method, StatusCode, Uri,
         header::{AUTHORIZATION, CONTENT_TYPE},
@@ -59,20 +59,36 @@ pub struct CacheClear {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SettingsPatch {
+    #[serde(default, deserialize_with = "double_option::deserialize")]
     pub block_time_ms: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "double_option::deserialize")]
     pub confirmation_depth: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "double_option::deserialize")]
     pub tip_ttl_ms: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "double_option::deserialize")]
     pub max_block_lag: Option<Option<u64>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EndpointAction {
     pub url: String,
     pub seconds: Option<u64>,
     pub rps: Option<u32>,
     pub concurrency: Option<usize>,
+}
+
+mod double_option {
+    use serde::{Deserialize, Deserializer};
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        Ok(Some(Option::<T>::deserialize(deserializer)?))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,7 +138,7 @@ pub struct ChainRow {
     pub upstream_total: u64,
     pub user_visible_errors_total: u64,
     pub settings: Value,
-    #[serde(rename = "endpoints", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "endpointRows", skip_serializing_if = "Option::is_none")]
     pub endpoint_rows: Option<Vec<EndpointRow>>,
 }
 
@@ -155,6 +171,56 @@ fn auth(headers: &HeaderMap, method: &Method, token: Option<&str>) -> Result<(),
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+fn valid_endpoint_url(raw: &str, allow_private: bool) -> Result<String, Response> {
+    if raw.contains("${") {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "endpoint URL contains a template",
+        ));
+    }
+    let mut url = reqwest::Url::parse(raw).map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "endpoint URL is invalid",
+        )
+    })?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "endpoint URL must be HTTPS without userinfo",
+        ));
+    }
+    if !allow_private {
+        let host = url.host_str().unwrap_or_default();
+        if host.eq_ignore_ascii_case("localhost") {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "private endpoint is not allowed",
+            ));
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            let private = match ip {
+                std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+                std::net::IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+            };
+            if ip.is_loopback() || private {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "private endpoint is not allowed",
+                ));
+            }
+        }
+    }
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
 pub fn router(state: AdminState) -> Router {
     let enabled = state.config.admin.enabled;
     let mut router = Router::new()
@@ -172,25 +238,33 @@ pub fn router(state: AdminState) -> Router {
             post(endpoint_action),
         )
         .route("/admin/api/chains/{id}/{action}", post(chain_action))
-        .route("/admin/api/state/import", post(state_import))
+        .route(
+            "/admin/api/state/import",
+            post(state_import).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/admin/api/state/reset", post(state_reset))
         .route("/dashboard", get(static_file))
         .route("/dashboard/", get(static_file))
         .route("/dashboard/{*path}", get(static_file))
         .with_state(state.clone());
     if !state.config.admin.cors_allow_origins.is_empty() {
-        let mut layer = CorsLayer::new().allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::OPTIONS,
-        ]);
-        for origin in &state.config.admin.cors_allow_origins {
-            if let Ok(value) = origin.parse::<axum::http::HeaderValue>() {
-                layer = layer.allow_origin(value);
-            }
-        }
+        let origins = state
+            .config
+            .admin
+            .cors_allow_origins
+            .iter()
+            .filter_map(|origin| origin.parse::<axum::http::HeaderValue>().ok())
+            .collect::<Vec<_>>();
+        let layer = CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::list(origins))
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ]);
         router = router.layer(layer);
     }
     if enabled {
@@ -227,7 +301,6 @@ async fn overview(State(s): State<AdminState>, headers: HeaderMap) -> Response {
         last_error: None,
         refreshing: false,
     });
-    let export = s.store.export().await.unwrap_or_default();
     let total = s.registry.catalog().await.map_or(0, |c| c.chains.len());
     let traffic = summaries
         .iter()
@@ -245,7 +318,8 @@ async fn overview(State(s): State<AdminState>, headers: HeaderMap) -> Response {
                 a
             },
         );
-    Json(json!({"process":{"version":env!("CARGO_PKG_VERSION"),"uptimeSeconds":s.started.elapsed().as_secs()},"chainlist":{"source":rs.source.label(),"lastRefreshUnix":rs.last_refresh_unix,"etag":rs.etag,"catalogChains":rs.catalog_chains,"catalogEndpoints":rs.catalog_endpoints,"refreshSeconds":s.config.chainlist.refresh_seconds,"lastError":rs.last_error,"refreshing":rs.refreshing},"chains":{"catalog":total,"pinned":counts.pinned,"hot":counts.hot,"dormant":counts.dormant,"disabled":counts.disabled},"endpoints":{"materialized":summaries.iter().map(|x|x.endpoints).sum::<usize>(),"active":active,"cooling":cooling,"probation":probation},"traffic":{"ingressTotal":traffic.ingress,"cacheHitsTotal":traffic.cache_hits,"cacheLookupsTotal":traffic.cache_lookups,"coalescedTotal":traffic.coalesced,"upstreamTotal":traffic.upstream,"userVisibleErrorsTotal":traffic.user_visible_errors,"ingressRejectedTotal":s.metrics.ingress_rejected_total(),"hedgesTotal":traffic.hedges,"inFlight":s.metrics.in_flight()},"state":{"backend":s.store.backend_name(),"overrides":export.overrides.chains.len()+export.overrides.endpoints.len()},"probe":{"queueDepth":s.registry.probe_queue_depth.load(std::sync::atomic::Ordering::Relaxed),"inFlight":s.registry.probe_in_flight.load(std::sync::atomic::Ordering::Relaxed),"maxConcurrency":s.config.probe.max_concurrency},"cache":{"entries":s.forwarder.cache().entry_count(),"weightedBytes":s.forwarder.cache().weighted_size(),"maxBytes":s.config.cache.max_bytes},"total":total})).into_response()
+    let runtime = s.registry.runtime_overrides();
+    Json(json!({"process":{"version":env!("CARGO_PKG_VERSION"),"uptimeSeconds":s.started.elapsed().as_secs()},"chainlist":{"source":rs.source.label(),"lastRefreshUnix":rs.last_refresh_unix,"etag":rs.etag,"catalogChains":rs.catalog_chains,"catalogEndpoints":rs.catalog_endpoints,"refreshSeconds":s.config.chainlist.refresh_seconds,"lastError":rs.last_error,"refreshing":rs.refreshing},"chains":{"catalog":total,"pinned":counts.pinned,"hot":counts.hot,"dormant":counts.dormant,"disabled":counts.disabled},"endpoints":{"materialized":summaries.iter().map(|x|x.endpoints).sum::<usize>(),"active":active,"cooling":cooling,"probation":probation},"traffic":{"ingressTotal":traffic.ingress,"cacheHitsTotal":traffic.cache_hits,"cacheLookupsTotal":traffic.cache_lookups,"coalescedTotal":traffic.coalesced,"upstreamTotal":traffic.upstream,"userVisibleErrorsTotal":traffic.user_visible_errors,"ingressRejectedTotal":s.metrics.ingress_rejected_total(),"hedgesTotal":traffic.hedges,"inFlight":s.metrics.in_flight()},"state":{"backend":s.store.backend_name(),"overrides":runtime.chains.len()+runtime.endpoints.len()},"probe":{"queueDepth":s.registry.probe_queue_depth.load(std::sync::atomic::Ordering::Relaxed),"inFlight":s.registry.probe_in_flight.load(std::sync::atomic::Ordering::Relaxed),"maxConcurrency":s.config.probe.max_concurrency},"cache":{"entries":s.forwarder.cache().entry_count(),"weightedBytes":s.forwarder.cache().weighted_size(),"maxBytes":s.config.cache.max_bytes},"total":total})).into_response()
 }
 
 async fn chains(
@@ -311,14 +385,7 @@ async fn overrides(State(s): State<AdminState>, headers: HeaderMap) -> Response 
     if let Err(r) = auth(&headers, &Method::GET, s.config.admin.auth_token.as_deref()) {
         return r;
     }
-    match s.store.export().await {
-        Ok(x) => Json(x.overrides).into_response(),
-        Err(e) => err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "state_store_unavailable",
-            e.to_string(),
-        ),
-    }
+    Json(s.registry.runtime_overrides()).into_response()
 }
 async fn state_info(State(s): State<AdminState>, headers: HeaderMap) -> Response {
     if let Err(r) = auth(&headers, &Method::GET, s.config.admin.auth_token.as_deref()) {
@@ -330,6 +397,7 @@ async fn state_info(State(s): State<AdminState>, headers: HeaderMap) -> Response
         "namespace": snapshot.namespace,
         "instanceId": snapshot.instance_id,
         "up": snapshot.up,
+        "writable": snapshot.writable,
         "schemaVersion": snapshot.schema_version,
         "dirtyEndpoints": snapshot.dirty_endpoints,
         "lastFlushUnix": snapshot.last_flush_unix,
@@ -406,8 +474,18 @@ async fn chainlist_refresh(State(s): State<AdminState>, headers: HeaderMap) -> R
 async fn cache_clear(
     State(s): State<AdminState>,
     headers: HeaderMap,
-    Json(body): Json<CacheClear>,
+    body: Result<Json<CacheClear>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(body) = match body {
+        Ok(value) => value,
+        Err(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "invalid JSON body",
+            );
+        }
+    };
     if let Err(r) = auth(
         &headers,
         &Method::POST,
@@ -513,13 +591,43 @@ async fn chain_settings(
     State(s): State<AdminState>,
     headers: HeaderMap,
     Path(id): Path<u64>,
-    Json(patch): Json<SettingsPatch>,
+    patch: Result<Json<SettingsPatch>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(patch) = match patch {
+        Ok(value) => value,
+        Err(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "invalid JSON body",
+            );
+        }
+    };
     if let Err(r) = auth(&headers, &Method::PUT, s.config.admin.auth_token.as_deref()) {
         return r;
     }
     if !s.registry.chain_in_catalog(id).await {
         return err(StatusCode::NOT_FOUND, "unknown_chain", "unknown chain");
+    }
+    if patch
+        .block_time_ms
+        .flatten()
+        .is_some_and(|v| !(100..=600_000).contains(&v))
+        || patch
+            .confirmation_depth
+            .flatten()
+            .is_some_and(|v| !(1..=100_000).contains(&v))
+        || patch
+            .tip_ttl_ms
+            .flatten()
+            .is_some_and(|v| !(100..=60_000).contains(&v))
+        || patch.max_block_lag.flatten().is_some_and(|v| v > 10_000)
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "settings value is out of range",
+        );
     }
     let mut v = existing_chain_override(&s, id).await;
     if let Some(x) = patch.block_time_ms {
@@ -548,14 +656,75 @@ async fn endpoint_action(
     State(s): State<AdminState>,
     headers: HeaderMap,
     Path((id, action)): Path<(u64, String)>,
-    Json(body): Json<EndpointAction>,
+    body: Result<Json<EndpointAction>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(body) = match body {
+        Ok(value) => value,
+        Err(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "invalid JSON body",
+            );
+        }
+    };
     if let Err(r) = auth(
         &headers,
         &Method::POST,
         s.config.admin.auth_token.as_deref(),
     ) {
         return r;
+    }
+    let mut body = body;
+    if action == "add" {
+        body.url = match valid_endpoint_url(&body.url, s.config.admin.allow_private_endpoints) {
+            Ok(url) => url,
+            Err(response) => return response,
+        };
+    }
+    if body.rps.is_some_and(|value| !(1..=100).contains(&value)) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "rps must be between 1 and 100",
+        );
+    }
+    if body
+        .concurrency
+        .is_some_and(|value| !(1..=64).contains(&value))
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "concurrency must be between 1 and 64",
+        );
+    }
+    if action == "cool" && !(1..=604800).contains(&body.seconds.unwrap_or(60)) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "cool seconds must be between 1 and 604800",
+        );
+    }
+    if action == "add" {
+        if !s.registry.chain_in_catalog(id).await {
+            return err(StatusCode::NOT_FOUND, "unknown_chain", "unknown chain");
+        }
+        let value = EndpointOverrideState {
+            url: body.url.clone(),
+            disabled: Some(false),
+            rps: body.rps,
+            concurrency: body.concurrency,
+        };
+        if let Err(response) = persist_endpoint(&s, id, &value).await {
+            return response;
+        }
+        s.registry.set_endpoint_override(id, value).await;
+        audit(&s, "endpoint.add", &body.url).await;
+        return Json(json!({"url":body.url,"state":"probation"})).into_response();
+    }
+    if !s.registry.endpoint_known(id, &body.url).await {
+        return err(StatusCode::NOT_FOUND, "not_found", "endpoint not found");
     }
     let endpoint = match s.registry.endpoint(id, &body.url).await {
         Some(e) => e,
@@ -577,44 +746,63 @@ async fn endpoint_action(
             return Json(json!({"url":body.url,"state":"probation"})).into_response();
         }
         None if action == "enable" || action == "limits" => {
-            let value = EndpointOverrideState {
-                url: body.url.clone(),
-                disabled: (action == "enable").then_some(false),
-                rps: body.rps,
-                concurrency: body.concurrency,
-            };
+            let mut value = s
+                .registry
+                .runtime_endpoint_override(id, &body.url)
+                .unwrap_or(EndpointOverrideState {
+                    url: body.url.clone(),
+                    disabled: None,
+                    rps: None,
+                    concurrency: None,
+                });
+            if action == "enable" {
+                value.disabled = Some(false);
+            }
+            if action == "limits" {
+                if body.rps.is_some() {
+                    value.rps = body.rps;
+                }
+                if body.concurrency.is_some() {
+                    value.concurrency = body.concurrency;
+                }
+            }
             if let Err(r) = persist_endpoint(&s, id, &value).await {
                 return r;
             }
             s.registry.set_endpoint_override(id, value).await;
-            let Some(endpoint) = s.registry.endpoint(id, &body.url).await else {
-                return err(StatusCode::NOT_FOUND, "not_found", "endpoint not found");
-            };
             audit(&s, &format!("endpoint.{action}"), &body.url).await;
-            return Json(json!({"url":body.url,"state":format!("{:?}",endpoint.state(Instant::now().into())).to_ascii_lowercase()})).into_response();
+            return Json(json!({"url":body.url,"state":"dormant"})).into_response();
         }
         None => return err(StatusCode::NOT_FOUND, "not_found", "endpoint not found"),
     };
     match action.as_str() {
         "disable" => {
-            let v = EndpointOverrideState {
-                url: body.url.clone(),
-                disabled: Some(true),
-                rps: None,
-                concurrency: None,
-            };
+            let mut v = s
+                .registry
+                .runtime_endpoint_override(id, &body.url)
+                .unwrap_or(EndpointOverrideState {
+                    url: body.url.clone(),
+                    disabled: None,
+                    rps: None,
+                    concurrency: None,
+                });
+            v.disabled = Some(true);
             if let Err(r) = persist_endpoint(&s, id, &v).await {
                 return r;
             };
             s.registry.set_endpoint_override(id, v).await;
         }
         "enable" => {
-            let v = EndpointOverrideState {
-                url: body.url.clone(),
-                disabled: Some(false),
-                rps: None,
-                concurrency: None,
-            };
+            let mut v = s
+                .registry
+                .runtime_endpoint_override(id, &body.url)
+                .unwrap_or(EndpointOverrideState {
+                    url: body.url.clone(),
+                    disabled: None,
+                    rps: None,
+                    concurrency: None,
+                });
+            v.disabled = Some(false);
             if let Err(r) = persist_endpoint(&s, id, &v).await {
                 return r;
             };
@@ -623,12 +811,21 @@ async fn endpoint_action(
         "cool" => endpoint.cool_for(std::time::Duration::from_secs(body.seconds.unwrap_or(60))),
         "reset" => endpoint.reset_health(),
         "limits" => {
-            let v = EndpointOverrideState {
-                url: body.url.clone(),
-                disabled: None,
-                rps: body.rps,
-                concurrency: body.concurrency,
-            };
+            let mut v = s
+                .registry
+                .runtime_endpoint_override(id, &body.url)
+                .unwrap_or(EndpointOverrideState {
+                    url: body.url.clone(),
+                    disabled: None,
+                    rps: None,
+                    concurrency: None,
+                });
+            if body.rps.is_some() {
+                v.rps = body.rps;
+            }
+            if body.concurrency.is_some() {
+                v.concurrency = body.concurrency;
+            }
             if let Err(r) = persist_endpoint(&s, id, &v).await {
                 return r;
             };
@@ -692,8 +889,18 @@ async fn endpoint_action(
 async fn state_import(
     State(s): State<AdminState>,
     headers: HeaderMap,
-    Json(value): Json<StateExport>,
+    value: Result<Json<StateExport>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(value) = match value {
+        Ok(value) => value,
+        Err(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "invalid JSON body",
+            );
+        }
+    };
     if let Err(r) = auth(
         &headers,
         &Method::POST,
@@ -710,14 +917,26 @@ async fn state_import(
     };
     s.registry.apply_overrides(&value.overrides).await;
     s.forwarder.apply_state_overrides(&value.overrides);
+    s.registry.restore_health(&value.health).await;
+    s.registry.activate_restored_hot(&value.hot_chains).await;
     audit(&s, "state.import", "namespace").await;
     Json(json!({"ok":true})).into_response()
 }
 async fn state_reset(
     State(s): State<AdminState>,
     headers: HeaderMap,
-    Json(value): Json<ConfirmReset>,
+    value: Result<Json<ConfirmReset>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(value) = match value {
+        Ok(value) => value,
+        Err(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "invalid JSON body",
+            );
+        }
+    };
     if let Err(r) = auth(
         &headers,
         &Method::POST,
@@ -750,17 +969,38 @@ async fn static_file(State(s): State<AdminState>, uri: Uri) -> Response {
     let Some(dir) = &s.config.admin.static_dir else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let path = uri.path().trim_start_matches("/dashboard/");
-    let path = if path.is_empty() { "index.html" } else { path };
-    if path.split('/').any(|part| part == "..") {
+    let raw = uri.path().strip_prefix("/dashboard").unwrap_or("");
+    let path = raw.trim_start_matches('/');
+    if path.is_empty() {
+        return read_static_file(dir, "index.html").await;
+    }
+    if raw.starts_with("//")
+        || path.contains('%')
+        || path.starts_with('/')
+        || path.split('/').any(|part| part.is_empty() || part == "..")
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let full = dir.join(path);
-    let full = if tokio::fs::metadata(&full).await.is_ok() {
-        full
-    } else {
-        dir.join("index.html")
+    let candidate = dir.join(path);
+    if tokio::fs::metadata(&candidate).await.is_ok() {
+        return read_static_file(dir, path).await;
+    }
+    if std::path::Path::new(path).extension().is_some() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    read_static_file(dir, "index.html").await
+}
+async fn read_static_file(dir: &std::path::Path, relative: &str) -> Response {
+    let Ok(root) = tokio::fs::canonicalize(dir).await else {
+        return StatusCode::NOT_FOUND.into_response();
     };
+    let candidate = dir.join(relative);
+    let Ok(full) = tokio::fs::canonicalize(&candidate).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !full.starts_with(&root) || !full.is_file() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match tokio::fs::read(&full).await {
         Ok(bytes) => (
             StatusCode::OK,
@@ -773,11 +1013,17 @@ async fn static_file(State(s): State<AdminState>, uri: Uri) -> Response {
 }
 fn content_type(path: &std::path::Path) -> &'static str {
     match path.extension().and_then(|x| x.to_str()) {
-        Some("js") => "text/javascript",
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
         Some("css") => "text/css",
         Some("json") => "application/json",
         Some("svg") => "image/svg+xml",
-        _ => "text/html; charset=utf-8",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("map") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
     }
 }
 
@@ -787,18 +1033,20 @@ async fn audit(s: &AdminState, what: &str, target: &str) {
     }
 }
 async fn existing_chain_override(s: &AdminState, id: u64) -> ChainOverrideState {
-    s.store
-        .export()
-        .await
-        .ok()
-        .and_then(|x| x.overrides.chains.get(&id).cloned())
-        .unwrap_or_default()
+    s.registry.runtime_chain_override(id)
 }
 async fn persist_chain(
     s: &AdminState,
     id: u64,
     value: &ChainOverrideState,
 ) -> Result<(), Response> {
+    if !s.store.writable().await {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "state_store_unavailable",
+            "state store is not writable",
+        ));
+    }
     s.store.put_chain_override(id, value).await.map_err(|e| {
         err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -813,6 +1061,13 @@ async fn persist_endpoint(
     id: u64,
     value: &EndpointOverrideState,
 ) -> Result<(), Response> {
+    if !s.store.writable().await {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "state_store_unavailable",
+            "state store is not writable",
+        ));
+    }
     s.store
         .put_endpoint_override(&endpoint_key(id, &value.url), value)
         .await

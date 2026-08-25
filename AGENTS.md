@@ -68,4 +68,8 @@ v1 已交付（2026-07-26 验收）。后续任务规划统一沉淀在 `docs/RO
   - [x] W5 动态目录 + 链生命周期（2026-08-25 合入：目录 2887 链 / 5562 端点，pinned/hot/dormant/
         disabled 生命周期，未知链 404 / 无端点 503 / 禁用 403 不计 UVE，冷启动失败单独计数，
         有界探针池；10k 压测 p99 1.5ms、UVE 0，见 docs/reports/loadtest-w5.md）。
-  - [ ] W6a Redis 状态存储层 → W6b Admin REST API → W7 React dashboard。
+  - [x] W6 Redis 状态存储层 + Admin REST API（2026-08-25 合入：StateStore Memory/File/Redis，结构化
+        key 为真相、从零初始化/覆盖/重置、Redis 不可达 ≤3s 降级启动且控制写 503；后台任务监督器；
+        `/admin/api/*` 只读 + 控制接口，bearer 鉴权、静态托管防穿越、输入校验；compose redis +
+        cluster 分片 profile（方案 A）；见 docs/reports/w6-state-admin.md）。
+  - [ ] W7 React dashboard（`dashboard/`，进行中）。

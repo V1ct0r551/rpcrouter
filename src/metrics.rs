@@ -10,7 +10,7 @@ use std::{
 use dashmap::DashMap;
 use prometheus::{
     Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    IntGaugeVec, Opts, Registry as PrometheusRegistry, TextEncoder,
+    IntGaugeVec, Opts, Registry as PrometheusRegistry, TextEncoder, core::Collector,
 };
 
 use crate::registry::{EndpointStatsSnapshot, Registry};
@@ -583,17 +583,34 @@ impl Metrics {
 
     pub fn chain_snapshot(&self, chain_id: u64) -> ChainMetricsSnapshot {
         let chain = chain_id.to_string();
-        let hedge_totals = self.hedge_totals(chain_id);
+        let counter = |metric: &IntCounterVec| {
+            metric
+                .collect()
+                .into_iter()
+                .flat_map(|family| family.get_metric().to_vec())
+                .find(|sample| {
+                    sample
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "chain_id" && label.value() == chain)
+                })
+                .map_or(0, |sample| sample.get_counter().value() as u64)
+        };
+        let hedge_totals = self.hedge_totals.get(&chain_id);
         ChainMetricsSnapshot {
-            ingress: self.ingress.with_label_values(&[&chain]).get(),
-            cache_lookups: self.cache_lookups.with_label_values(&[&chain]).get(),
-            cache_hits: self.cache_hits.with_label_values(&[&chain]).get(),
-            cache_misses: self.cache_misses.with_label_values(&[&chain]).get(),
-            coalesced: self.coalesced.with_label_values(&[&chain]).get(),
-            upstream: hedge_totals.upstream.load(Ordering::Relaxed),
-            user_visible_errors: self.user_visible_errors.with_label_values(&[&chain]).get(),
-            cold_start_failures: self.cold_start_failures.with_label_values(&[&chain]).get(),
-            hedges: hedge_totals.hedges.load(Ordering::Relaxed),
+            ingress: counter(&self.ingress),
+            cache_lookups: counter(&self.cache_lookups),
+            cache_hits: counter(&self.cache_hits),
+            cache_misses: counter(&self.cache_misses),
+            coalesced: counter(&self.coalesced),
+            upstream: hedge_totals
+                .as_ref()
+                .map_or(0, |v| v.upstream.load(Ordering::Relaxed)),
+            user_visible_errors: counter(&self.user_visible_errors),
+            cold_start_failures: counter(&self.cold_start_failures),
+            hedges: hedge_totals
+                .as_ref()
+                .map_or(0, |v| v.hedges.load(Ordering::Relaxed)),
         }
     }
 

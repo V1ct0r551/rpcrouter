@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
     let initial_up = store.health().await;
     metrics.set_state_store_up(initial_up);
     state_runtime.write().await.up = initial_up;
+    state_runtime.write().await.writable = store.writable().await;
     state_runtime.write().await.last_ping_unix = unix_seconds();
     // 启动 housekeeping 后台任务（每 30s 一次）。
     spawn_housekeeping(Arc::clone(&registry), Arc::clone(&metrics));
@@ -421,6 +422,7 @@ fn spawn_state_ping(
                 metrics.set_state_store_up(up);
                 let mut snapshot = state_runtime.write().await;
                 snapshot.up = up;
+                snapshot.writable = store.writable().await;
                 snapshot.last_ping_unix = unix_seconds();
             }
         }

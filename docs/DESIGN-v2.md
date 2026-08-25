@@ -133,7 +133,8 @@ refresh_seconds = 3600    # 默认由 21600 改为 3600
 enabled = true
 # auth_token = "..."      # 未配置：只读接口开放、控制接口 403；配置后 /admin/api/* 全部需 Bearer
 # static_dir = "./dashboard/dist"   # 可选：托管前端构建产物到 /dashboard/
-# cors_allow_origins = ["http://localhost:5173"]   # 可选：前端独立域名/开发服务器
+# cors_allow_origins = ["http://localhost:5173"]   # 可选：前端独立域名/开发服务器（不允许与 auth_token 同时用 "*"）
+# allow_private_endpoints = false   # endpoints/add 是否允许 loopback/私网 URL（测试用）
 
 [state]                   # 持久状态存储（§11）
 backend = "redis"         # "redis" | "file"（file = data/state.json，单机零依赖回退）
@@ -163,7 +164,7 @@ POST/PUT/DELETE 一律 403 `admin_disabled`。`[admin].enabled=false` → 整个
 |---|---|
 | `GET /admin/api/overview` | 进程（version/uptime）、chainlist（source/lastRefreshUnix/etag/catalogChains/catalogEndpoints/refreshSeconds/lastError/refreshing）、链计数（catalog/pinned/hot/dormant/disabled）、端点计数（materialized/active/cooling/probation）、流量累计（ingressTotal/cacheHitsTotal/cacheLookupsTotal/coalescedTotal/upstreamTotal/userVisibleErrorsTotal/ingressRejectedTotal/hedgesTotal/inFlight）、探针（queueDepth/inFlight/maxConcurrency）、缓存（entries/weightedBytes/maxBytes） |
 | `GET /admin/api/chains?state=all|pinned|hot|dormant|disabled&q=<子串匹配 name/shortName/chainId>&testnet=true|false&sort=traffic|chainId|name&limit=&offset=` | `{total, items:[ChainRow]}`；ChainRow = chainId,name,shortName,isTestnet,status,state,pinned,disabled,catalogEndpoints,endpoints,active,cooling,probation,head,lastIngressUnix,ingressTotal,cacheHitsTotal,cacheLookupsTotal,upstreamTotal,userVisibleErrorsTotal,settings{blockTimeMs,confirmationDepth,tipTtlMs,maxBlockLag,source:"default|config|runtime"} |
-| `GET /admin/api/chains/{id}` | ChainRow + `endpoints:[EndpointRow]`；EndpointRow = url,tracking,state,strikes,coolingUntilUnix,latencyEwmaMs,lag,rps,concurrency,disabled,source:"chainlist|config|runtime",lastFault,stats{outboundRequests,failures,rateLimited,coolingEvents,probeSuccesses} |
+| `GET /admin/api/chains/{id}` | ChainRow（`endpoints` 为 materialized 端点数，与 `/chains` 一致）+ `endpointRows:[EndpointRow]`（含被 disable 的端点，`state="disabled"`，便于 re-enable）；EndpointRow = url,tracking,state,strikes,coolingUntilUnix,latencyEwmaMs,lag,rps,concurrency,disabled,source:"chainlist|config|runtime",lastFault,stats{outboundRequests,failures,rateLimited,coolingEvents,probeSuccesses} |
 | `GET /admin/api/overrides` | 当前持久化的运行时覆写文档 |
 
 控制（全部幂等，返回操作后的对象）：
@@ -178,7 +179,19 @@ POST/PUT/DELETE 一律 403 `admin_disabled`。`[admin].enabled=false` → 整个
 
 运行时覆写经 **状态存储层（§11）** 持久化（默认 Redis；`state.backend="file"` 时为
 `data/state.json` 原子写），启动时加载并叠加在 config.toml 之上（优先级：runtime > config >
-default）。另有状态管理接口：`GET /admin/api/state`（后端/连通性/schema/最近 flush）、
+default）。控制接口约定（2026-08-25 第二轮审查后固化）：
+- **持久化成功才改内存**；主存储（Redis）不可达时所有控制写返回 503 `state_store_unavailable`
+  且内存不变（降级期只允许读；`GET /admin/api/state` 的 `writable=false`）。
+- **输入校验与上限**：rps 1..=100、concurrency 1..=64、cool 1..=604800s、tip_ttl_ms 100..=60000、
+  confirmation_depth 1..=100000、block_time_ms 100..=600000、max_block_lag 0..=10000；
+  settings 的 `null` 表示删除该项覆写；未知字段 400；加载到非法覆写时 warn 并忽略，绝不 panic。
+- **端点 URL**：`add` 只接受 https、无 userinfo、无 `${`、去 fragment，默认拒绝 loopback/链路本地/
+  私网（`admin.allow_private_endpoints=true` 放行）；`enable/disable/limits` 只接受目录、config
+  或 runtime 已知 URL；dormant 链的端点覆写照常持久化（materialize 时生效）。
+- export/import 不含 catalog；`POST /admin/api/state/import` 单独放宽 body 上限到 8 MiB；import 在
+  事务内先清后写并立即应用到内存（含 health 恢复与预激活）。
+- 鉴权中间件在 body/Path 解析之前执行；token 常量时间比较；所有错误（含提取失败）统一 JSON 错误体。
+- 管理面读接口只读内存快照，不触发 store 调用，也不得创建新的指标序列。另有状态管理接口：`GET /admin/api/state`（后端/连通性/schema/最近 flush）、
 `GET /admin/api/state/export`（全量 JSON 导出）、`POST /admin/api/state/import`（整体覆盖导入）、
 `POST /admin/api/state/reset`（清空本命名空间并从零重新初始化，需 token + `{"confirm":true}`）。
 `/chains`、`/healthz`、`/metrics` 保持不变（`/chains` 增加 `state` 字段）。
@@ -292,20 +305,40 @@ Probation 起步——不恢复 Active（探针必须重新证明）。
 5. 所有写操作只触及本命名空间，可与其他应用共用一个 Redis；key 使用 `{namespace}` hash tag
    风格前缀，兼容 Redis Cluster。
 
-### 11.4 实现要点
+### 11.4 实现要点（2026-08-25 checker 审查后修订为决策 D1–D6）
 
+- **D1 结构化 key 是唯一读真相**：不再维护任何整体 JSON document 镜像。读取用
+  HGETALL / SMEMBERS / ZRANGE（靠 `override:index` 避免 SCAN）；写入是单 key 写，不做读-改-写；
+  只有 import / reset 这类多 key 原子操作用 MULTI/EXEC。
+- **D2 catalog 单独存**：`{ns}:catalog`（gzip JSON）+ `catalog:etag` + `catalog:fetched_at`，每次
+  成功网络刷新写一次；启动回退顺序：网络 → 内存 → Redis catalog → 磁盘 → fixture。
+- **D3 Redis 非空即以 Redis 为准**：启动/重连时 `meta` 存在 → 从 Redis 加载覆写并重新应用到内存，
+  只补 flush 本地脏 health；只有空库才 seed；**永远不用本地文件 import 覆盖 Redis**。本地文件
+  （FileStore 或降级镜像）只是降级期间的本地缓存。
+- **D4 所有 Redis 交互有界**：`ConnectionManager::new_with_config` 设 retries=0（重连交给
+  supervisor 退避）、connect 2s、response 5s；open / reconnect / 每个 store 方法外再包
+  `tokio::time::timeout`（bootstrap 3s、单次 flush 5s）。`required=false` 时 Redis 拒连或黑洞都必须
+  ≤3s 内监听并服务；断连期间 flush 不阻塞，脏集合上限 20000（超出只保留最新，计数指标）。
+- **D5 hot 集合按实例写**：`{ns}:hot:{instance_id}`（ZADD/ZREM 增量，实例心跳 TTL 60s），预激活
+  只读本实例集合；`instance_id` 来自 `RPCROUTER_INSTANCE_ID`，默认主机名 + listen 端口
+  （必须跨重启稳定，不能含 pid）。
+- **D6 本地文件写策略**：紧凑 JSON、只在内容变化时写、原子写；损坏/旧 schema 文件在 optional 模式
+  下改名 `.corrupt-<unix>` 并 warn 后按空库起。
 - `state::StateStore` trait（async）：`bootstrap()`, `load_overrides()`, `put_chain_override()`,
-  `put_endpoint_override()`, `delete_*()`, `flush_health(batch)`, `load_health()`,
-  `set_hot_chains()`, `append_audit()`, `export()`, `import()`, `reset()`, `health()`；
-  实现：`MemoryStore`（测试）、`FileStore`（`data/state.json`）、`RedisStore`。
-- crate：`redis`（`tokio-comp` + `connection-manager`，自动重连）；批量写用 pipeline，
-  import/reset 用 `MULTI/EXEC`。
-- write-behind：Registry 维护脏端点集合（DashSet），flush 任务每周期取走、pipeline 写入；
-  单次上限 2000 条，超出下周期续写。
+  `put_endpoint_override()`, `delete_*()`（同步 DEL + SREM）, `flush_health(batch)`, `load_health()`,
+  `set_hot_chains()`, `append_audit()`, `export()`, `import()`, `reset()`（兜底 `SCAN MATCH {ns}:*`）,
+  `health()`（真实 PING）；实现：`MemoryStore`（测试）、`FileStore`、`RedisStore`、`ResilientStore`
+  （Redis + 本地镜像降级）。
+- crate：`redis`（`tokio-comp` + `connection-manager`）；批量写用 pipeline。
+- write-behind：Registry 维护脏端点集合，flush 任务每周期取走、pipeline 写入；单次上限 2000 条。
+- `state_store_up` 只由一处带超时的真实 PING（每 5s）设置；降级/恢复切换有限频日志。
+- 端点级覆写（disabled / rps / concurrency）对 pinned 链与动态链一视同仁（`merge_chain` 与
+  materialize 共用同一 helper），chainlist 刷新不得还原覆写；恢复的 health 快照保留在 Registry，
+  链 materialize 时再套用（cluster 下 `restore_hot=false` 也能恢复冷却期）。
 - 指标：`rpcrouter_state_store_up`、`rpcrouter_state_flush_total{result}`、
   `rpcrouter_state_flush_duration_seconds`、`rpcrouter_state_dirty_endpoints`。
-- docker-compose：新增 `redis:7-alpine` 服务（`--appendonly yes` + 卷）；网关默认
-  `RPCROUTER_REDIS_URL=redis://redis:6379/0`。
+- docker-compose：`redis:7-alpine`（`--appendonly yes` + 卷 + healthcheck，实例
+  `depends_on: condition: service_healthy`）；网关默认 `RPCROUTER_REDIS_URL=redis://redis:6379/0`。
 
 ## 12. 多实例与横向扩展路线（2026-08-25 增补）
 

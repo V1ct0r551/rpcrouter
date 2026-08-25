@@ -25,6 +25,7 @@ use axum::{
     response::Response,
 };
 use serde_json::{Value, json};
+use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 use tower::{Layer, Service, ServiceExt, util::BoxCloneService};
 use tracing::debug;
@@ -246,8 +247,12 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let limit = if request.uri().path() == "/admin/api/state/import" {
+            8 * 1024 * 1024
+        } else {
+            self.limit
+        };
         let (parts, body) = request.into_parts();
-        let limit = self.limit;
         let metrics = Arc::clone(&self.metrics);
         let mut inner = self.inner.clone();
         Box::pin(async move {
@@ -404,7 +409,7 @@ where
         let authorized = request
             .headers()
             .get(AUTHORIZATION)
-            .is_some_and(|value| value == self.expected);
+            .is_some_and(|value| value.as_bytes().ct_eq(self.expected.as_bytes()).into());
         if authorized {
             let mut inner = self.inner.clone();
             Box::pin(async move { inner.ready().await.unwrap().call(request).await })
