@@ -147,55 +147,72 @@ async fn metrics(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn rpc(Path(chain_id): Path<u64>, State(state): State<AppState>, body: Bytes) -> Json<Value> {
+async fn rpc(Path(chain_id): Path<u64>, State(state): State<AppState>, body: Bytes) -> Response {
     // 路由层解析链一次（batch 也只做一次）。
+    // 语义边界：未知链 404 / 禁用链 403 / 0 端点链 503，均为入口拒绝，
+    // 计入 ingress_rejected，不计 user_visible_errors。
     let resolved = state.registry.resolve_for_request(chain_id).await;
     let Some(chain_state) = resolved else {
         // 未知链 → 404。
         state.metrics.record_ingress_rejected("unknown_chain");
-        return Json(jsonrpc_error(
-            Value::Null,
-            -32000,
-            &format!("rpcrouter: unknown chain id {chain_id}"),
-        ));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(jsonrpc_error(
+                Value::Null,
+                -32000,
+                &format!("rpcrouter: unknown chain id {chain_id}"),
+            )),
+        )
+            .into_response();
     };
     if chain_state.state_label() == crate::registry::ChainStateLabel::Disabled {
         state.metrics.record_ingress_rejected("chain_disabled");
-        return Json(jsonrpc_error(
-            Value::Null,
-            -32000,
-            &format!("rpcrouter: chain {chain_id} is disabled"),
-        ));
+        return (
+            StatusCode::FORBIDDEN,
+            Json(jsonrpc_error(
+                Value::Null,
+                -32000,
+                &format!("rpcrouter: chain {chain_id} is disabled"),
+            )),
+        )
+            .into_response();
     }
     // 0 端点链 → 503。
     let endpoint_count = state.registry.endpoint_count(chain_id).await;
     if endpoint_count == 0 {
         state.metrics.record_ingress_rejected("no_endpoints");
-        return Json(jsonrpc_error(
-            Value::Null,
-            -32000,
-            &format!("rpcrouter: chain {chain_id} has no public endpoints"),
-        ));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(jsonrpc_error(
+                Value::Null,
+                -32000,
+                &format!("rpcrouter: chain {chain_id} has no public endpoints"),
+            )),
+        )
+            .into_response();
     }
 
     let request: Box<RawValue> = match serde_json::from_slice(&body) {
         Ok(request) => request,
-        Err(_) => return Json(jsonrpc_error(Value::Null, -32700, "Parse error")),
+        Err(_) => return Json(jsonrpc_error(Value::Null, -32700, "Parse error")).into_response(),
     };
 
     match request.get().trim_start().as_bytes().first() {
-        Some(b'{') => Json(state.forwarder.execute_raw(chain_id, &request).await),
+        Some(b'{') => Json(state.forwarder.execute_raw(chain_id, &request).await).into_response(),
         Some(b'[') => {
             let requests: Vec<Box<RawValue>> = match serde_json::from_str(request.get()) {
                 Ok(requests) => requests,
-                Err(_) => return Json(jsonrpc_error(Value::Null, -32700, "Parse error")),
+                Err(_) => {
+                    return Json(jsonrpc_error(Value::Null, -32700, "Parse error")).into_response();
+                }
             };
             if requests.is_empty() {
                 return Json(jsonrpc_error(
                     Value::Null,
                     -32600,
                     "Invalid Request: batch must not be empty",
-                ));
+                ))
+                .into_response();
             }
             if requests.len() > state.batch_limit {
                 return Json(jsonrpc_error(
@@ -205,11 +222,12 @@ async fn rpc(Path(chain_id): Path<u64>, State(state): State<AppState>, body: Byt
                         "Invalid Request: batch exceeds limit of {}",
                         state.batch_limit
                     ),
-                ));
+                ))
+                .into_response();
             }
-            Json(execute_batch(chain_id, &state, requests).await)
+            Json(execute_batch(chain_id, &state, requests).await).into_response()
         }
-        _ => Json(jsonrpc_error(Value::Null, -32600, "Invalid Request")),
+        _ => Json(jsonrpc_error(Value::Null, -32600, "Invalid Request")).into_response(),
     }
 }
 
@@ -291,11 +309,13 @@ mod tests {
         http::{Request, StatusCode, header::CONTENT_TYPE},
         response::{IntoResponse, Response},
     };
+    use std::collections::HashSet;
+
     use tower::ServiceExt;
 
     use crate::{
-        chainlist::{ChainEndpoints, ChainlistSnapshot},
-        config::{Config, UpstreamConfig},
+        chainlist::{Catalog, CatalogChain, CatalogEndpoint, ChainEndpoints, ChainlistSnapshot},
+        config::{Config, DiscoveryConfig, UpstreamConfig},
     };
 
     use super::*;
@@ -534,5 +554,285 @@ mod tests {
             .expect("metrics body");
         let body = String::from_utf8(body.to_vec()).expect("metrics text");
         assert!(body.contains("rpcrouter_endpoint_state"));
+    }
+
+    // ── acceptance c: 语义边界 ──
+
+    fn v2_test_config() -> Config {
+        Config {
+            chains: vec![1], // pinned
+            discovery: DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            upstream: UpstreamConfig {
+                request_timeout_ms: 100,
+                slow_threshold_ms: 50,
+                deadline_ms: 500,
+                max_attempts: 2,
+                default_rps: 100,
+                default_concurrency: 8,
+            },
+            ..Config::default()
+        }
+    }
+
+    async fn v2_test_app_with_catalog(catalog: Catalog) -> Router {
+        let config = v2_test_config();
+        let registry = Arc::new(Registry::new(&config));
+        registry.set_catalog(Arc::new(catalog)).await;
+        // 预激活 pinned 链。
+        let _ = registry.resolve_for_request(1).await;
+        let forwarder = Arc::new(
+            Forwarder::new(Arc::clone(&registry), &config).expect("create test forwarder"),
+        );
+        router(AppState::new(
+            registry,
+            forwarder,
+            config.server.batch_limit,
+        ))
+    }
+
+    async fn post_json_status(app: Router, path: &str, value: Value) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::post(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(value.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn unknown_chain_returns_404_with_jsonrpc_error() {
+        let catalog = Catalog {
+            chains: vec![],
+            by_id: HashSet::new(),
+        };
+        let app = v2_test_app_with_catalog(catalog).await;
+
+        let (status, body) = post_json_status(
+            app,
+            "/rpc/999999",
+            json!({"jsonrpc":"2.0", "id":1, "method":"eth_blockNumber", "params":[]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], -32000);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown chain")
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_endpoint_chain_returns_503() {
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 127,
+                name: "Empty".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![], // 0 端点
+            }],
+            by_id: HashSet::from([127]),
+        };
+        let app = v2_test_app_with_catalog(catalog).await;
+
+        let (status, body) = post_json_status(
+            app,
+            "/rpc/127",
+            json!({"jsonrpc":"2.0", "id":1, "method":"eth_blockNumber", "params":[]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], -32000);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no public endpoints")
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_chain_returns_403() {
+        let config = Config {
+            chains: vec![],
+            discovery: DiscoveryConfig {
+                enabled: true,
+                deny: vec![13],
+                ..Default::default()
+            },
+            upstream: UpstreamConfig {
+                request_timeout_ms: 100,
+                slow_threshold_ms: 50,
+                deadline_ms: 500,
+                max_attempts: 2,
+                default_rps: 100,
+                default_concurrency: 8,
+            },
+            ..Config::default()
+        };
+        let registry = Arc::new(Registry::new(&config));
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 13,
+                name: "Blocked".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![CatalogEndpoint {
+                    url: "https://rpc.blocked.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashSet::from([13]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+        let forwarder = Arc::new(
+            Forwarder::new(Arc::clone(&registry), &config).expect("create test forwarder"),
+        );
+        let app = router(AppState::new(
+            registry,
+            forwarder,
+            config.server.batch_limit,
+        ));
+
+        let (status, body) = post_json_status(
+            app,
+            "/rpc/13",
+            json!({ "jsonrpc":"2.0", "id":1, "method":"eth_blockNumber", "params":[] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], -32000);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_boundary_ingress_rejected_not_user_visible_errors() {
+        // 验证：未知链/0端点/deny 错误计入 ingress_rejected，不计入 user_visible_errors。
+        let config = Config {
+            chains: vec![],
+            discovery: DiscoveryConfig {
+                enabled: true,
+                deny: vec![13],
+                ..Default::default()
+            },
+            upstream: UpstreamConfig {
+                request_timeout_ms: 100,
+                slow_threshold_ms: 50,
+                deadline_ms: 500,
+                max_attempts: 2,
+                default_rps: 100,
+                default_concurrency: 8,
+            },
+            ..Config::default()
+        };
+        let registry = Arc::new(Registry::new(&config));
+        let catalog = Catalog {
+            chains: vec![
+                CatalogChain {
+                    chain_id: 13,
+                    name: "Blocked".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "https://rpc.blocked.example".to_owned(),
+                        tracking: None,
+                    }],
+                },
+                CatalogChain {
+                    chain_id: 127,
+                    name: "Empty".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![],
+                },
+            ],
+            by_id: HashSet::from([13, 127]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+        let forwarder = Arc::new(
+            Forwarder::new(Arc::clone(&registry), &config).expect("create test forwarder"),
+        );
+        let metrics = forwarder.metrics();
+        let app = router(AppState::new(
+            Arc::clone(&registry),
+            forwarder,
+            config.server.batch_limit,
+        ));
+
+        let uve_before = registry.user_visible_errors();
+
+        // 未知链。
+        let _ = post_json_status(
+            app.clone(),
+            "/rpc/999999",
+            json!({ "jsonrpc":"2.0", "id":1, "method":"eth_blockNumber", "params":[] }),
+        )
+        .await;
+        // 0 端点链。
+        let _ = post_json_status(
+            app.clone(),
+            "/rpc/127",
+            json!({ "jsonrpc":"2.0", "id":1, "method":"eth_blockNumber", "params":[] }),
+        )
+        .await;
+        // deny 链。
+        let _ = post_json_status(
+            app.clone(),
+            "/rpc/13",
+            json!({ "jsonrpc":"2.0", "id":1, "method":"eth_blockNumber", "params":[] }),
+        )
+        .await;
+
+        // user_visible_errors 不增。
+        assert_eq!(registry.user_visible_errors(), uve_before);
+
+        // ingress_rejected 被记录（通过 metrics 编码验证）。
+        let encoded = metrics.encode(&registry).await.expect("encode");
+        assert!(encoded.contains("rpcrouter_ingress_rejected_total{reason=\"unknown_chain\"}"));
+        assert!(encoded.contains("rpcrouter_ingress_rejected_total{reason=\"no_endpoints\"}"));
+        assert!(encoded.contains("rpcrouter_ingress_rejected_total{reason=\"chain_disabled\"}"));
     }
 }

@@ -535,13 +535,24 @@ impl Registry {
         // 路由层用这个做语义判定：未知链 / 0端点 / disabled。
         // 先查 DashMap（已 materialized 的链）。
         if let Some(state) = self.chain(chain_id) {
-            // 更新 last_ingress：只在秒值变化时写入，避免 10k QPS 下缓存行争用。
-            let now_sec = unix_seconds();
-            let last = state.last_ingress.load(Ordering::Relaxed);
-            if now_sec != last {
-                state.last_ingress.store(now_sec, Ordering::Relaxed);
+            let label = state.state_label();
+            // disabled 链直接返回，由 server 层返回 403。
+            if label == ChainStateLabel::Disabled {
+                return Some(state);
             }
-            return Some(state);
+            // dormant 链（已降级，端点运行态已丢弃）需要重新 materialize。
+            if label == ChainStateLabel::Dormant {
+                // 删除旧 state，走慢路径重新 materialize。
+                self.chains.remove(&chain_id);
+            } else {
+                // pinned / hot：更新 last_ingress 并返回。
+                let now_sec = unix_seconds();
+                let last = state.last_ingress.load(Ordering::Relaxed);
+                if now_sec != last {
+                    state.last_ingress.store(now_sec, Ordering::Relaxed);
+                }
+                return Some(state);
+            }
         }
 
         // 未 materialized → 查目录。
@@ -553,14 +564,22 @@ impl Registry {
             return None; // 未知链
         }
 
+        // discovery.deny 链：只建 disabled 空状态（不 materialize 端点、不发激活 kick，
+        // 避免对被禁链做任何外呼/探针）。
+        if self.config.discovery.deny.contains(&chain_id) {
+            let name = catalog_entry
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("Chain {chain_id}"));
+            drop(catalog);
+            let state = Arc::new(ChainState::new(chain_id, name, pinned));
+            state.disabled.store(true, Ordering::Relaxed);
+            self.chains.insert(chain_id, Arc::clone(&state));
+            return Some(state);
+        }
+
         // 慢路径：materialize。
         drop(catalog);
         let state = self.materialize(chain_id, pinned).await?;
-
-        // discovery.deny 链 materialize 后立即标记为 disabled。
-        if self.config.discovery.deny.contains(&chain_id) {
-            state.disabled.store(true, Ordering::Relaxed);
-        }
 
         Some(state)
     }
@@ -1419,5 +1438,438 @@ mod tests {
         assert_eq!(state.state_label(), ChainStateLabel::Pinned); // pinned because in config.chains
         assert_eq!(registry.all_endpoints(1).await.len(), 1);
         assert_eq!(registry.chain_activations(), 1);
+    }
+
+    // ── acceptance b: lifecycle ──
+
+    #[tokio::test]
+    async fn dormant_chain_activates_on_first_request_and_becomes_hot() {
+        // 使用 discovery 模式（chains 为空），链在 catalog 中但未 pinned → dormant。
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 42,
+                name: "DynamicChain".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.dynamic.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashSet::from([42]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        // 激活前：不在 hot_chain_ids 中。
+        assert!(registry.hot_chain_ids().is_empty());
+
+        // 首次请求触发 materialize。
+        let state = registry.resolve_for_request(42).await.expect("chain 42");
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.all_endpoints(42).await.len(), 1);
+        assert_eq!(registry.chain_activations(), 1);
+
+        // 激活后：在 hot_chain_ids 中。
+        assert!(registry.hot_chain_ids().contains(&42));
+
+        // 再次请求复用已有 state。
+        let state2 = registry
+            .resolve_for_request(42)
+            .await
+            .expect("chain 42 again");
+        assert!(Arc::ptr_eq(&state, &state2));
+        assert_eq!(registry.chain_activations(), 1); // 不重复计数。
+    }
+
+    #[tokio::test]
+    async fn idle_chain_is_demoted_to_dormant() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                idle_seconds: 1, // 1 秒后降级
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 7,
+                name: "FastIdle".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.fast.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashSet::from([7]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        // 激活链。
+        let _ = registry.resolve_for_request(7).await.expect("chain 7");
+        assert_eq!(registry.all_endpoints(7).await.len(), 1);
+        assert_eq!(registry.chain_counts().await.hot, 1);
+
+        // 等待 idle 超时（1 秒）。
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // housekeeping 降级。
+        registry.housekeeping().await;
+
+        // 验证已降级。
+        let counts = registry.chain_counts().await;
+        assert_eq!(counts.hot, 0);
+        assert_eq!(counts.dormant, 1);
+        assert_eq!(registry.all_endpoints(7).await.len(), 0); // 端点运行态丢弃。
+        let (idle, lru, admin) = registry.chain_demotions();
+        assert_eq!(idle, 1);
+        assert_eq!(lru, 0);
+        assert_eq!(admin, 0);
+    }
+
+    #[tokio::test]
+    async fn pinned_chain_is_never_demoted_by_idle_or_lru() {
+        let config = Config {
+            chains: vec![1], // pinned
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                idle_seconds: 1,
+                max_hot_chains: 0, // 容不下任何 hot 链
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 1,
+                name: "Pinned".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.pinned.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashSet::from([1]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        let _ = registry.resolve_for_request(1).await.expect("chain 1");
+        assert_eq!(registry.chain_counts().await.pinned, 1);
+
+        // 等待 idle 超时。
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        registry.housekeeping().await;
+
+        // pinned 不降级。
+        let counts = registry.chain_counts().await;
+        assert_eq!(counts.pinned, 1);
+        assert_eq!(counts.dormant, 0);
+        assert_eq!(registry.all_endpoints(1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn demote_clears_endpoints_and_chain_can_reactivate() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                max_hot_chains: 256,
+                idle_seconds: 86_400,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 1,
+                name: "Test".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc1.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashSet::from([1]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        let _ = registry.resolve_for_request(1).await.expect("chain 1");
+        assert_eq!(registry.all_endpoints(1).await.len(), 1);
+
+        // 手动 demote（模拟 LRU）。
+        assert!(registry.demote(1, "lru").await);
+        assert_eq!(registry.all_endpoints(1).await.len(), 0);
+        assert_eq!(registry.chain_counts().await.dormant, 1);
+
+        // 重新激活。
+        let state = registry
+            .resolve_for_request(1)
+            .await
+            .expect("chain 1 re-activate");
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.all_endpoints(1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn housekeeping_lru_evicts_when_over_max_hot_chains() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                max_hot_chains: 2,
+                idle_seconds: 86_400, // 极大，不会 idle 降级
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+
+        // 在目录中放入 3 条链。
+        let mut chains = Vec::new();
+        let mut ids = HashSet::new();
+        for i in 1..=3u64 {
+            ids.insert(i);
+            chains.push(CatalogChain {
+                chain_id: i,
+                name: format!("Chain{i}"),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: format!("https://rpc{i}.example"),
+                    tracking: None,
+                }],
+            });
+        }
+        registry
+            .set_catalog(Arc::new(Catalog { chains, by_id: ids }))
+            .await;
+
+        // 激活全部 3 条链。
+        let _ = registry.resolve_for_request(1).await.expect("chain 1");
+        let _ = registry.resolve_for_request(2).await.expect("chain 2");
+        let _ = registry.resolve_for_request(3).await.expect("chain 3");
+        assert_eq!(registry.chain_counts().await.hot, 3);
+
+        // housekeeping: max_hot_chains=2，应淘汰 1 条链。
+        registry.housekeeping().await;
+
+        let counts = registry.chain_counts().await;
+        assert_eq!(counts.hot, 2);
+        assert_eq!(counts.dormant, 1);
+
+        // 恰好 1 条链被淘汰（端点清空）。
+        let mut evicted = Vec::new();
+        for id in [1u64, 2, 3] {
+            if registry.all_endpoints(id).await.len() == 0 {
+                evicted.push(id);
+            }
+        }
+        assert_eq!(evicted.len(), 1, "exactly one chain should be evicted");
+
+        let (idle, lru, _) = registry.chain_demotions();
+        assert_eq!(idle, 0);
+        assert_eq!(lru, 1);
+
+        // 被淘汰的链可重新激活。
+        let evicted_id = evicted[0];
+        let state = registry
+            .resolve_for_request(evicted_id)
+            .await
+            .expect("chain re-activate");
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.all_endpoints(evicted_id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn demoted_chain_can_be_re_activated() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                idle_seconds: 1,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 99,
+                name: "Phantom".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.phantom.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashSet::from([99]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        // 激活。
+        let s1 = registry.resolve_for_request(99).await.expect("chain 99");
+        assert_eq!(s1.state_label(), ChainStateLabel::Hot);
+
+        // 降级。
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        registry.housekeeping().await;
+        assert_eq!(registry.chain_counts().await.hot, 0);
+
+        // 重新激活。
+        let s2 = registry
+            .resolve_for_request(99)
+            .await
+            .expect("chain 99 again");
+        assert_eq!(s2.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.all_endpoints(99).await.len(), 1);
+        // 激活计数为 2（两次 materialize）。
+        assert_eq!(registry.chain_activations(), 2);
+    }
+
+    #[tokio::test]
+    async fn deny_chain_is_marked_disabled_on_materialize() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                deny: vec![13],
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 13,
+                name: "Blocked".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.blocked.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashSet::from([13]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        let state = registry.resolve_for_request(13).await.expect("chain 13");
+        assert_eq!(state.state_label(), ChainStateLabel::Disabled);
+    }
+
+    #[tokio::test]
+    async fn chainstate_label_reflects_current_state() {
+        let config = Config {
+            chains: vec![100],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 100,
+                name: "LabelTest".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![],
+            }],
+            by_id: HashSet::from([100]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        // pinned。
+        let state = registry.resolve_for_request(100).await.expect("chain 100");
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned);
+
+        // unpin → hot。
+        registry.set_pinned(100, false).await;
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+
+        // disable。
+        registry.set_disabled(100, true).await;
+        assert_eq!(state.state_label(), ChainStateLabel::Disabled);
+
+        // re-enable → hot。
+        registry.set_disabled(100, false).await;
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+
+        // demote → dormant。
+        assert!(registry.demote(100, "admin").await);
+        assert_eq!(state.state_label(), ChainStateLabel::Dormant);
+
+        // pinned 不降级。
+        registry.set_pinned(100, true).await;
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned);
+        assert!(!registry.demote(100, "idle").await);
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned);
     }
 }

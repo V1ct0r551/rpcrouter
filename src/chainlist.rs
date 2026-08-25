@@ -93,6 +93,19 @@ pub enum RefreshSource {
     Fixture,
 }
 
+impl RefreshSource {
+    /// Prometheus `source` 标签值（小写 snake_case，与 DESIGN-v2 §8 一致）。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::NotModified => "not_modified",
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+            Self::Fixture => "fixture",
+        }
+    }
+}
+
 /// 兼容旧代码的类型别名。
 pub type SnapshotSource = RefreshSource;
 
@@ -137,6 +150,7 @@ pub struct ChainlistLoader {
     url: String,
     cache_path: PathBuf,
     discovery_enabled: bool,
+    include_testnets: bool,
     pinned_chains: HashSet<u64>,
     state: Mutex<LoaderState>,
 }
@@ -152,6 +166,7 @@ impl ChainlistLoader {
             config.chainlist.url.clone(),
             config.chainlist.cache_path.clone(),
             config.discovery.enabled,
+            config.discovery.include_testnets,
             config.chains.iter().copied(),
         )
     }
@@ -161,6 +176,7 @@ impl ChainlistLoader {
         url: String,
         cache_path: PathBuf,
         discovery_enabled: bool,
+        include_testnets: bool,
         pinned_chains: impl IntoIterator<Item = u64>,
     ) -> Result<Self> {
         Url::parse(&url).with_context(|| format!("invalid chainlist URL {url}"))?;
@@ -169,6 +185,7 @@ impl ChainlistLoader {
             url,
             cache_path,
             discovery_enabled,
+            include_testnets,
             pinned_chains: pinned_chains.into_iter().collect(),
             state: Mutex::new(LoaderState::default()),
         })
@@ -182,7 +199,7 @@ impl ChainlistLoader {
         allowed_chains: impl IntoIterator<Item = u64>,
     ) -> Result<Self> {
         let allowed: HashSet<_> = allowed_chains.into_iter().collect();
-        Self::with_client(client, url, cache_path, false, allowed)
+        Self::with_client(client, url, cache_path, false, true, allowed)
     }
 
     /// 优先联网刷新；失败后依次回退到进程内快照、磁盘缓存和内置样例。
@@ -206,7 +223,12 @@ impl ChainlistLoader {
         }
 
         match tokio::fs::read(&self.cache_path).await {
-            Ok(bytes) => match parse_catalog(&bytes, self.discovery_enabled, &self.pinned_chains) {
+            Ok(bytes) => match parse_catalog(
+                &bytes,
+                self.discovery_enabled,
+                self.include_testnets,
+                &self.pinned_chains,
+            ) {
                 Ok((catalog, snapshot)) => {
                     return Ok(self.remember(catalog, snapshot, RefreshSource::Disk).await);
                 }
@@ -224,9 +246,13 @@ impl ChainlistLoader {
             ),
         }
 
-        let (catalog, snapshot) =
-            parse_catalog(BUILTIN_FIXTURE, self.discovery_enabled, &self.pinned_chains)
-                .context("built-in chainlist fixture is invalid")?;
+        let (catalog, snapshot) = parse_catalog(
+            BUILTIN_FIXTURE,
+            self.discovery_enabled,
+            self.include_testnets,
+            &self.pinned_chains,
+        )
+        .context("built-in chainlist fixture is invalid")?;
         Ok(self
             .remember(catalog, snapshot, RefreshSource::Fixture)
             .await)
@@ -308,9 +334,13 @@ impl ChainlistLoader {
             .bytes()
             .await
             .context("failed to read chainlist response")?;
-        let (catalog, snapshot) =
-            parse_catalog(&bytes, self.discovery_enabled, &self.pinned_chains)
-                .context("chainlist response is invalid")?;
+        let (catalog, snapshot) = parse_catalog(
+            &bytes,
+            self.discovery_enabled,
+            self.include_testnets,
+            &self.pinned_chains,
+        )
+        .context("chainlist response is invalid")?;
         if let Err(error) = persist_cache(&self.cache_path, &bytes).await {
             warn!(
                 path = %self.cache_path.display(),
@@ -382,10 +412,11 @@ async fn persist_cache(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// 解析全部链为 Catalog（+ 兼容的 ChainlistSnapshot）。
 /// 过滤规则：https-only、剔 `${KEY}` 模板、剔带 userinfo、去重、去 fragment。
-/// discovery_enabled=false 时只保留 pinned 链。
+/// discovery_enabled=false 时只保留 pinned 链；include_testnets=false 时过滤 testnet（pinned 除外）。
 pub fn parse_catalog(
     bytes: &[u8],
     discovery_enabled: bool,
+    include_testnets: bool,
     pinned_chains: &HashSet<u64>,
 ) -> Result<(Catalog, ChainlistSnapshot)> {
     let document: ChainlistDocument =
@@ -397,7 +428,12 @@ pub fn parse_catalog(
 
     let all_chains: Vec<CatalogChain> = records
         .into_iter()
-        .filter(|record| discovery_enabled || pinned_chains.contains(&record.chain_id))
+        .filter(|record| {
+            let pinned = pinned_chains.contains(&record.chain_id);
+            let is_testnet = record.is_testnet.unwrap_or(false);
+            // pinned 始终保留；discovery 开启时按 include_testnets 决定是否纳入 testnet。
+            pinned || (discovery_enabled && (include_testnets || !is_testnet))
+        })
         .map(|record| {
             let mut seen = HashSet::new();
             let endpoints: Vec<CatalogEndpoint> = record
@@ -458,7 +494,7 @@ pub fn parse_catalog(
 
 /// 旧版 parse_and_filter（兼容现有测试）。始终解析全部链，按 allowed_chains 过滤。
 pub fn parse_and_filter(bytes: &[u8], allowed_chains: &HashSet<u64>) -> Result<ChainlistSnapshot> {
-    let (_, snapshot) = parse_catalog(bytes, false, allowed_chains)?;
+    let (_, snapshot) = parse_catalog(bytes, false, true, allowed_chains)?;
     Ok(snapshot)
 }
 
@@ -496,6 +532,7 @@ struct ChainRecord {
     #[serde(default)]
     slug: Option<String>,
     #[serde(default)]
+    #[serde(rename = "isTestnet")]
     is_testnet: Option<bool>,
     #[serde(default)]
     #[serde(rename = "nativeCurrency")]
@@ -647,7 +684,7 @@ mod tests {
     #[test]
     fn catalog_parses_all_chains_with_metadata() {
         let (catalog, snapshot) =
-            parse_catalog(BUILTIN_FIXTURE, true, &HashSet::new()).expect("parse catalog");
+            parse_catalog(BUILTIN_FIXTURE, true, true, &HashSet::new()).expect("parse catalog");
         // 有至少 2 条链
         assert!(catalog.chains.len() >= 2);
         // 有 chain 字段
@@ -667,16 +704,147 @@ mod tests {
     #[test]
     fn catalog_parse_when_discovery_disabled_filters_to_pinned() {
         let pinned: HashSet<u64> = HashSet::from([1]);
-        let (catalog, _) = parse_catalog(BUILTIN_FIXTURE, false, &pinned).expect("parse catalog");
+        let (catalog, _) =
+            parse_catalog(BUILTIN_FIXTURE, false, true, &pinned).expect("parse catalog");
         assert_eq!(catalog.chains.len(), 1);
         assert_eq!(catalog.chains[0].chain_id, 1);
     }
 
     #[test]
+    fn catalog_excludes_testnets_when_include_testnets_false() {
+        let (catalog, _) =
+            parse_catalog(BUILTIN_FIXTURE, true, false, &HashSet::new()).expect("parse catalog");
+        // include_testnets=false 时 testnet 链（Hoodi/Sepolia）不进目录。
+        assert!(!catalog.chains.iter().any(|c| c.is_testnet));
+        // 主网链仍在。
+        assert!(catalog.lookup(1).is_some());
+    }
+
+    #[test]
+    fn catalog_keeps_pinned_testnet_when_include_testnets_false() {
+        let pinned: HashSet<u64> = HashSet::from([560048]);
+        let (catalog, _) =
+            parse_catalog(BUILTIN_FIXTURE, true, false, &pinned).expect("parse catalog");
+        // pinned 的 testnet 链仍保留。
+        assert!(catalog.lookup(560048).is_some());
+        // 其他 testnet 链被过滤。
+        assert!(!catalog.lookup(11155111).is_some());
+    }
+
+    #[test]
     fn catalog_unknown_chain_returns_none() {
         let (catalog, _) =
-            parse_catalog(BUILTIN_FIXTURE, true, &HashSet::new()).expect("parse catalog");
+            parse_catalog(BUILTIN_FIXTURE, true, true, &HashSet::new()).expect("parse catalog");
         assert!(catalog.lookup(999999).is_none());
+    }
+
+    #[test]
+    fn fixture_has_testnet_chains() {
+        let (catalog, _) =
+            parse_catalog(BUILTIN_FIXTURE, true, true, &HashSet::new()).expect("parse catalog");
+        let testnets: Vec<_> = catalog.chains.iter().filter(|c| c.is_testnet).collect();
+        assert!(
+            testnets.len() >= 2,
+            "fixture must contain at least 2 testnet chains"
+        );
+        // 验证 testnet chain_id 均正确。
+        let testnet_ids: HashSet<u64> = testnets.iter().map(|c| c.chain_id).collect();
+        assert!(testnet_ids.contains(&560048)); // Hoodi
+        assert!(testnet_ids.contains(&11155111)); // Sepolia
+    }
+
+    #[test]
+    fn fixture_has_zero_endpoint_chain() {
+        let (catalog, _) =
+            parse_catalog(BUILTIN_FIXTURE, true, true, &HashSet::new()).expect("parse catalog");
+        let zero_ep: Vec<_> = catalog
+            .chains
+            .iter()
+            .filter(|c| c.endpoints.is_empty())
+            .collect();
+        assert!(
+            !zero_ep.is_empty(),
+            "fixture must contain at least one chain with 0 endpoints"
+        );
+        // Factory 127 在真实 chainlist 中无端点。
+        assert!(zero_ep.iter().any(|c| c.chain_id == 127));
+    }
+
+    #[test]
+    fn fixture_has_status_fields() {
+        let (catalog, _) =
+            parse_catalog(BUILTIN_FIXTURE, true, true, &HashSet::new()).expect("parse catalog");
+        let with_status: Vec<_> = catalog
+            .chains
+            .iter()
+            .filter(|c| c.status.is_some())
+            .collect();
+        assert!(
+            !with_status.is_empty(),
+            "fixture must contain at least one chain with a status field"
+        );
+        // Base (8453) 和 Ink (57073) 有 status="active"。
+        assert!(with_status.iter().any(|c| c.chain_id == 8453));
+    }
+
+    #[test]
+    fn fixture_has_tracking_endpoints() {
+        let (catalog, _) =
+            parse_catalog(BUILTIN_FIXTURE, true, true, &HashSet::new()).expect("parse catalog");
+        let has_tracking = catalog
+            .chains
+            .iter()
+            .any(|c| c.endpoints.iter().any(|e| e.tracking.is_some()));
+        assert!(
+            has_tracking,
+            "fixture must have endpoints with tracking field"
+        );
+    }
+
+    #[test]
+    fn fixture_filters_template_and_wss_endpoints() {
+        let (catalog, _) =
+            parse_catalog(BUILTIN_FIXTURE, true, true, &HashSet::new()).expect("parse catalog");
+        // 所有端点 URL 必须是 https 且不含 ${。
+        for chain in &catalog.chains {
+            for ep in &chain.endpoints {
+                assert!(
+                    ep.url.starts_with("https://"),
+                    "endpoint URL must be https: {}",
+                    ep.url
+                );
+                assert!(
+                    !ep.url.contains("${"),
+                    "endpoint URL must not contain template: {}",
+                    ep.url
+                );
+            }
+        }
+        // 验证：Arbitrum (42161) 的 fixture 包含 ${KEY} 模板端点，解析后应被过滤。
+        let arb = catalog.lookup(42161).expect("Arbitrum in fixture");
+        // 模板端点已被过滤，所有端点都是 https。
+        assert!(
+            arb.endpoints.iter().all(|e| !e.url.contains("${")),
+            "Arbitrum endpoints must not contain template variables"
+        );
+    }
+
+    #[test]
+    fn fixture_catalog_dedup_assertion() {
+        let (catalog, _) =
+            parse_catalog(BUILTIN_FIXTURE, true, true, &HashSet::new()).expect("parse catalog");
+        // 每条链的端点 URL 无重复。
+        for chain in &catalog.chains {
+            let mut seen = HashSet::new();
+            for ep in &chain.endpoints {
+                assert!(
+                    seen.insert(&ep.url),
+                    "duplicate endpoint URL in chain {}: {}",
+                    chain.chain_id,
+                    ep.url
+                );
+            }
+        }
     }
 
     #[tokio::test]
