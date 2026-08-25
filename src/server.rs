@@ -354,6 +354,9 @@ mod tests {
                 let request: Value = serde_json::from_slice(&body).expect("single JSON request");
                 assert!(request.is_object(), "batch must be split before forwarding");
                 let method = request["method"].as_str().unwrap_or_default();
+                if method == "fail_method" {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
                 match method {
                     "slow_method" => tokio::time::sleep(Duration::from_millis(30)).await,
                     "medium_method" => tokio::time::sleep(Duration::from_millis(15)).await,
@@ -511,6 +514,45 @@ mod tests {
         assert_eq!(responses[1]["id"], 2);
         assert_eq!(responses[2]["id"], 3);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_attributes_probation_failure_as_cold_start() {
+        let (base, _) = spawn_mock().await;
+        let config = test_config(100);
+        let registry = Arc::new(Registry::new(&config));
+        registry
+            .apply_snapshot(&ChainlistSnapshot {
+                chains: vec![ChainEndpoints {
+                    chain_id: 1,
+                    name: "Cold Batch".to_owned(),
+                    endpoints: vec![format!("{base}/rpc")],
+                }],
+            })
+            .await;
+        let forwarder =
+            Arc::new(Forwarder::new(Arc::clone(&registry), &config).expect("create forwarder"));
+        let metrics = forwarder.metrics();
+        let app = router(AppState::new(
+            Arc::clone(&registry),
+            forwarder,
+            config.server.batch_limit,
+        ));
+        let response = post_json(
+            app,
+            "/rpc/1",
+            json!([
+                {"jsonrpc":"2.0", "id":1, "method":"ok_method", "params":[]},
+                {"jsonrpc":"2.0", "id":2, "method":"fail_method", "params":[]}
+            ]),
+        )
+        .await;
+        let items = response.as_array().expect("batch");
+        assert_eq!(items[0]["result"], "ok_method");
+        assert_eq!(items[1]["error"]["data"]["reason"], "cold_start");
+        assert_eq!(registry.user_visible_errors(), 0);
+        let encoded = metrics.encode(&registry).await.expect("metrics");
+        assert!(encoded.contains("rpcrouter_cold_start_failures_total{chain_id=\"1\"} 1"));
     }
 
     #[tokio::test]
