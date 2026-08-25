@@ -77,8 +77,8 @@
 ## P5 长期
 
 - WebSocket 订阅透传（eth_subscribe）
-- **横向扩展**（DESIGN-v2 §12）：Phase A 按 chainId 一致性哈希分片部署（`deploy/nginx-shard.conf`，
-  零代码）；Phase B 实例注册/集群视图、覆写与冷却事件 pub/sub 广播、Redis Lua 分布式每端点
+- **横向扩展**（DESIGN-v2 §12）：**已选定方案 A** 按 chainId 一致性哈希分片部署（`deploy/nginx-shard.conf`，
+  零代码；compose `cluster` profile 在 W6 交付）；Phase B 为备选： 实例注册/集群视图、覆写与冷却事件 pub/sub 广播、Redis Lua 分布式每端点
   令牌桶、可选 L2 共享缓存、自路由模式、pinned 分片感知
 - simd-json 热路径（压测显示当前 p99 4.6ms，未到瓶颈，暂缓）
 - chainlist 之外的端点源聚合（eRPC 公开目录等，许可与条款先行评估）

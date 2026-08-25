@@ -69,6 +69,11 @@
 4. 重置/覆盖：`--reset-state` / `RPCROUTER_STATE_RESET=1` / `import()` / `export()` / `reset()`。
 5. 指标 4 个（§11.4）+ alerts 一条（state store down）+ docker-compose 加 redis 服务 +
    OPERATIONS「状态存储」章节。
+6. 多实例分片部署样例（DESIGN-v2 §12 方案 A，用户已选定）：docker-compose 增加 `cluster`
+   profile（nginx 用 `deploy/nginx-shard.conf` + 3 个 rpcrouter 实例共用同一 Redis），README
+   「部署」新增「多实例分片」小节，OPERATIONS 新增「扩容/缩容与故障接管」说明；本机用
+   compose 起 cluster 后对 3 条不同链各打一次请求，确认每条链只落在一个实例（看各实例
+   `/chains` 的 hot 集合）——结果写进交付说明。
 
 W6a 验收（单测跑 Memory/File 实现，全离线；Redis 实现用 `#[ignore]` 集成测试，`REDIS_URL` 未设时跳过）：
 - a) 从零初始化：空 store 启动 → meta/catalog 写入、覆写为空；再次启动不重复 seed；schema 版本

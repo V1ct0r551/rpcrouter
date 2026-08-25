@@ -309,10 +309,11 @@ Probation 起步——不恢复 Active（探针必须重新证明）。
 
 > 用户问题：部署 rpcrouter 的机器要扛住所有链的访问，流量单点怎么办？更平滑的横向扩展方式？
 
-**原则：按 chainId 一致性哈希分片 + 无状态实例 + Redis 共享镜像。** 不用轮询：轮询会把每条链的
+**决策（2026-08-25，用户选定方案 A）：按 chainId 一致性哈希分片 + 无状态实例 + Redis 共享镜像；
+Phase B 各项仅作为 P5 备选，按需再立项。** 不用轮询：轮询会把每条链的
 缓存/折叠/健康学习/每端点出站限流复制 N 份，缓存命中率下降、公共节点实际承受 N×15 rps、探针 ×N。
 
-### Phase A（零代码改动，部署即得）
+### Phase A（已选定；零代码改动，部署即得）
 - N 个实例（同一 config + 同一 Redis）放在 nginx/HAProxy/云 LB 后，LB 对 `/rpc/{chainId}` 做
   **一致性哈希**（样例 `deploy/nginx-shard.conf`）。每条链固定落一个实例：
   - 缓存与 in-flight 折叠局部性最好；每端点 15 rps / 8 并发上限仍然准确（不随实例数放大）；
@@ -324,7 +325,7 @@ Probation 起步——不恢复 Active（探针必须重新证明）。
   5–10 万 rps 以上；LB 自身用 keepalived/云 LB/多 A 记录做 HA；跨地域用 GeoDNS 分集群。
 - Redis HA 用 Sentinel/托管服务；因 `state.required=false` 降级模式，Redis 故障不影响出流量。
 
-### Phase B（P5 代码项，按需）
+### Phase B（未选定，P5 备选，按需）
 1. **实例注册与集群视图**：`{ns}:instance:{id}` 心跳 hash（TTL 15s）+ 各实例摘要；
    `GET /admin/api/cluster` 任一实例返回全集群；dashboard 集群页。
 2. **覆写广播**：管理操作写 Redis 后 `PUBLISH {ns}:events`，所有实例订阅并即时应用
