@@ -168,6 +168,9 @@ impl Config {
         if let Some(raw) = env_non_empty("RPCROUTER_ADMIN_STATIC_DIR") {
             self.admin.static_dir = Some(PathBuf::from(raw));
         }
+        if let Some(raw) = env_non_empty("RPCROUTER_ADMIN_PUBLIC_SITE") {
+            self.admin.public_site = parse_bool(&raw, "RPCROUTER_ADMIN_PUBLIC_SITE")?;
+        }
         self.validate()
     }
 
@@ -551,6 +554,7 @@ pub struct StateConfig {
 #[serde(default)]
 pub struct AdminConfig {
     pub enabled: bool,
+    pub public_site: bool,
     pub auth_token: Option<String>,
     pub static_dir: Option<PathBuf>,
     pub cors_allow_origins: Vec<String>,
@@ -561,6 +565,7 @@ impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            public_site: true,
             auth_token: None,
             static_dir: None,
             cors_allow_origins: Vec::new(),
