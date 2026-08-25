@@ -1707,6 +1707,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_demotion_sample_cannot_clear_recent_ingress() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 77,
+                    name: "Race".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "http://race".to_owned(),
+                        tracking: None,
+                    }],
+                }],
+                by_id: HashMap::from([(77, 0)]),
+            }))
+            .await;
+        let state = registry.resolve_for_request(77).await.expect("state");
+        let sampled = unix_seconds().saturating_sub(10);
+        state.last_ingress.store(sampled, Ordering::Relaxed);
+        registry
+            .resolve_for_request(77)
+            .await
+            .expect("recent ingress");
+        assert!(!registry.demote_if_unchanged(77, "lru", sampled).await);
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.user_visible_errors(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_pin_state_survives_snapshot_refresh_and_unpin_stays_hot() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 1,
+                    name: "Runtime".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "http://runtime".to_owned(),
+                        tracking: None,
+                    }],
+                }],
+                by_id: HashMap::from([(1, 0)]),
+            }))
+            .await;
+        let state = registry.resolve_for_request(1).await.expect("state");
+        registry
+            .apply_snapshot(&snapshot(&["http://runtime"]))
+            .await;
+        assert!(registry.set_pinned(1, true).await);
+        registry
+            .apply_snapshot(&snapshot(&["http://runtime"]))
+            .await;
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned);
+        assert!(registry.set_pinned(1, false).await);
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        registry
+            .apply_snapshot(&snapshot(&["http://runtime"]))
+            .await;
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+    }
+
+    #[tokio::test]
     async fn discovery_disabled_only_serves_pinned_chains() {
         let config = Config {
             chains: vec![1],
