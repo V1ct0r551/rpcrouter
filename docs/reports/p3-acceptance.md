@@ -48,7 +48,7 @@
 
 ### 6. Dashboard（W7）
 - 真实后端联调：总览（2887 链目录）、链列表搜索/过滤、链详情（78 个 endpointRows）、缓存清理生效；`writable=false` 时控制按钮禁用。
-- 镜像内置：`docker build` 后容器 `/dashboard/` 返回 index.html；构建产物无外链运行时资源。
+- 镜像内置：main 上 `docker build -t rpcrouter:p3 .` 成功（148 MB，含 node 构建阶段）；容器内 `/dashboard/` 200 text/html，`/admin/api/overview` 返回 2887 链目录；构建产物无外链运行时资源。
 
 ## 已知遗留（不阻塞，记入 DESIGN-v2 §13 / TASKS-v2）
 - W6 should-fix S7（optional 模式 Redis schema 不一致的从零初始化）、S8（审计 before/after 细化）、S12（API reset 后立即重新 seed）为最小实现。
