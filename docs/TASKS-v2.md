@@ -123,7 +123,8 @@ W6b 验收（离线，axum `oneshot` + 进程内 mock 上游 + MemoryStore）：
 - d) overview/chains/chains/{id} 字段与 DESIGN-v2 §6 契约一致（用 serde 结构体 + 快照断言）；
 - e) `static_dir` 存在时 `/dashboard/`、`/dashboard/chains/1` 均返回 index.html；三门槛全绿。
 
-## W7 — React Dashboard（分支 `w7-dashboard`，目录 `dashboard/`，基于 W6 合入后的 main）
+## W7 — React Dashboard（分支 `w7-dashboard`，目录 `dashboard/`）✅ 2026-08-25 合入 main
+（四门槛 6 用例；真实后端联调 + docker 镜像验证；报告 docs/reports/p3-acceptance.md）
 
 > 设置页增加「状态存储」卡片（后端/连通性/最近 flush/脏端点数）与 export / import / reset
 > 操作（reset 需二次确认）。

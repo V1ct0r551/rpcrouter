@@ -44,7 +44,7 @@
 5. **soak**：真实网络低 QPS（≤5）长跑 24h，观察摘除/回池分布与内存曲线。
 6. /metrics 绑定内网地址或加简单鉴权开关。
 
-## P3 动态全链目录 + 状态控制 Dashboard（2026-08-25 立项，进行中）
+## P3 动态全链目录 + 状态控制 Dashboard（✅ 2026-08-25 立项并交付，见 docs/reports/p3-acceptance.md）
 
 > 需求：从固定 8 链扩展到**实时动态获取并支持 chainlist `rpcs.json` 里的全部链**
 > （2877 条），并提供状态控制 Dashboard（独立 React 工程 `dashboard/`，经 REST API 与
@@ -56,7 +56,7 @@
 2. **W6 状态存储层（Redis）+ Admin REST API**（✅ 2026-08-25 合入）：`StateStore`（Redis / file / memory）持久化运行时
    覆写、端点健康快照、热链集合与审计，支持从零初始化 / 整体覆盖导入 / 重置，Redis 不可用可降级；
    `/admin/api/*` 只读 + 控制接口，bearer 鉴权（无 token 则控制接口 403），可选托管前端静态产物。
-3. **W7 React Dashboard**：总览 / 链列表 / 链详情 / 设置；亮暗主题；CI 前端 job；镜像内置。
+3. **W7 React Dashboard**（✅ 2026-08-25 合入）：总览 / 链列表 / 链详情 / 设置；亮暗主题；CI 前端 job；镜像内置。
 
 ## P4 命名链路由（对齐 ChainUp 网关形态）
 

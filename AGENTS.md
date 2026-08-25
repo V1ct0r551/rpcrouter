@@ -62,8 +62,8 @@ v1 已交付（2026-07-26 验收）。后续任务规划统一沉淀在 `docs/RO
 - [x] ROADMAP P1 部署 + P2 生产可用（2026-08-20 验收，maker/checker 对抗流程交付；
       真实环境验收见 `docs/reports/prod-readiness.md`：docker 8 链 smoke、加固特性实测、
       监控栈实跑、CI 首跑绿灯、30 分钟真实网络 soak 0 错误）。遗留：24h soak。
-- [ ] ROADMAP P3 动态全链目录 + 状态控制 Dashboard（2026-08-25 立项；W5 → W6 → W7 串行
-      推进，见 docs/TASKS-v2.md）。前端为独立 React 工程 `dashboard/`，前端门槛：
+- [x] ROADMAP P3 动态全链目录 + 状态控制 Dashboard（2026-08-25 立项并交付；W5 → W6 → W7，
+      验收报告 docs/reports/p3-acceptance.md）。前端为独立 React 工程 `dashboard/`，前端门槛：
       `npm run lint && npm run typecheck && npm test && npm run build`。
   - [x] W5 动态目录 + 链生命周期（2026-08-25 合入：目录 2887 链 / 5562 端点，pinned/hot/dormant/
         disabled 生命周期，未知链 404 / 无端点 503 / 禁用 403 不计 UVE，冷启动失败单独计数，
@@ -72,4 +72,4 @@ v1 已交付（2026-07-26 验收）。后续任务规划统一沉淀在 `docs/RO
         key 为真相、从零初始化/覆盖/重置、Redis 不可达 ≤3s 降级启动且控制写 503；后台任务监督器；
         `/admin/api/*` 只读 + 控制接口，bearer 鉴权、静态托管防穿越、输入校验；compose redis +
         cluster 分片 profile（方案 A）；见 docs/reports/w6-state-admin.md）。
-  - [ ] W7 React dashboard（`dashboard/`，进行中）。
+  - [x] W7 React dashboard（2026-08-25 合入：总览/链列表/链详情/设置，四门槛 + CI job + 镜像内置）。
