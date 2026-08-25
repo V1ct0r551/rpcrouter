@@ -4,9 +4,9 @@
 
 使用 release 构建、进程内 mock 上游、10,000 请求并发调度 60 秒：
 
-- achieved_qps：9,999.817
-- p50：0.171ms
-- p99：1.091ms
+- achieved_qps：9,999.699
+- p50：0.169ms
+- p99：1.494ms
 - hit + coalesce：99.9948%
 - user_visible_errors：0
 
