@@ -4,3 +4,10 @@
 /data/
 *.log
 .DS_Store
+dashboard/node_modules
+dashboard/dist
+dashboard/*.tsbuildinfo
+dashboard/vite.config.js
+dashboard/vite.config.d.ts
+dashboard/vitest.config.js
+dashboard/vitest.config.d.ts
