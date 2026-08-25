@@ -52,9 +52,38 @@
 - g) 性能：`scripts/ci-smoke.sh` 通过；本机 `cargo run --release --bin loadtest`（10k×60s）
      与 loadtest-phase3.md 对比 p99 无明显退化（±20% 内），结果写进交付说明。
 
-## W6 — Admin REST API + 运行时覆写持久化（分支 `w6-admin-api`，基于 W5 合入后的 main）
+## W6 — 状态存储层（Redis）+ Admin REST API（分支 `w6-state-admin`，基于 W5 合入后的 main）
 
-范围（DESIGN-v2 §6、§9）：
+> 2026-08-25 增补：用户决定用 Redis 做持久状态（重启不丢），要求支持从 0 初始化与整体覆盖，
+> 方案见 DESIGN-v2 §11。本工作流拆两段串行交付：**W6a 状态存储层** → **W6b Admin REST API**，
+> 同一分支、一次 checker 审查。本机无 redis-server，集成测试用
+> `docker run -d --name rpcrouter-redis -p 127.0.0.1:6379:6379 redis:7-alpine`（用完可停）。
+
+### W6a 状态存储层（DESIGN-v2 §11）
+1. `state` 模块：`StateStore` trait + `MemoryStore` / `FileStore`（`data/state.json` 原子写）/
+   `RedisStore`（`redis` crate，tokio-comp + connection-manager，pipeline/MULTI）；`[state]` 配置 +
+   环境变量；`required` 语义；断连降级与后台重连、恢复后全量 flush。
+2. 数据模型按 §11.2；bootstrap（从零初始化、schema 版本处理）、`chains:hot` 预激活、`health:*`
+   冷却期恢复；write-behind flush 任务（脏端点集合、批量上限）；审计 stream。
+3. 覆写叠加：runtime（store）> config.toml > default，供 Registry/Classifier 在激活/请求时使用。
+4. 重置/覆盖：`--reset-state` / `RPCROUTER_STATE_RESET=1` / `import()` / `export()` / `reset()`。
+5. 指标 4 个（§11.4）+ alerts 一条（state store down）+ docker-compose 加 redis 服务 +
+   OPERATIONS「状态存储」章节。
+
+W6a 验收（单测跑 Memory/File 实现，全离线；Redis 实现用 `#[ignore]` 集成测试，`REDIS_URL` 未设时跳过）：
+- a) 从零初始化：空 store 启动 → meta/catalog 写入、覆写为空；再次启动不重复 seed；schema 版本
+     不一致按 `required` 分支处理；
+- b) 重启恢复：pin/disable/limits/settings 覆写重启后仍生效；冷却期端点重启后为 Cooling 且
+     `cooling_until` 保留；热链预激活；Active 端点重启后为 Probation（不恢复 Active）；
+- c) 覆盖与重置：export → 改动 → import 后内存态与 store 一致；reset 后等价于空库首启；换
+     namespace 互不干扰；
+- d) 降级：store 不可达（错误 URL）且 `required=false` → 正常提供 RPC 服务、`state_store_up=0`、
+     写操作排队/丢弃有日志；`required=true` → 启动失败并给出明确错误；
+- e) 热路径零 store 调用（用 MemoryStore 计数器断言 10k 次请求期间 store 调用数不随请求数增长）；
+- f) Redis 集成（`#[ignore]`，CI service container 跑）：a–c 在真实 Redis 上通过；pipeline 批量
+     2000+ 端点 flush 一次完成；`--reset-state` 清空命名空间但不动其他前缀的 key。
+
+### W6b Admin REST API（DESIGN-v2 §6、§9）
 1. `[admin]` 配置（enabled/auth_token/static_dir/cors_allow_origins）+ 环境变量；
    鉴权规则：token 已配置 → `/admin/api/*` 全部 Bearer；未配置 → GET 开放、写操作 403
    `admin_disabled`；`enabled=false` → `/admin` 整体 404。CORS 仅对配置的 origin 开放。
@@ -64,23 +93,29 @@
    链 settings 覆写、端点 disable/enable/cool/reset/probe/limits/add/remove。
    端点 `limits` 运行时生效（可重建 Endpoint 对象，健康状态重置可接受）；`probe` 同步
    返回 ProbeOutcome。
-4. 运行时覆写 `data/overrides.json`：结构、原子写、启动加载、叠加优先级 runtime > config >
-   default；损坏文件只告警不阻塞启动。
+4. 状态管理接口：`GET /admin/api/state`、`GET /admin/api/state/export`、
+   `POST /admin/api/state/import`、`POST /admin/api/state/reset {"confirm":true}`；所有控制
+   接口的持久化经 W6a 的 `StateStore`（同步写成功才返回 200，失败返回 503 `state_store_unavailable`）；
+   每个管理操作追加审计记录。
 5. 静态托管：`static_dir` 配置时 `/dashboard/` 提供 SPA（index.html fallback），无 token
    要求；目录不存在时启动告警。
 6. 文档：README 新增「Admin API」章节（含 curl 示例）；OPERATIONS 新增「运行时控制」章节。
 
-验收（离线，axum `oneshot` + 进程内 mock 上游）：
+W6b 验收（离线，axum `oneshot` + 进程内 mock 上游 + MemoryStore）：
 - a) 鉴权矩阵：无 token 配置时 GET 200 / POST 403；配置 token 后无头 401、错 token 401、
      对头 200；`enabled=false` 404；
 - b) 每个控制接口至少一个用例断言**运行态确实变化**（如 disable 端点后 candidates 不含它；
      cool 后 state=Cooling 且流量归零；reset 后 Probation；pin 后 housekeeping 不淘汰；
      settings 覆写后 Classifier 出的 tip TTL 变化；cache clear 后下一次请求打到上游）；
-- c) 覆写持久化 round-trip：写→重建 Registry 加载→生效；损坏文件不阻塞启动；
+- c) 覆写持久化 round-trip：写→重建 Registry + store 加载→生效；store 不可达时控制接口 503 且
+     内存态不变；export/import/reset 接口行为与 W6a-c 一致；审计 stream 有记录；
 - d) overview/chains/chains/{id} 字段与 DESIGN-v2 §6 契约一致（用 serde 结构体 + 快照断言）；
 - e) `static_dir` 存在时 `/dashboard/`、`/dashboard/chains/1` 均返回 index.html；三门槛全绿。
 
 ## W7 — React Dashboard（分支 `w7-dashboard`，目录 `dashboard/`，基于 W6 合入后的 main）
+
+> 设置页增加「状态存储」卡片（后端/连通性/最近 flush/脏端点数）与 export / import / reset
+> 操作（reset 需二次确认）。
 
 范围（DESIGN-v2 §7）：
 1. 脚手架：Vite + React 18 + TypeScript + eslint + vitest + testing-library；`package.json`
@@ -97,7 +132,7 @@
 4. 视觉：DESIGN-v2 §7 的色彩与标记规范；亮/暗两套；状态永远色块 + 文字；无外链资源；
    响应式到 1024px 宽。
 5. CI：`.github/workflows/ci.yml` 增加 `dashboard` job（node 22、`npm ci`、lint/typecheck/
-   test/build），与 Rust job 并行。
+   test/build），与 Rust job 并行（Rust job 在 W6 已加 `services: redis` 跑 `--ignored` 集成用例）。
 6. 部署：`Dockerfile` 增加 node 构建阶段把 `dashboard/dist` 拷进镜像 `/app/dashboard`，
    `RPCROUTER_ADMIN_STATIC_DIR=/app/dashboard` 默认开启；docker-compose 示例同步；
    README 新增「Dashboard」章节（开发/构建/托管/鉴权）。

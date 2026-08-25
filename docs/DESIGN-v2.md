@@ -134,10 +134,19 @@ enabled = true
 # auth_token = "..."      # 未配置：只读接口开放、控制接口 403；配置后 /admin/api/* 全部需 Bearer
 # static_dir = "./dashboard/dist"   # 可选：托管前端构建产物到 /dashboard/
 # cors_allow_origins = ["http://localhost:5173"]   # 可选：前端独立域名/开发服务器
+
+[state]                   # 持久状态存储（§11）
+backend = "redis"         # "redis" | "file"（file = data/state.json，单机零依赖回退）
+redis_url = "redis://127.0.0.1:6379/0"
+namespace = "rpcrouter"   # key 前缀；换前缀 = 换一套全新状态
+required = false          # true：连不上 Redis 启动失败；false：降级为内存+磁盘缓存运行并后台重连
+flush_interval_ms = 2000  # 端点健康快照 write-behind 周期
+health_ttl_seconds = 86400
 ```
 
 环境变量：`RPCROUTER_DISCOVERY_ENABLED`、`RPCROUTER_DISCOVERY_MAX_HOT_CHAINS`、
-`RPCROUTER_DISCOVERY_IDLE_SECONDS`、`RPCROUTER_ADMIN_TOKEN`、`RPCROUTER_ADMIN_STATIC_DIR`。
+`RPCROUTER_DISCOVERY_IDLE_SECONDS`、`RPCROUTER_ADMIN_TOKEN`、`RPCROUTER_ADMIN_STATIC_DIR`、
+`RPCROUTER_STATE_BACKEND`、`RPCROUTER_REDIS_URL`、`RPCROUTER_STATE_NAMESPACE`、`RPCROUTER_STATE_RESET`。
 校验：`discovery.enabled=false` 时 `chains` 不得为空；`enabled=true` 时允许为空。
 
 ## 6. Admin REST API（Rust 侧，`/admin/api/*`）
@@ -167,8 +176,11 @@ POST/PUT/DELETE 一律 403 `admin_disabled`。`[admin].enabled=false` → 整个
 | `PUT /admin/api/chains/{id}/settings` `{blockTimeMs?,confirmationDepth?,tipTtlMs?,maxBlockLag?}` | 运行时覆写链参数（持久化；null 删除） |
 | `POST /admin/api/chains/{id}/endpoints/{action}` body `{url, ...}` | action ∈ `disable`/`enable`（持久化）、`cool {seconds}`、`reset`（清 strikes→Probation）、`probe`（立即探一次，返回结果）、`limits {rps?,concurrency?}`（持久化）、`add`（运行时附加端点，持久化）、`remove`（只允许删 runtime 附加的） |
 
-运行时覆写持久化到 `data/overrides.json`（原子写：tmp + rename，与 chainlist 磁盘缓存
-同法），启动时加载并叠加在 config.toml 之上（优先级：runtime > config > default）。
+运行时覆写经 **状态存储层（§11）** 持久化（默认 Redis；`state.backend="file"` 时为
+`data/state.json` 原子写），启动时加载并叠加在 config.toml 之上（优先级：runtime > config >
+default）。另有状态管理接口：`GET /admin/api/state`（后端/连通性/schema/最近 flush）、
+`GET /admin/api/state/export`（全量 JSON 导出）、`POST /admin/api/state/import`（整体覆盖导入）、
+`POST /admin/api/state/reset`（清空本命名空间并从零重新初始化，需 token + `{"confirm":true}`）。
 `/chains`、`/healthz`、`/metrics` 保持不变（`/chains` 增加 `state` 字段）。
 
 ## 7. Dashboard（`dashboard/`，独立 React 工程）
@@ -226,5 +238,69 @@ POST/PUT/DELETE 一律 403 `admin_disabled`。`[admin].enabled=false` → 整个
 
 ## 10. 非目标（本期）
 
-命名链路由（`/ethereum/...`，ROADMAP P4）、非 EVM 链、WebSocket、多实例共享覆写、
-基于探针的块时间自适应、Dashboard 用户体系（单 token 即可）。
+命名链路由（`/ethereum/...`，ROADMAP P4）、非 EVM 链、WebSocket、多实例共享**响应缓存**与
+分布式出站限流（P5）、基于探针的块时间自适应、Dashboard 用户体系（单 token 即可）。
+
+## 11. 状态存储层（Redis 持久镜像，2026-08-25 增补）
+
+> 用户要求：程序重启不丢状态；Redis 必须支持**从 0 初始化**与**整体覆盖**。
+
+### 11.1 原则
+
+- **内存仍是数据面的唯一真相，Redis 是持久镜像**。10k QPS 热路径（选点、缓存、健康计数）
+  零 Redis 调用；Redis 只在三种时机参与：启动 bootstrap（读）、管理操作（同步写，写成功才
+  返回 200）、后台 write-behind（每 `flush_interval_ms` 批量写脏端点健康快照）。
+- **响应缓存不进 Redis**（每请求一次网络往返会毁掉 p99；多实例共享缓存留 P5）。
+- **Redis 不可用不影响服务**：`required=false`（默认）时降级为内存 + 磁盘缓存运行，后台指数
+  退避重连，恢复后补一次全量 flush；`rpcrouter_state_store_up` 指标 + 告警。`required=true`
+  用于必须保证状态持久的部署（连不上直接启动失败）。
+- 单机零依赖仍然可用：`backend="file"` 用 `data/state.json`（同一 `StateStore` trait 的文件
+  实现，原子写），语义与 Redis 完全一致；单测全部跑在内存/文件实现上，Redis 实现用
+  `#[ignore]` 集成测试 + CI service container 覆盖。
+
+### 11.2 数据模型（全部 key 带 `{namespace}:` 前缀）
+
+| key | 类型 | 内容 | 写入时机 |
+|---|---|---|---|
+| `meta` | hash | `schema_version`、`seeded_at`、`last_flush_at`、`instance_id` | 初始化 / 每次 flush |
+| `catalog` / `catalog:etag` | string(JSON, gzip) | chainlist 快照（替代/并列磁盘缓存） | 每次成功刷新 |
+| `override:chain:{id}` | hash | `pinned` `disabled` `block_time_ms` `confirmation_depth` `tip_ttl_ms` `max_block_lag` | 管理操作（同步） |
+| `override:endpoint:{id}:{blake3(url)[:16]}` | hash | `url` `disabled` `rps` `concurrency` `source=runtime` | 管理操作（同步） |
+| `override:index` | set | 所有 override key 的索引（避免 SCAN） | 随上两项 |
+| `health:{id}:{urlhash}` | hash（TTL `health_ttl_seconds`） | `state` `cooling_until_unix` `strikes` `latency_ewma_us` `lag` 累计计数 | write-behind，只写脏端点 |
+| `chains:hot` | zset（score = last_ingress_unix） | 激活链集合 | write-behind |
+| `audit` | stream（MAXLEN ≈ 10000） | 管理操作审计：who(token 指纹)/what/target/before/after | 管理操作 |
+
+启动恢复：`chains:hot` 里 `now - score < idle_seconds` 的链预激活（避免重启后首个请求冷启动）；
+`health:*` 里仍在冷却期的端点恢复为 Cooling（重启后不再去撞已知限频端点），其余端点照常从
+Probation 起步——不恢复 Active（探针必须重新证明）。
+
+### 11.3 从零初始化 / 覆盖 / 重置（用户明确要求）
+
+1. **从零初始化**：启动时 `meta` 不存在 → 视为空库：写 `meta`（schema_version = 当前版本）、
+   写 `catalog`（首次拉取结果）；覆写为空。**config.toml 不会被复制进 Redis**——它是叠加层，
+   改配置文件后重启即生效，不会被历史状态遮蔽。
+2. **schema 版本**：`meta.schema_version` 与二进制不一致 → 有迁移则迁移，否则按 `required`
+   决定：报错退出或忽略旧状态从零初始化（记 warn）。
+3. **整体覆盖**：`POST /admin/api/state/import`（body = export 格式 JSON）→ 事务内清空
+   `override:*` / `chains:hot` / `health:*` 后写入新内容并立即应用到内存。
+4. **重置**：`rpcrouter --reset-state` 或 `RPCROUTER_STATE_RESET=1`（启动时）或
+   `POST /admin/api/state/reset {"confirm":true}`（运行时）→ 删除本命名空间全部 key 并按 1 重新
+   初始化；换 `namespace` 也等价于一套全新状态（用于灰度/回滚）。
+5. 所有写操作只触及本命名空间，可与其他应用共用一个 Redis；key 使用 `{namespace}` hash tag
+   风格前缀，兼容 Redis Cluster。
+
+### 11.4 实现要点
+
+- `state::StateStore` trait（async）：`bootstrap()`, `load_overrides()`, `put_chain_override()`,
+  `put_endpoint_override()`, `delete_*()`, `flush_health(batch)`, `load_health()`,
+  `set_hot_chains()`, `append_audit()`, `export()`, `import()`, `reset()`, `health()`；
+  实现：`MemoryStore`（测试）、`FileStore`（`data/state.json`）、`RedisStore`。
+- crate：`redis`（`tokio-comp` + `connection-manager`，自动重连）；批量写用 pipeline，
+  import/reset 用 `MULTI/EXEC`。
+- write-behind：Registry 维护脏端点集合（DashSet），flush 任务每周期取走、pipeline 写入；
+  单次上限 2000 条，超出下周期续写。
+- 指标：`rpcrouter_state_store_up`、`rpcrouter_state_flush_total{result}`、
+  `rpcrouter_state_flush_duration_seconds`、`rpcrouter_state_dirty_endpoints`。
+- docker-compose：新增 `redis:7-alpine` 服务（`--appendonly yes` + 卷）；网关默认
+  `RPCROUTER_REDIS_URL=redis://redis:6379/0`。
