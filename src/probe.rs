@@ -198,6 +198,7 @@ impl ProbeManager {
                     continue;
                 }
                 if now >= *next {
+                    *next = now + self.jittered_interval();
                     due.push((chain_id, endpoint));
                 }
             }
@@ -229,8 +230,11 @@ impl ProbeManager {
                     schedules.insert(key, until);
                     continue;
                 }
+                let should_kick = schedules.get(&key).is_none_or(|next| *next <= now);
                 schedules.insert(key, now + self.jittered_interval());
-                self.enqueue(chain_id, endpoint);
+                if should_kick {
+                    self.enqueue(chain_id, endpoint);
+                }
             }
         }
     }
