@@ -10,7 +10,7 @@ use std::{
 use dashmap::DashMap;
 use prometheus::{
     Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    IntGaugeVec, Opts, Registry as PrometheusRegistry, TextEncoder,
+    IntGaugeVec, Opts, Registry as PrometheusRegistry, TextEncoder, core::Collector,
 };
 
 use crate::registry::{EndpointStatsSnapshot, Registry};
@@ -51,6 +51,11 @@ pub struct Metrics {
     chainlist_refresh_total: IntCounterVec,
     chain_activations: IntCounter,
     chain_demotions: IntCounterVec,
+    background_task_restarts: IntCounterVec,
+    state_store_up: IntGauge,
+    state_flush_total: IntCounterVec,
+    state_flush_duration: HistogramVec,
+    state_dirty_endpoints: IntGauge,
     v2_totals: Mutex<V2Totals>,
 }
 
@@ -278,6 +283,35 @@ impl Metrics {
             ),
             &["reason"],
         )?;
+        let background_task_restarts = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_background_task_restarts_total",
+                "Background task restarts after panic or unexpected exit.",
+            ),
+            &["task"],
+        )?;
+        let state_store_up = IntGauge::new(
+            "rpcrouter_state_store_up",
+            "1 when the configured persistent state store is reachable.",
+        )?;
+        let state_flush_total = IntCounterVec::new(
+            Opts::new(
+                "rpcrouter_state_flush_total",
+                "State write-behind flushes by result.",
+            ),
+            &["result"],
+        )?;
+        let state_flush_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "rpcrouter_state_flush_duration_seconds",
+                "State write-behind flush duration.",
+            ),
+            &[],
+        )?;
+        let state_dirty_endpoints = IntGauge::new(
+            "rpcrouter_state_dirty_endpoints",
+            "Endpoints waiting for state write-behind.",
+        )?;
 
         for collector in [
             Box::new(ingress.clone()) as Box<dyn prometheus::core::Collector>,
@@ -311,6 +345,11 @@ impl Metrics {
             Box::new(chainlist_refresh_total.clone()),
             Box::new(chain_activations.clone()),
             Box::new(chain_demotions.clone()),
+            Box::new(background_task_restarts.clone()),
+            Box::new(state_store_up.clone()),
+            Box::new(state_flush_total.clone()),
+            Box::new(state_flush_duration.clone()),
+            Box::new(state_dirty_endpoints.clone()),
         ] {
             registry.register(collector)?;
         }
@@ -350,6 +389,11 @@ impl Metrics {
             chainlist_refresh_total,
             chain_activations,
             chain_demotions,
+            background_task_restarts,
+            state_store_up,
+            state_flush_total,
+            state_flush_duration,
+            state_dirty_endpoints,
             v2_totals: Mutex::new(V2Totals::default()),
         })
     }
@@ -514,20 +558,78 @@ impl Metrics {
         self.chain_demotions.with_label_values(&[reason]).inc();
     }
 
+    pub fn record_background_task_restart(&self, task: &str) {
+        self.background_task_restarts
+            .with_label_values(&[task])
+            .inc();
+    }
+    pub fn background_task_restarts(&self, task: &str) -> u64 {
+        self.background_task_restarts
+            .with_label_values(&[task])
+            .get()
+    }
+    pub fn set_state_store_up(&self, up: bool) {
+        self.state_store_up.set(i64::from(up));
+    }
+    pub fn record_state_flush(&self, result: &str, duration: Duration) {
+        self.state_flush_total.with_label_values(&[result]).inc();
+        self.state_flush_duration
+            .with_label_values(&[] as &[&str])
+            .observe(duration.as_secs_f64());
+    }
+    pub fn set_state_dirty_endpoints(&self, count: usize) {
+        self.state_dirty_endpoints.set(count as i64);
+    }
+
     pub fn chain_snapshot(&self, chain_id: u64) -> ChainMetricsSnapshot {
         let chain = chain_id.to_string();
-        let hedge_totals = self.hedge_totals(chain_id);
+        let counter = |metric: &IntCounterVec| {
+            metric
+                .collect()
+                .into_iter()
+                .flat_map(|family| family.get_metric().to_vec())
+                .find(|sample| {
+                    sample
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "chain_id" && label.value() == chain)
+                })
+                .map_or(0, |sample| sample.get_counter().value() as u64)
+        };
+        let hedge_totals = self.hedge_totals.get(&chain_id);
         ChainMetricsSnapshot {
-            ingress: self.ingress.with_label_values(&[&chain]).get(),
-            cache_lookups: self.cache_lookups.with_label_values(&[&chain]).get(),
-            cache_hits: self.cache_hits.with_label_values(&[&chain]).get(),
-            cache_misses: self.cache_misses.with_label_values(&[&chain]).get(),
-            coalesced: self.coalesced.with_label_values(&[&chain]).get(),
-            upstream: hedge_totals.upstream.load(Ordering::Relaxed),
-            user_visible_errors: self.user_visible_errors.with_label_values(&[&chain]).get(),
-            cold_start_failures: self.cold_start_failures.with_label_values(&[&chain]).get(),
-            hedges: hedge_totals.hedges.load(Ordering::Relaxed),
+            ingress: counter(&self.ingress),
+            cache_lookups: counter(&self.cache_lookups),
+            cache_hits: counter(&self.cache_hits),
+            cache_misses: counter(&self.cache_misses),
+            coalesced: counter(&self.coalesced),
+            upstream: hedge_totals
+                .as_ref()
+                .map_or(0, |v| v.upstream.load(Ordering::Relaxed)),
+            user_visible_errors: counter(&self.user_visible_errors),
+            cold_start_failures: counter(&self.cold_start_failures),
+            hedges: hedge_totals
+                .as_ref()
+                .map_or(0, |v| v.hedges.load(Ordering::Relaxed)),
         }
+    }
+
+    pub fn in_flight(&self) -> i64 {
+        self.in_flight.get()
+    }
+
+    pub fn ingress_rejected_total(&self) -> u64 {
+        [
+            "unknown_chain",
+            "chain_disabled",
+            "no_endpoints",
+            "overload",
+            "body_too_large",
+            "rate_limited",
+        ]
+        .iter()
+        .map(|reason| self.ingress_rejected.with_label_values(&[*reason]).get())
+        .sum()
     }
 
     pub async fn encode(&self, rpc_registry: &Registry) -> prometheus::Result<String> {

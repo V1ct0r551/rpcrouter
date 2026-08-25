@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod cache;
 pub mod chainlist;
 pub mod classify;
@@ -11,3 +12,5 @@ pub mod probe;
 pub mod registry;
 pub mod server;
 pub mod signals;
+pub mod state;
+pub mod supervisor;

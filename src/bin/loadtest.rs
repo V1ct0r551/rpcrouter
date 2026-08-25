@@ -14,7 +14,7 @@ use rpcrouter::{
     forward::Forwarder,
     metrics::ChainMetricsSnapshot,
     mock_upstream::{MockBehavior, MockController, router as mock_router},
-    probe::{ProbeManager, spawn as spawn_probes},
+    probe::{ProbeManager, spawn_supervised as spawn_probes},
     registry::{Endpoint, EndpointState, Registry},
     server::{AppState, router},
 };
@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
     let baseline = metrics.chain_snapshot(1);
 
     let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
-    spawn_probes(probes);
+    spawn_probes(probes, Arc::clone(&metrics));
     let timeline = Arc::new(Mutex::new(Vec::new()));
     let started = Instant::now();
     record_event(&timeline, started, "load_started");

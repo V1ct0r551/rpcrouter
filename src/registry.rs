@@ -22,12 +22,24 @@ use crate::{
     chainlist::{Catalog, ChainEndpoints, ChainlistSnapshot},
     config::Config,
     signals::{FailureSignal, FaultKind},
+    state::{ChainOverrideState, EndpointOverrideState, HealthSnapshot, Overrides},
 };
 
 const ERROR_WINDOW: Duration = Duration::from_secs(60);
 const STRIKE_DECAY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const FAULTS_BEFORE_COOLING: u8 = 3;
 const PROBATION_PASSES_REQUIRED: u8 = 2;
+
+fn valid_chain_override(value: &ChainOverrideState) -> bool {
+    value
+        .block_time_ms
+        .is_none_or(|v| (100..=600_000).contains(&v))
+        && value
+            .confirmation_depth
+            .is_none_or(|v| (1..=100_000).contains(&v))
+        && value.tip_ttl_ms.is_none_or(|v| (100..=60_000).contains(&v))
+        && value.max_block_lag.is_none_or(|v| v <= 10_000)
+}
 
 // ── 端点状态机（v1 不变） ──
 
@@ -193,10 +205,13 @@ pub struct Endpoint {
     stats: EndpointStats,
     /// 同一端点同一时刻至多一个在飞探针（防止 kick 与周期调度重复入队）。
     probing: AtomicBool,
+    dirty: AtomicBool,
 }
 
 impl Endpoint {
     fn new(url: String, rps: u32, concurrency: usize, now: u64) -> Self {
+        let rps = rps.clamp(1, 100);
+        let concurrency = concurrency.clamp(1, 64);
         let quota = Quota::per_second(NonZeroU32::new(rps).expect("validated nonzero RPS"))
             .allow_burst(NonZeroU32::new(rps).expect("validated nonzero RPS"));
         Self {
@@ -213,6 +228,7 @@ impl Endpoint {
             height_observation: Mutex::new(None),
             stats: EndpointStats::default(),
             probing: AtomicBool::new(false),
+            dirty: AtomicBool::new(true),
         }
     }
 
@@ -301,6 +317,7 @@ impl Endpoint {
     }
 
     pub fn record_success(&self, now: Instant, latency: Duration, probe: bool) {
+        self.dirty.store(true, Ordering::Release);
         self.update_latency(latency);
         lock(&self.outcomes).record(now, false);
         if probe {
@@ -327,6 +344,7 @@ impl Endpoint {
     }
 
     pub fn record_failure(&self, now: Instant, signal: FailureSignal) {
+        self.dirty.store(true, Ordering::Release);
         self.stats.failures.fetch_add(1, Ordering::Relaxed);
         if signal.kind == FaultKind::RateLimited {
             self.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -402,6 +420,83 @@ impl Endpoint {
         self.stats.snapshot()
     }
 
+    pub fn health_snapshot(&self, chain_id: u64) -> HealthSnapshot {
+        let now_unix = unix_seconds();
+        let state = self.state(Instant::now());
+        let (state_name, cooling_until_unix, strikes) = match state {
+            EndpointState::Active => ("active".to_owned(), None, 0),
+            EndpointState::Probation { .. } => ("probation".to_owned(), None, 0),
+            EndpointState::Cooling { until, strikes } => {
+                let secs = until.saturating_duration_since(Instant::now()).as_secs();
+                (
+                    "cooling".to_owned(),
+                    Some(now_unix.saturating_add(secs)),
+                    strikes,
+                )
+            }
+        };
+        HealthSnapshot {
+            chain_id,
+            url: self.url.clone(),
+            state: state_name,
+            cooling_until_unix,
+            strikes,
+            latency_ewma_us: self.latency_ewma_micros(),
+            lag: self.lag(),
+        }
+    }
+
+    pub fn restore_health(&self, snapshot: &HealthSnapshot) {
+        let mut health = lock(&self.health);
+        health.strikes = snapshot.strikes;
+        health.status = if snapshot.state == "cooling" {
+            let remaining = snapshot
+                .cooling_until_unix
+                .unwrap_or(0)
+                .saturating_sub(unix_seconds());
+            if remaining > 0 {
+                HealthStatus::Cooling {
+                    until: Instant::now() + Duration::from_secs(remaining),
+                }
+            } else {
+                HealthStatus::Probation { passes: 0 }
+            }
+        } else {
+            HealthStatus::Probation { passes: 0 }
+        };
+        self.latency_ewma_micros
+            .store(snapshot.latency_ewma_us, Ordering::Relaxed);
+        self.lag.store(snapshot.lag, Ordering::Relaxed);
+        self.dirty.store(false, Ordering::Release);
+    }
+
+    pub fn reset_health(&self) {
+        let mut health = lock(&self.health);
+        health.status = HealthStatus::Probation { passes: 0 };
+        health.strikes = 0;
+        health.consecutive_faults = 0;
+        health.last_fault = None;
+        health.healthy_since = None;
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    pub fn cool_for(&self, duration: Duration) {
+        let mut health = lock(&self.health);
+        health.status = HealthStatus::Cooling {
+            until: Instant::now() + duration,
+        };
+        health.strikes = health.strikes.saturating_add(1);
+        health.healthy_since = None;
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
     fn update_latency(&self, latency: Duration) {
         let sample = latency.as_micros().min(u128::from(u64::MAX)) as u64;
         let mut previous = self.latency_ewma_micros.load(Ordering::Relaxed);
@@ -425,6 +520,7 @@ impl Endpoint {
 
     fn observe_height(&self, height: u64, now: Instant) {
         *lock(&self.height_observation) = Some((height, now));
+        self.dirty.store(true, Ordering::Release);
     }
 
     fn recent_height(&self, now: Instant, freshness: Duration) -> Option<u64> {
@@ -457,7 +553,7 @@ pub enum ChainStateLabel {
     Disabled,
 }
 
-pub(crate) struct ChainState {
+pub struct ChainState {
     chain_id: u64,
     name: RwLock<String>,
     endpoints: RwLock<Vec<Arc<Endpoint>>>,
@@ -507,6 +603,9 @@ pub struct Registry {
     chains: DashMap<u64, Arc<ChainState>>,
     activation_locks: DashMap<u64, Arc<tokio::sync::Mutex<()>>>,
     runtime_pinned: DashMap<u64, bool>,
+    runtime_chain_overrides: DashMap<u64, ChainOverrideState>,
+    runtime_endpoint_overrides: DashMap<String, EndpointOverrideState>,
+    restored_health: DashMap<String, HealthSnapshot>,
     catalog: RwLock<Option<Arc<Catalog>>>,
     config: Config,
     user_visible_errors: AtomicU64,
@@ -537,6 +636,9 @@ impl Registry {
             chains: DashMap::new(),
             activation_locks: DashMap::new(),
             runtime_pinned: DashMap::new(),
+            runtime_chain_overrides: DashMap::new(),
+            runtime_endpoint_overrides: DashMap::new(),
+            restored_health: DashMap::new(),
             catalog: RwLock::new(None),
             config: config.clone(),
             user_visible_errors: AtomicU64::new(0),
@@ -579,12 +681,130 @@ impl Registry {
         self.activation_tx.clone()
     }
 
+    /// 将持久化运行时覆写叠加到内存。请求路径只读取这些并发 map，不访问 StateStore。
+    pub async fn apply_overrides(&self, overrides: &Overrides) {
+        self.runtime_chain_overrides.clear();
+        self.runtime_endpoint_overrides.clear();
+        self.runtime_pinned.clear();
+        for entry in &self.chains {
+            entry
+                .value()
+                .pinned
+                .store(self.config.chains.contains(entry.key()), Ordering::Relaxed);
+            entry.value().disabled.store(false, Ordering::Relaxed);
+        }
+        for (id, value) in &overrides.chains {
+            if !valid_chain_override(value) {
+                tracing::warn!(chain_id = *id, "invalid runtime chain override ignored");
+                continue;
+            }
+            self.runtime_chain_overrides.insert(*id, value.clone());
+            if let Some(pinned) = value.pinned {
+                self.runtime_pinned.insert(*id, pinned);
+            }
+            if let Some(state) = self.chain(*id) {
+                if let Some(pinned) = value.pinned {
+                    state.pinned.store(pinned, Ordering::Relaxed);
+                }
+                if let Some(disabled) = value.disabled {
+                    state.disabled.store(disabled, Ordering::Relaxed);
+                }
+            }
+        }
+        for (key, value) in &overrides.endpoints {
+            if value.rps.is_some_and(|v| !(1..=100).contains(&v))
+                || value.concurrency.is_some_and(|v| !(1..=64).contains(&v))
+            {
+                tracing::warn!(override_key=%key, "invalid runtime endpoint override ignored");
+                continue;
+            }
+            self.runtime_endpoint_overrides
+                .insert(key.clone(), value.clone());
+            self.set_endpoint_override(
+                key.split(':')
+                    .next()
+                    .and_then(|id| id.parse().ok())
+                    .unwrap_or_default(),
+                value.clone(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn apply_override(&self, chain_id: u64, value: ChainOverrideState) {
+        self.runtime_chain_overrides.insert(chain_id, value.clone());
+        if let Some(pinned) = value.pinned {
+            self.runtime_pinned.insert(chain_id, pinned);
+        }
+        if let Some(state) = self.chain(chain_id) {
+            if let Some(pinned) = value.pinned {
+                state.pinned.store(pinned, Ordering::Relaxed);
+            }
+            if let Some(disabled) = value.disabled {
+                state.disabled.store(disabled, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn runtime_chain_override(&self, chain_id: u64) -> ChainOverrideState {
+        self.runtime_chain_overrides
+            .get(&chain_id)
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn runtime_overrides(&self) -> Overrides {
+        Overrides {
+            chains: self
+                .runtime_chain_overrides
+                .iter()
+                .map(|v| (*v.key(), v.value().clone()))
+                .collect(),
+            endpoints: self
+                .runtime_endpoint_overrides
+                .iter()
+                .map(|v| (v.key().clone(), v.value().clone()))
+                .collect(),
+        }
+    }
+
+    pub fn runtime_endpoint_override(
+        &self,
+        chain_id: u64,
+        url: &str,
+    ) -> Option<EndpointOverrideState> {
+        self.runtime_endpoint_overrides
+            .get(&crate::state::endpoint_key(chain_id, url))
+            .map(|v| v.clone())
+    }
+
+    pub async fn endpoint_known(&self, chain_id: u64, url: &str) -> bool {
+        if self.endpoint(chain_id, url).await.is_some()
+            || self.runtime_endpoint_override(chain_id, url).is_some()
+        {
+            return true;
+        }
+        if self
+            .catalog
+            .read()
+            .await
+            .as_ref()
+            .and_then(|catalog| catalog.lookup(chain_id))
+            .is_some_and(|chain| chain.endpoints.iter().any(|endpoint| endpoint.url == url))
+        {
+            return true;
+        }
+        self.config
+            .chain_override(chain_id)
+            .is_some_and(|chain| chain.extra_endpoints.iter().any(|endpoint| endpoint == url))
+    }
+
     // ── 热路径：resolve_for_request ──
 
     /// 热路径：解析 chain_id 并触达 ChainState。
     /// DashMap get + 原子读；dormant 时才走慢路径 materialize。
     /// 返回 `None` 表示未知链（不在目录也不在 pinned）。
-    pub(crate) async fn resolve_for_request(&self, chain_id: u64) -> Option<Arc<ChainState>> {
+    pub async fn resolve_for_request(&self, chain_id: u64) -> Option<Arc<ChainState>> {
         // 路由层用这个做语义判定：未知链 / 0端点 / disabled。
         // 先查 DashMap（已 materialized 的链）。
         if let Some(state) = self.chain(chain_id) {
@@ -699,7 +919,20 @@ impl Registry {
         if let Some(chain_override) = self.config.chain_override(chain_id) {
             desired_urls.extend(chain_override.extra_endpoints.iter().cloned());
         }
+        desired_urls.extend(
+            self.runtime_endpoint_overrides
+                .iter()
+                .filter(|entry| {
+                    entry.key().starts_with(&format!("{chain_id}:"))
+                        && entry.value().disabled != Some(true)
+                })
+                .map(|entry| entry.value().url.clone()),
+        );
 
+        let runtime = self
+            .runtime_chain_overrides
+            .get(&chain_id)
+            .map(|v| v.clone());
         let chain_override = self.config.chain_override(chain_id);
         let disabled: HashSet<&str> = chain_override
             .into_iter()
@@ -713,10 +946,37 @@ impl Registry {
             if disabled.contains(url.as_str()) || !seen.insert(url.clone()) {
                 continue;
             }
-            let (rps, concurrency) = self.config.endpoint_limits(chain_id, &url);
+            let (mut rps, mut concurrency) = self.config.endpoint_limits(chain_id, &url);
+            if let Some(endpoint) = self
+                .runtime_endpoint_overrides
+                .get(&crate::state::endpoint_key(chain_id, &url))
+            {
+                if let Some(v) = endpoint.rps {
+                    rps = v;
+                }
+                if let Some(v) = endpoint.concurrency {
+                    concurrency = v;
+                }
+                if endpoint.disabled == Some(true) {
+                    continue;
+                }
+            }
             endpoints.push(Arc::new(Endpoint::new(url, rps, concurrency, now)));
         }
         *state.endpoints.write().await = endpoints;
+        for endpoint in state.endpoints.read().await.iter() {
+            if let Some(snapshot) = self
+                .restored_health
+                .get(&crate::state::endpoint_key(chain_id, endpoint.url()))
+            {
+                endpoint.restore_health(&snapshot);
+            }
+        }
+        if let Some(value) = runtime
+            && let Some(disabled) = value.disabled
+        {
+            state.disabled.store(disabled, Ordering::Relaxed);
+        }
 
         // 插入 DashMap。
         self.chains.insert(chain_id, Arc::clone(&state));
@@ -775,6 +1035,11 @@ impl Registry {
         // pinned 链始终合并；动态发现模式下，已 materialized 的 hot 链也必须在刷新时
         // 保留健康运行态并合并新增/消失端点。dormant 链保持零成本，不创建端点对象。
         let mut materialized_ids: HashSet<u64> = self.config.chains.iter().copied().collect();
+        materialized_ids.extend(
+            self.runtime_pinned
+                .iter()
+                .filter_map(|entry| (*entry.value()).then_some(*entry.key())),
+        );
         materialized_ids.extend(self.chains.iter().filter_map(|entry| {
             matches!(
                 entry.value().state_label(),
@@ -835,6 +1100,15 @@ impl Registry {
         if let Some(chain) = chain_override {
             desired.extend(chain.extra_endpoints.iter().cloned());
         }
+        desired.extend(
+            self.runtime_endpoint_overrides
+                .iter()
+                .filter(|entry| {
+                    entry.key().starts_with(&format!("{}:", state.chain_id))
+                        && entry.value().disabled != Some(true)
+                })
+                .map(|entry| entry.value().url.clone()),
+        );
 
         let mut present = HashSet::new();
         let mut merged = Vec::new();
@@ -845,12 +1119,49 @@ impl Registry {
             {
                 continue;
             }
+            let runtime = self
+                .runtime_endpoint_overrides
+                .get(&crate::state::endpoint_key(state.chain_id, &url))
+                .map(|entry| entry.clone());
+            if runtime
+                .as_ref()
+                .is_some_and(|entry| entry.disabled == Some(true))
+            {
+                continue;
+            }
             if let Some(endpoint) = previous_by_url.get(&url) {
-                endpoint.last_seen.store(now, Ordering::Relaxed);
-                merged.push(Arc::clone(endpoint));
+                let (configured_rps, configured_concurrency) =
+                    self.config.endpoint_limits(state.chain_id, &url);
+                let desired_rps = runtime
+                    .as_ref()
+                    .and_then(|entry| entry.rps)
+                    .unwrap_or(configured_rps);
+                let desired_concurrency = runtime
+                    .as_ref()
+                    .and_then(|entry| entry.concurrency)
+                    .unwrap_or(configured_concurrency);
+                if endpoint.rps() == desired_rps && endpoint.concurrency() == desired_concurrency {
+                    endpoint.last_seen.store(now, Ordering::Relaxed);
+                    merged.push(Arc::clone(endpoint));
+                } else {
+                    merged.push(Arc::new(Endpoint::new(
+                        url,
+                        desired_rps,
+                        desired_concurrency,
+                        now,
+                    )));
+                }
             } else {
                 let (rps, concurrency) = self.config.endpoint_limits(state.chain_id, &url);
-                merged.push(Arc::new(Endpoint::new(url, rps, concurrency, now)));
+                merged.push(Arc::new(Endpoint::new(
+                    url,
+                    runtime.as_ref().and_then(|entry| entry.rps).unwrap_or(rps),
+                    runtime
+                        .as_ref()
+                        .and_then(|entry| entry.concurrency)
+                        .unwrap_or(concurrency),
+                    now,
+                )));
             }
         }
 
@@ -866,6 +1177,14 @@ impl Registry {
             }
         }
         *state.endpoints.write().await = merged;
+        for endpoint in state.endpoints.read().await.iter() {
+            if let Some(snapshot) = self
+                .restored_health
+                .get(&crate::state::endpoint_key(state.chain_id, endpoint.url()))
+            {
+                endpoint.restore_health(&snapshot);
+            }
+        }
     }
 
     // ── 生命周期控制 ──
@@ -907,8 +1226,12 @@ impl Registry {
 
     /// 设置 disabled 状态。
     pub async fn set_disabled(&self, chain_id: u64, disabled: bool) -> bool {
-        let Some(state) = self.chain(chain_id) else {
-            return false;
+        let state = match self.chain(chain_id) {
+            Some(state) => state,
+            None => match self.resolve_for_request(chain_id).await {
+                Some(state) => state,
+                None => return false,
+            },
         };
         state.disabled.store(disabled, Ordering::Relaxed);
         true
@@ -916,8 +1239,12 @@ impl Registry {
 
     /// 设置 pinned 状态。
     pub async fn set_pinned(&self, chain_id: u64, pinned: bool) -> bool {
-        let Some(state) = self.chain(chain_id) else {
-            return false;
+        let state = match self.chain(chain_id) {
+            Some(state) => state,
+            None => match self.resolve_for_request(chain_id).await {
+                Some(state) => state,
+                None => return false,
+            },
         };
         self.runtime_pinned.insert(chain_id, pinned);
         state.pinned.store(pinned, Ordering::Relaxed);
@@ -938,6 +1265,99 @@ impl Registry {
             })
             .map(|entry| *entry.key())
             .collect()
+    }
+
+    pub fn hot_chain_snapshot(&self) -> Vec<(u64, u64)> {
+        self.chains
+            .iter()
+            .filter_map(|entry| {
+                let last = entry.value().last_ingress.load(Ordering::Relaxed);
+                (last > 0).then_some((*entry.key(), last))
+            })
+            .collect()
+    }
+
+    pub fn hot_chain_timestamps(&self) -> Vec<(u64, u64)> {
+        self.chains
+            .iter()
+            .filter_map(|entry| {
+                let state = entry.value();
+                matches!(
+                    state.state_label(),
+                    ChainStateLabel::Pinned | ChainStateLabel::Hot
+                )
+                .then_some((*entry.key(), state.last_ingress.load(Ordering::Relaxed)))
+            })
+            .collect()
+    }
+
+    pub async fn activate_restored_hot(&self, chains: &[(u64, u64)]) {
+        let now = unix_seconds();
+        for (chain_id, last) in chains {
+            if now.saturating_sub(*last) <= self.config.discovery.idle_seconds
+                && let Some(state) = self.resolve_for_request(*chain_id).await
+            {
+                state.last_ingress.store(*last, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub async fn restore_health(&self, snapshots: &[HealthSnapshot]) {
+        for snapshot in snapshots {
+            self.restored_health.insert(
+                crate::state::endpoint_key(snapshot.chain_id, &snapshot.url),
+                snapshot.clone(),
+            );
+            if let Some(endpoint) = self
+                .all_endpoints(snapshot.chain_id)
+                .await
+                .into_iter()
+                .find(|e| e.url() == snapshot.url)
+            {
+                endpoint.restore_health(snapshot);
+            }
+        }
+    }
+
+    pub async fn take_dirty_health(&self, limit: usize) -> Vec<HealthSnapshot> {
+        let mut out = Vec::new();
+        for entry in &self.hot_chain_ids() {
+            for endpoint in self.all_endpoints(*entry).await {
+                if out.len() >= limit {
+                    return out;
+                }
+                if endpoint.take_dirty() {
+                    out.push(endpoint.health_snapshot(*entry));
+                }
+            }
+        }
+        out
+    }
+
+    pub async fn restore_dirty_health(&self, snapshots: &[HealthSnapshot]) {
+        for snapshot in snapshots {
+            if let Some(endpoint) = self
+                .all_endpoints(snapshot.chain_id)
+                .await
+                .into_iter()
+                .find(|e| e.url() == snapshot.url)
+            {
+                endpoint.mark_dirty();
+            }
+        }
+    }
+
+    pub async fn dirty_endpoint_count(&self) -> usize {
+        let mut count = 0;
+        for chain_id in self.hot_chain_ids() {
+            count += self
+                .all_endpoints(chain_id)
+                .await
+                .into_iter()
+                .filter(|e| e.dirty.load(Ordering::Acquire))
+                .count();
+        }
+        count
     }
 
     /// housekeeping：idle 降级 + LRU 淘汰。
@@ -1100,6 +1520,92 @@ impl Registry {
         endpoints.len() != previous_len
     }
 
+    pub async fn set_endpoint_override(&self, chain_id: u64, value: EndpointOverrideState) -> bool {
+        let key = crate::state::endpoint_key(chain_id, &value.url);
+        self.runtime_endpoint_overrides.insert(key, value.clone());
+        if let Some(state) = self.chain(chain_id) {
+            let mut endpoints = state.endpoints.write().await;
+            if value.disabled == Some(true) {
+                endpoints.retain(|e| e.url() != value.url);
+            } else if let Some(existing) = endpoints.iter_mut().find(|e| e.url() == value.url) {
+                if value.rps.is_some() || value.concurrency.is_some() {
+                    let (rps, concurrency) = self.config.endpoint_limits(chain_id, &value.url);
+                    let replacement = Arc::new(Endpoint::new(
+                        value.url.clone(),
+                        value.rps.unwrap_or(rps),
+                        value.concurrency.unwrap_or(concurrency),
+                        unix_seconds(),
+                    ));
+                    *existing = replacement;
+                }
+            } else {
+                let (rps, concurrency) = self.config.endpoint_limits(chain_id, &value.url);
+                endpoints.push(Arc::new(Endpoint::new(
+                    value.url.clone(),
+                    value.rps.unwrap_or(rps),
+                    value.concurrency.unwrap_or(concurrency),
+                    unix_seconds(),
+                )));
+            }
+        }
+        true
+    }
+
+    pub async fn add_runtime_endpoint(&self, chain_id: u64, url: String) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        let (rps, concurrency) = self.config.endpoint_limits(chain_id, &url);
+        let mut endpoints = state.endpoints.write().await;
+        if endpoints.iter().any(|e| e.url() == url) {
+            return true;
+        }
+        endpoints.push(Arc::new(Endpoint::new(
+            url,
+            rps,
+            concurrency,
+            unix_seconds(),
+        )));
+        true
+    }
+
+    pub async fn remove_runtime_endpoint(&self, chain_id: u64, url: &str) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        let key = crate::state::endpoint_key(chain_id, url);
+        if self.runtime_endpoint_overrides.remove(&key).is_none() {
+            return false;
+        }
+        let mut endpoints = state.endpoints.write().await;
+        let old = endpoints.len();
+        endpoints.retain(|e| e.url() != url);
+        old != endpoints.len()
+    }
+
+    pub async fn runtime_endpoint_exists(&self, chain_id: u64, url: &str) -> bool {
+        if !self
+            .runtime_endpoint_overrides
+            .contains_key(&crate::state::endpoint_key(chain_id, url))
+        {
+            return false;
+        }
+        if self
+            .config
+            .chain_override(chain_id)
+            .is_some_and(|value| value.extra_endpoints.iter().any(|item| item == url))
+        {
+            return false;
+        }
+        !self
+            .catalog
+            .read()
+            .await
+            .as_ref()
+            .and_then(|catalog| catalog.lookup(chain_id))
+            .is_some_and(|chain| chain.endpoints.iter().any(|item| item.url == url))
+    }
+
     pub async fn record_probe_height(
         &self,
         chain_id: u64,
@@ -1126,9 +1632,10 @@ impl Registry {
             if let Some(item_height) = item.recent_height(now, freshness) {
                 item.lag
                     .store(head.abs_diff(item_height), Ordering::Relaxed);
+                item.dirty.store(true, Ordering::Release);
             }
         }
-        if head.abs_diff(height) > self.config.lag_threshold(chain_id) {
+        if head.abs_diff(height) > self.runtime_lag_threshold(chain_id) {
             endpoint.record_failure(now, FailureSignal::new(FaultKind::Lagging));
         }
     }
@@ -1190,6 +1697,46 @@ impl Registry {
     /// v2 指标：chainlist 最近刷新来源。
     pub fn chainlist_refresh_source_str(&self) -> String {
         lock(&self.chainlist_refresh_source).clone()
+    }
+
+    pub fn chain_settings(&self, chain_id: u64) -> (u64, u64, u64, u64, &'static str) {
+        if let Some(v) = self.runtime_chain_overrides.get(&chain_id) {
+            return (
+                v.block_time_ms
+                    .unwrap_or_else(|| self.config.block_time_ms(chain_id)),
+                v.confirmation_depth
+                    .unwrap_or_else(|| self.config.confirmation_depth(chain_id)),
+                v.tip_ttl_ms
+                    .unwrap_or_else(|| self.config.tip_ttl_ms(chain_id)),
+                v.max_block_lag
+                    .unwrap_or_else(|| self.config.lag_threshold(chain_id)),
+                "runtime",
+            );
+        }
+        let source = if self.config.chain_override(chain_id).is_some() {
+            "config"
+        } else {
+            "default"
+        };
+        (
+            self.config.block_time_ms(chain_id),
+            self.config.confirmation_depth(chain_id),
+            self.config.tip_ttl_ms(chain_id),
+            self.config.lag_threshold(chain_id),
+            source,
+        )
+    }
+
+    fn runtime_lag_threshold(&self, chain_id: u64) -> u64 {
+        self.runtime_chain_overrides
+            .get(&chain_id)
+            .and_then(|value| value.max_block_lag)
+            .unwrap_or_else(|| self.config.lag_threshold(chain_id))
+    }
+
+    pub fn chain_last_ingress(&self, chain_id: u64) -> u64 {
+        self.chain(chain_id)
+            .map_or(0, |state| state.last_ingress.load(Ordering::Relaxed))
     }
 
     // ── summaries（v2：增加 state 字段） ──

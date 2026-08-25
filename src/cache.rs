@@ -228,6 +228,17 @@ impl ResponseCache {
     pub async fn sync(&self) {
         self.entries.run_pending_tasks().await;
     }
+
+    pub async fn clear(&self) {
+        self.entries.invalidate_all();
+        self.flights.clear();
+        self.entries.run_pending_tasks().await;
+    }
+
+    pub async fn clear_chain(&self, _chain_id: u64) {
+        // 缓存键是不可逆哈希，链级清理安全退化为全量清理。
+        self.clear().await;
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

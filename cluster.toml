@@ -1,0 +1,21 @@
+listen = "0.0.0.0:8545"
+chains = []
+
+[discovery]
+enabled = true
+include_testnets = true
+max_hot_chains = 256
+idle_seconds = 600
+
+[chainlist]
+refresh_seconds = 3600
+cache_path = "/app/data/rpcs.json"
+
+[state]
+backend = "redis"
+redis_url = "redis://redis:6379/0"
+namespace = "rpcrouter"
+required = false
+flush_interval_ms = 2000
+health_ttl_seconds = 86400
+restore_hot = false

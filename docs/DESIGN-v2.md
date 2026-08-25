@@ -383,3 +383,25 @@ Phase B 各项仅作为 P5 备选，按需再立项。** 不用轮询：轮询�
 - 刷新周期通过 `ChainlistLoader::refresh()` 与手动刷新共享互斥状态；Memory/Disk/Fixture 回退不会伪造新鲜刷新时间。
 - `discovery.enabled=false` 在 registry 路由层拒绝非 pinned 目录链，保持 v1 语义；deny 与 pinned 的冲突在配置校验阶段拒绝。
 - 已知限制：`rpcrouter_chain_pinned` 标签数最坏为 materialized 链数；极端 `Retry-After` 仍可能触发 `Instant` 加法边界；墙钟向后跳可能延迟/集中一次 idle 降级；未知链 Classifier 仍使用默认 TTL，而配置中 1/143 有专用值；RPC 条目自身仍要求字符串或含字符串 `url` 的对象。上述项不影响 W5 的动态目录、生命周期边界与离线验收，留待后续独立加固。
+
+### W6a 偏差记录
+
+- RedisStore 使用结构化 key 作为唯一真相：`meta`、独立 `catalog`、`override:index`、
+  `health:index`、按实例 `hot:<instance_id>` 与 `audit`；不再维护 document JSON 镜像。
+  import/reset 使用 MULTI/EXEC 批量清理和重写。
+- optional Redis 降级通过 FileStore 镜像承接，后台 supervisor 指数退避重连；Redis 非空时
+  不用本地文件覆盖，只补写本地脏 health 快照。
+- Endpoint dirty 集合按端点原子位维护，flush 每轮最多 2000 条；未引入 Redis 分布式 token
+  bucket 或共享响应缓存（按 §12 Phase B/P5 规划）。
+- cluster profile 关闭共享 `chains:hot` 的启动预激活（`state.restore_hot=false`），避免实例接管
+  历史分片后全部探测同一链；单实例默认仍恢复热链，覆写与健康快照继续共享。
+
+### W6b 偏差记录
+
+- Admin API 复用 axum 路由与内存 Registry；为保持 RPC 热路径零 StateStore 调用，管理读接口
+  只在请求到达管理路由时读取状态，控制写入成功后才应用内存覆写。
+- `cache.clear?chainId` 当前安全退化为全量清理（缓存条目未保留可逆 chain 索引），不改变
+  数据面语义但会比精确清理影响更多缓存。
+- 端点 `probe` 在无 ProbeManager 的进程内测试环境返回 503；生产主进程始终注入探针管理器。
+- 最近 flush 时间在 Admin state 摘要中暂以 0 表示，详细时间仍可由 Prometheus flush 指标
+  查询；后续可在 StateStore 接口增加只读元数据 getter。

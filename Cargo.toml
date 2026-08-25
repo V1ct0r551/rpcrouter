@@ -9,9 +9,12 @@ default-run = "rpcrouter"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 axum = "0.8"
 blake3 = "1"
+flate2 = "1"
 dashmap = "6"
+futures-util = "0.3"
 governor = "0.10"
 httpdate = "1"
 moka = { version = "0.12", features = ["future"] }
@@ -19,11 +22,14 @@ prometheus = "0.14"
 rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+subtle = "2"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

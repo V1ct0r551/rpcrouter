@@ -53,6 +53,8 @@ pub struct Config {
     pub cache: CacheConfig,
     pub hedging: HedgingConfig,
     pub chain_overrides: Vec<ChainOverride>,
+    pub state: StateConfig,
+    pub admin: AdminConfig,
 }
 
 impl Default for Config {
@@ -71,6 +73,8 @@ impl Default for Config {
             cache: CacheConfig::default(),
             hedging: HedgingConfig::default(),
             chain_overrides: Vec::new(),
+            state: StateConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 }
@@ -140,6 +144,30 @@ impl Config {
                 .parse()
                 .context("RPCROUTER_DISCOVERY_IDLE_SECONDS is not a valid integer")?;
         }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_BACKEND") {
+            self.state.backend = raw;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_REDIS_URL") {
+            self.state.redis_url = raw;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_NAMESPACE") {
+            self.state.namespace = raw;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_RESET") {
+            self.state.reset = parse_bool(&raw, "RPCROUTER_STATE_RESET")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_RESTORE_HOT") {
+            self.state.restore_hot = parse_bool(&raw, "RPCROUTER_STATE_RESTORE_HOT")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_REQUIRED") {
+            self.state.required = parse_bool(&raw, "RPCROUTER_STATE_REQUIRED")?;
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_ADMIN_TOKEN") {
+            self.admin.auth_token = Some(raw);
+        }
+        if let Some(raw) = env_non_empty("RPCROUTER_ADMIN_STATIC_DIR") {
+            self.admin.static_dir = Some(PathBuf::from(raw));
+        }
         self.validate()
     }
 
@@ -200,6 +228,27 @@ impl Config {
         }
         if self.discovery.max_hot_chains == 0 {
             bail!("discovery.max_hot_chains must be greater than zero");
+        }
+        if self.state.backend != "redis"
+            && self.state.backend != "file"
+            && self.state.backend != "memory"
+        {
+            bail!("state.backend must be redis, file, or memory");
+        }
+        if self.state.namespace.trim().is_empty() {
+            bail!("state.namespace must not be empty");
+        }
+        if self.state.flush_interval_ms == 0 || self.state.health_ttl_seconds == 0 {
+            bail!("state intervals must be greater than zero");
+        }
+        if let Some(token) = &self.admin.auth_token
+            && (token.is_empty() || token.bytes().any(is_header_control))
+        {
+            bail!("admin.auth_token is not a valid HTTP header value");
+        }
+        if self.admin.auth_token.is_some() && self.admin.cors_allow_origins.iter().any(|x| x == "*")
+        {
+            bail!("admin.cors_allow_origins '*' cannot be used with admin.auth_token");
         }
         if self.discovery.idle_seconds == 0 {
             bail!("discovery.idle_seconds must be greater than zero");
@@ -484,6 +533,58 @@ pub struct HedgingConfig {
     pub min_active_endpoints: usize,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct StateConfig {
+    pub backend: String,
+    pub redis_url: String,
+    pub namespace: String,
+    pub required: bool,
+    pub flush_interval_ms: u64,
+    pub health_ttl_seconds: u64,
+    pub reset: bool,
+    pub restore_hot: bool,
+    pub file_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct AdminConfig {
+    pub enabled: bool,
+    pub auth_token: Option<String>,
+    pub static_dir: Option<PathBuf>,
+    pub cors_allow_origins: Vec<String>,
+    pub allow_private_endpoints: bool,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auth_token: None,
+            static_dir: None,
+            cors_allow_origins: Vec::new(),
+            allow_private_endpoints: false,
+        }
+    }
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            backend: "redis".to_owned(),
+            redis_url: "redis://127.0.0.1:6379/0".to_owned(),
+            namespace: "rpcrouter".to_owned(),
+            required: false,
+            flush_interval_ms: 2_000,
+            health_ttl_seconds: 86_400,
+            reset: false,
+            restore_hot: true,
+            file_path: PathBuf::from("./data/state.json"),
+        }
+    }
+}
+
 impl Default for HedgingConfig {
     fn default() -> Self {
         Self {
@@ -686,6 +787,27 @@ mod tests {
                 assert_eq!(
                     config.chainlist.cache_path,
                     std::path::PathBuf::from("/tmp/rpcrs.json")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn env_overrides_admin_settings() {
+        with_env(
+            &[
+                ("RPCROUTER_ADMIN_TOKEN", "secret"),
+                ("RPCROUTER_ADMIN_STATIC_DIR", "/tmp/dashboard"),
+            ],
+            || {
+                let mut config = Config::default();
+                config
+                    .apply_env_overrides()
+                    .expect("admin env overrides should apply");
+                assert_eq!(config.admin.auth_token.as_deref(), Some("secret"));
+                assert_eq!(
+                    config.admin.static_dir,
+                    Some(std::path::PathBuf::from("/tmp/dashboard"))
                 );
             },
         );
