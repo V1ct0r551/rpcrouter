@@ -61,7 +61,7 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 
 状态存储环境变量：`RPCROUTER_STATE_BACKEND=redis|file`、`RPCROUTER_REDIS_URL`、
 `RPCROUTER_STATE_NAMESPACE`、`RPCROUTER_STATE_RESET=1`。默认 Redis 不可达时自动降级为
-内存 + `data/state.json`，不会中断 RPC 流量；`required=true` 用于必须持久化的部署。
+内存 + `data/state.json`，不会中断 RPC 流量；`RPCROUTER_STATE_REQUIRED=true` 用于必须持久化的部署。
 
 仓库配置使用偏保守的缓存确认深度。BSC 按 Maxwell 升级后的约 750ms 出块配置；Polygon
 约 2s、Arbitrum 约 250ms，Base、OP 与 Avalanche 约 2s。tip TTL 不超过对应块时间和 2s。

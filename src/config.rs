@@ -157,6 +157,9 @@ impl Config {
         if let Some(raw) = env_non_empty("RPCROUTER_STATE_RESTORE_HOT") {
             self.state.restore_hot = parse_bool(&raw, "RPCROUTER_STATE_RESTORE_HOT")?;
         }
+        if let Some(raw) = env_non_empty("RPCROUTER_STATE_REQUIRED") {
+            self.state.required = parse_bool(&raw, "RPCROUTER_STATE_REQUIRED")?;
+        }
         self.validate()
     }
 
