@@ -580,6 +580,20 @@ mod tests {
     }
 
     #[test]
+    fn deny_must_not_overlap_pinned_chains() {
+        let error = Config::from_toml(
+            r#"
+                chains = [1]
+                [discovery]
+                enabled = true
+                deny = [1]
+            "#,
+        )
+        .expect_err("pinned deny overlap must fail");
+        assert!(error.to_string().contains("pinned chains"));
+    }
+
+    #[test]
     fn discovery_disabled_requires_non_empty_chains() {
         let error = Config::from_toml("chains = []\n[discovery]\nenabled = false")
             .expect_err("empty chains with discovery disabled should fail");

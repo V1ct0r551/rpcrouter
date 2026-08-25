@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -37,6 +37,14 @@ impl Drop for ProbeGuard<'_> {
     }
 }
 
+struct InFlightGuard<'a>(&'a AtomicU64);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeOutcome {
     Passed,
@@ -63,6 +71,7 @@ pub struct ProbeManager {
     in_flight: Arc<AtomicU64>,
     /// 队列深度（近似，由 channel 长度估算）。
     queue_depth: Arc<AtomicU64>,
+    queued: StdMutex<HashSet<(u64, String)>>,
     /// 工作池并发数。
     max_concurrency: usize,
 }
@@ -91,6 +100,7 @@ impl ProbeManager {
             kick_rx: Mutex::new(kick_rx),
             in_flight,
             queue_depth,
+            queued: StdMutex::new(HashSet::new()),
             max_concurrency: config.probe.max_concurrency,
         })
     }
@@ -118,6 +128,41 @@ impl ProbeManager {
 
     pub fn queue_depth(&self) -> u64 {
         self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    fn enqueue(&self, chain_id: u64, endpoint: Arc<Endpoint>) {
+        let key = (chain_id, endpoint.url().to_owned());
+        let mut queued = self
+            .queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !queued.insert(key.clone()) {
+            return;
+        }
+        if self.queue_tx.try_send((chain_id, endpoint)).is_ok() {
+            self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        } else {
+            queued.remove(&key);
+        }
+    }
+
+    fn mark_received(&self) {
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn complete(&self, chain_id: u64, endpoint: &Endpoint) {
+        let mut queued = self
+            .queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queued.remove(&(chain_id, endpoint.url().to_owned()));
+    }
+
+    async fn schedule_after_completion(&self, chain_id: u64, endpoint: &Endpoint) {
+        self.schedules.lock().await.insert(
+            (chain_id, endpoint.url().to_owned()),
+            Instant::now() + self.jittered_interval(),
+        );
     }
 
     async fn schedule_due_probes(self: &Arc<Self>) {
@@ -153,16 +198,13 @@ impl ProbeManager {
                     continue;
                 }
                 if now >= *next {
-                    *next = now + self.jittered_interval();
                     due.push((chain_id, endpoint));
                 }
             }
         }
 
         for (chain_id, endpoint) in due {
-            if self.queue_tx.try_send((chain_id, endpoint)).is_ok() {
-                self.queue_depth.fetch_add(1, Ordering::Relaxed);
-            }
+            self.enqueue(chain_id, endpoint);
         }
     }
 
@@ -187,12 +229,8 @@ impl ProbeManager {
                     schedules.insert(key, until);
                     continue;
                 }
-                let already_scheduled = schedules.insert(key, now + self.jittered_interval());
-                if already_scheduled.is_none()
-                    && self.queue_tx.try_send((chain_id, endpoint)).is_ok()
-                {
-                    self.queue_depth.fetch_add(1, Ordering::Relaxed);
-                }
+                schedules.insert(key, now + self.jittered_interval());
+                self.enqueue(chain_id, endpoint);
             }
         }
     }
@@ -214,6 +252,7 @@ impl ProbeManager {
         }
         let _probe_guard = ProbeGuard(&endpoint);
         self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _in_flight_guard = InFlightGuard(&self.in_flight);
         let started = Instant::now();
 
         let chain_id_response = match self
@@ -221,20 +260,15 @@ impl ProbeManager {
             .await
         {
             Ok(response) => response,
-            Err(None) => {
-                self.in_flight.fetch_sub(1, Ordering::Relaxed);
-                return ProbeOutcome::Skipped;
-            }
+            Err(None) => return ProbeOutcome::Skipped,
             Err(Some(signal)) => {
                 endpoint.record_failure(now + started.elapsed(), signal.clone());
-                self.in_flight.fetch_sub(1, Ordering::Relaxed);
                 return ProbeOutcome::Failed(signal.kind);
             }
         };
         let Some(actual_chain_id) = parse_hex_result(&chain_id_response) else {
             let signal = FailureSignal::new(FaultKind::InvalidResponse);
             endpoint.record_failure(now + started.elapsed(), signal.clone());
-            self.in_flight.fetch_sub(1, Ordering::Relaxed);
             return ProbeOutcome::Failed(signal.kind);
         };
         if actual_chain_id != chain_id {
@@ -247,7 +281,6 @@ impl ProbeManager {
                 endpoint = endpoint.url(),
                 "probe removed endpoint with mismatched chain ID"
             );
-            self.in_flight.fetch_sub(1, Ordering::Relaxed);
             return ProbeOutcome::RemovedWrongChain {
                 actual: actual_chain_id,
             };
@@ -258,20 +291,15 @@ impl ProbeManager {
             .await
         {
             Ok(response) => response,
-            Err(None) => {
-                self.in_flight.fetch_sub(1, Ordering::Relaxed);
-                return ProbeOutcome::Skipped;
-            }
+            Err(None) => return ProbeOutcome::Skipped,
             Err(Some(signal)) => {
                 endpoint.record_failure(now + started.elapsed(), signal.clone());
-                self.in_flight.fetch_sub(1, Ordering::Relaxed);
                 return ProbeOutcome::Failed(signal.kind);
             }
         };
         let Some(height) = parse_hex_result(&block_response) else {
             let signal = FailureSignal::new(FaultKind::InvalidResponse);
             endpoint.record_failure(now + started.elapsed(), signal.clone());
-            self.in_flight.fetch_sub(1, Ordering::Relaxed);
             return ProbeOutcome::Failed(signal.kind);
         };
 
@@ -282,7 +310,6 @@ impl ProbeManager {
             .record_probe_height(chain_id, &endpoint, height, finished)
             .await;
         debug!(chain_id, endpoint = endpoint.url(), height, "probe passed");
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
         ProbeOutcome::Passed
     }
 
@@ -365,10 +392,12 @@ async fn worker_pool(manager: Arc<ProbeManager>, mut rx: ProbeQueueRx) {
         tokio::select! {
             item = rx.recv() => {
                 let Some((chain_id, endpoint)) = item else { break };
-                manager.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                manager.mark_received();
                 let manager = Arc::clone(&manager);
                 active.spawn(async move {
-                    manager.probe_endpoint(chain_id, endpoint).await;
+                    manager.probe_endpoint(chain_id, Arc::clone(&endpoint)).await;
+                    manager.schedule_after_completion(chain_id, &endpoint).await;
+                    manager.complete(chain_id, &endpoint);
                 });
             }
             joined = active.join_next(), if !active.is_empty() => {

@@ -49,6 +49,16 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
 | `rpcrouter_endpoint_rate_limited_total` | Counter | `chain_id,endpoint` | 端点收到的限频响应 |
 | `rpcrouter_endpoint_cooling_events_total` | Counter | `chain_id,endpoint` | 端点进入 Cooling 的次数 |
 | `rpcrouter_endpoint_state` | Gauge（单热） | `chain_id,endpoint,state` | state ∈ `active`/`cooling`/`probation`，当前态=1 |
+| `rpcrouter_chains` | Gauge | `state` | pinned/hot/dormant/disabled 生命周期链数量 |
+| `rpcrouter_chain_pinned` | Gauge | `chain_id` | materialized 链是否 pinned（1/0） |
+| `rpcrouter_catalog_chains` | Gauge | — | 目录链数量（含 dormant/0 端点链） |
+| `rpcrouter_catalog_endpoints` | Gauge | — | 目录过滤后的公开端点数量 |
+| `rpcrouter_probe_queue_depth` | Gauge | — | 等待探测的有界队列深度 |
+| `rpcrouter_probe_in_flight` | Gauge | — | 当前在飞探针数 |
+| `rpcrouter_chainlist_last_refresh_timestamp_seconds` | Gauge | — | 最近一次新鲜 chainlist 刷新 Unix 时间 |
+| `rpcrouter_chainlist_refresh_total` | Counter | `source` | network/not_modified/memory/disk/fixture 刷新次数 |
+| `rpcrouter_chain_activations_total` | Counter | — | dormant → hot 激活次数 |
+| `rpcrouter_chain_demotions_total` | Counter | `reason` | idle/lru/admin 降级次数 |
 
 ### 3. 语义边界：`ingress_rejected` ≠ `user_visible_errors`（重要）
 
@@ -61,6 +71,9 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
   - `overload`：全局并发超限（默认 1024 在飞），HTTP 503。
   - `body_too_large`：请求体超过 `server.max_body_bytes`（默认 256 KiB），HTTP 413。
   - `rate_limited`：每 IP 限速命中（可选开关），HTTP 429。
+  - `unknown_chain`：链不在目录，HTTP 404。
+  - `no_endpoints`：已知链没有公开端点，HTTP 503。
+  - `chain_disabled`：链被 deny/运行时禁用，HTTP 403。
 
 **两者完全独立、不可混算。** 查询「调用方是否受损」只看 `user_visible_errors`；
 查询「网关是否过载/配置过紧」看 `ingress_rejected`。Grafana 也分面板展示。
@@ -70,7 +83,7 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
 | 告警 | 触发表达式 | 严重度 | 含义 |
 |---|---|---|---|
 | `RpcrouterUserVisibleErrors` | `sum by(chain_id)(rate(rpcrouter_user_visible_errors_total[2m])) > 0` 持续 2m | critical | 上游承诺失败，链端点全不可用 |
-| `RpcrouterChainActiveEndpointsLow` | `sum by(chain_id)(rpcrouter_endpoint_state{state="active"}) < 2` 持续 5m | warning | 某链 active 端点不足，冗余耗尽 |
+| `RpcrouterChainActiveEndpointsLow` | `sum by(chain_id)(rpcrouter_endpoint_state{state="active"}) < 2 and on(chain_id) rpcrouter_chain_pinned == 1` 持续 5m | warning | pinned 链 active 端点不足；动态链不触发 |
 | `RpcrouterCacheHitRatioDropped` | `max_over_time(rpcrouter_cache_hit_ratio[1m]) < 0.8` 持续 5m | warning | 缓存命中率骤降，数据面压力放大 |
 | `RpcrouterUpstreamRateLimitedSpike` | 429 速率 / 上游速率 > 10% 持续 5m | warning | 上游限频占比突增 |
 | `RpcrouterIngressRejectionsSpiking` | `sum by(reason)(rate(rpcrouter_ingress_rejected_total[3m])) > 0` 持续 3m | warning | 入口防护持续拒绝请求 |

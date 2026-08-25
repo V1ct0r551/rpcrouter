@@ -489,7 +489,7 @@ pub struct Registry {
     /// v2 指标快照：chainlist 最近刷新时间戳（由 main 刷新循环更新）。
     chainlist_last_refresh_unix: AtomicU64,
     /// v2 指标快照：chainlist 最近刷新来源（由 main 刷新循环更新）。
-    chainlist_refresh_source: RwLock<String>,
+    chainlist_refresh_source: Mutex<String>,
     /// v2 指标快照：探针在飞/队列深度（由 ProbeManager 共享更新）。
     pub probe_in_flight: Arc<AtomicU64>,
     pub probe_queue_depth: Arc<AtomicU64>,
@@ -512,7 +512,7 @@ impl Registry {
             catalog_chains_count: AtomicU64::new(0),
             catalog_endpoints_count: AtomicU64::new(0),
             chainlist_last_refresh_unix: AtomicU64::new(0),
-            chainlist_refresh_source: RwLock::new(String::new()),
+            chainlist_refresh_source: Mutex::new(String::new()),
             probe_in_flight: Arc::new(AtomicU64::new(0)),
             probe_queue_depth: Arc::new(AtomicU64::new(0)),
         }
@@ -831,7 +831,10 @@ impl Registry {
 
     /// housekeeping：idle 降级 + LRU 淘汰。
     pub async fn housekeeping(&self) {
-        let now_sec = unix_seconds();
+        self.housekeeping_at(unix_seconds()).await;
+    }
+
+    async fn housekeeping_at(&self, now_sec: u64) {
         let idle_seconds = self.config.discovery.idle_seconds;
         let max_hot = self.config.discovery.max_hot_chains;
 
@@ -1052,17 +1055,12 @@ impl Registry {
     pub fn record_chainlist_refresh(&self, unix_ts: u64, source: &str) {
         self.chainlist_last_refresh_unix
             .store(unix_ts, Ordering::Relaxed);
-        if let Ok(mut s) = self.chainlist_refresh_source.try_write() {
-            *s = source.to_owned();
-        }
+        *lock(&self.chainlist_refresh_source) = source.to_owned();
     }
 
     /// v2 指标：chainlist 最近刷新来源。
     pub fn chainlist_refresh_source_str(&self) -> String {
-        self.chainlist_refresh_source
-            .try_read()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        lock(&self.chainlist_refresh_source).clone()
     }
 
     // ── summaries（v2：增加 state 字段） ──
@@ -1123,6 +1121,9 @@ impl Registry {
         if let Some(catalog) = catalog.as_ref() {
             for chain in &catalog.chains {
                 if self.chains.contains_key(&chain.chain_id) {
+                    continue;
+                }
+                if !self.config.discovery.enabled && !self.config.chains.contains(&chain.chain_id) {
                     continue;
                 }
                 if self.config.discovery.deny.contains(&chain.chain_id) {
@@ -1250,7 +1251,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::chainlist::CatalogChain;
+    use crate::chainlist::{CatalogChain, CatalogEndpoint};
 
     use super::*;
 
@@ -1425,6 +1426,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_merges_materialized_dynamic_chain() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 42,
+                    name: "Dynamic".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "http://old".to_owned(),
+                        tracking: None,
+                    }],
+                }],
+                by_id: HashMap::from([(42, 0)]),
+            }))
+            .await;
+        registry.resolve_for_request(42).await.expect("activate");
+        registry
+            .apply_snapshot(&ChainlistSnapshot {
+                chains: vec![ChainEndpoints {
+                    chain_id: 42,
+                    name: "Dynamic refreshed".to_owned(),
+                    endpoints: vec!["http://new".to_owned()],
+                }],
+            })
+            .await;
+        assert!(registry.endpoint(42, "http://new").await.is_some());
+        assert_eq!(registry.chain_activations(), 1);
+    }
+
+    #[tokio::test]
     async fn tracks_trimmed_head_and_penalizes_lag_or_high_outliers() {
         let config = Config {
             chains: vec![1],
@@ -1474,6 +1521,59 @@ mod tests {
         let registry = Registry::new(&config);
         // 没有 catalog，也没有 pinned 999999。
         assert!(registry.resolve_for_request(999999).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_disabled_only_serves_pinned_chains() {
+        let config = Config {
+            chains: vec![1],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![
+                CatalogChain {
+                    chain_id: 1,
+                    name: "Pinned".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "https://pinned.example".to_owned(),
+                        tracking: None,
+                    }],
+                },
+                CatalogChain {
+                    chain_id: 2,
+                    name: "Dynamic".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "https://dynamic.example".to_owned(),
+                        tracking: None,
+                    }],
+                },
+            ],
+            by_id: HashMap::from([(1, 0), (2, 1)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+        assert!(registry.resolve_for_request(1).await.is_some());
+        assert!(registry.resolve_for_request(2).await.is_none());
     }
 
     #[tokio::test]
@@ -1609,11 +1709,12 @@ mod tests {
         assert_eq!(registry.all_endpoints(7).await.len(), 1);
         assert_eq!(registry.chain_counts().await.hot, 1);
 
-        // 等待 idle 超时（1 秒）。
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // housekeeping 降级。
-        registry.housekeeping().await;
+        let last_ingress = registry
+            .chain(7)
+            .expect("chain state")
+            .last_ingress
+            .load(Ordering::Relaxed);
+        registry.housekeeping_at(last_ingress + 2).await;
 
         // 验证已降级。
         let counts = registry.chain_counts().await;
@@ -1663,9 +1764,12 @@ mod tests {
         let _ = registry.resolve_for_request(1).await.expect("chain 1");
         assert_eq!(registry.chain_counts().await.pinned, 1);
 
-        // 等待 idle 超时。
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        registry.housekeeping().await;
+        let last_ingress = registry
+            .chain(1)
+            .expect("chain state")
+            .last_ingress
+            .load(Ordering::Relaxed);
+        registry.housekeeping_at(last_ingress + 2).await;
 
         // pinned 不降级。
         let counts = registry.chain_counts().await;
@@ -1772,8 +1876,25 @@ mod tests {
         let _ = registry.resolve_for_request(3).await.expect("chain 3");
         assert_eq!(registry.chain_counts().await.hot, 3);
 
+        let base = unix_seconds();
+        registry
+            .chain(1)
+            .expect("chain 1")
+            .last_ingress
+            .store(base, Ordering::Relaxed);
+        registry
+            .chain(2)
+            .expect("chain 2")
+            .last_ingress
+            .store(base + 1, Ordering::Relaxed);
+        registry
+            .chain(3)
+            .expect("chain 3")
+            .last_ingress
+            .store(base + 2, Ordering::Relaxed);
+
         // housekeeping: max_hot_chains=2，应淘汰 1 条链。
-        registry.housekeeping().await;
+        registry.housekeeping_at(base + 2).await;
 
         let counts = registry.chain_counts().await;
         assert_eq!(counts.hot, 2);
@@ -1782,11 +1903,16 @@ mod tests {
         // 恰好 1 条链被淘汰（端点清空）。
         let mut evicted = Vec::new();
         for id in [1u64, 2, 3] {
-            if registry.all_endpoints(id).await.len() == 0 {
+            if registry.all_endpoints(id).await.is_empty() {
                 evicted.push(id);
             }
         }
         assert_eq!(evicted.len(), 1, "exactly one chain should be evicted");
+        assert_eq!(
+            evicted,
+            vec![1],
+            "least recently used chain must be evicted"
+        );
 
         let (idle, lru, _) = registry.chain_demotions();
         assert_eq!(idle, 0);
@@ -1839,9 +1965,8 @@ mod tests {
         let s1 = registry.resolve_for_request(99).await.expect("chain 99");
         assert_eq!(s1.state_label(), ChainStateLabel::Hot);
 
-        // 降级。
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        registry.housekeeping().await;
+        let last_ingress = s1.last_ingress.load(Ordering::Relaxed);
+        registry.housekeeping_at(last_ingress + 2).await;
         assert_eq!(registry.chain_counts().await.hot, 0);
 
         // 重新激活。

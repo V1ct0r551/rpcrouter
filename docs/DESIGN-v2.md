@@ -228,3 +228,10 @@ POST/PUT/DELETE 一律 403 `admin_disabled`。`[admin].enabled=false` → 整个
 
 命名链路由（`/ethereum/...`，ROADMAP P4）、非 EVM 链、WebSocket、多实例共享覆写、
 基于探针的块时间自适应、Dashboard 用户体系（单 token 即可）。
+
+## 实现偏差记录（W5）
+
+- Catalog 的 `by_id` 使用 `HashMap<u64, usize>`，使目录热路径查找为 O(1)；其余目录元数据与过滤规则保持不变。
+- 探针调度使用固定并发的 `JoinSet` 工作池和有界 channel，并在端点级去重；不再为每个排队项创建等待信号量的任务。
+- 刷新周期通过 `ChainlistLoader::refresh()` 与手动刷新共享互斥状态；Memory/Disk/Fixture 回退不会伪造新鲜刷新时间。
+- `discovery.enabled=false` 在 registry 路由层拒绝非 pinned 目录链，保持 v1 语义；deny 与 pinned 的冲突在配置校验阶段拒绝。

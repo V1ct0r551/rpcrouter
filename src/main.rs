@@ -34,19 +34,14 @@ async fn main() -> Result<()> {
     info!(source = ?initial.source, chains = initial.catalog.chains.len(), "chainlist loaded");
     registry.set_catalog(initial.catalog).await;
     registry.apply_snapshot(&initial.snapshot).await;
-    if matches!(
+    let initial_is_fresh = matches!(
         initial.source,
         rpcrouter::chainlist::RefreshSource::Network
             | rpcrouter::chainlist::RefreshSource::NotModified
-    ) {
+    );
+    if initial_is_fresh {
         registry.record_chainlist_refresh(unix_seconds(), initial.source.label());
     }
-
-    spawn_chainlist_refresh(
-        Arc::clone(&chainlist),
-        Arc::clone(&registry),
-        Duration::from_secs(config.chainlist.refresh_seconds),
-    );
     let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
     spawn_probes(probes);
 
@@ -54,6 +49,14 @@ async fn main() -> Result<()> {
     spawn_housekeeping(Arc::clone(&registry));
 
     let forwarder = Arc::new(Forwarder::new(Arc::clone(&registry), &config)?);
+    let metrics = forwarder.metrics();
+    metrics.record_chainlist_refresh(initial.source.label());
+    spawn_chainlist_refresh(
+        Arc::clone(&chainlist),
+        Arc::clone(&registry),
+        metrics,
+        Duration::from_secs(config.chainlist.refresh_seconds),
+    );
     let per_ip = if config.server.per_ip_rate_limit.enabled {
         Some((
             config.server.per_ip_rate_limit.requests_per_second,
@@ -108,6 +111,7 @@ fn forced_shutdown_exit_code() -> i32 {
 fn spawn_chainlist_refresh(
     chainlist: Arc<ChainlistLoader>,
     registry: Arc<Registry>,
+    metrics: Arc<rpcrouter::metrics::Metrics>,
     refresh_interval: Duration,
 ) {
     tokio::spawn(async move {
@@ -126,6 +130,7 @@ fn spawn_chainlist_refresh(
                     ) {
                         registry.record_chainlist_refresh(unix_seconds(), result.source.label());
                     }
+                    metrics.record_chainlist_refresh(result.source.label());
                     info!(source = ?result.source, "chainlist refresh completed");
                 }
                 Ok(None) => info!("chainlist refresh skipped because another refresh is running"),

@@ -76,7 +76,6 @@ struct V2Totals {
     demotions_idle: u64,
     demotions_lru: u64,
     demotions_admin: u64,
-    refresh_timestamp: u64,
 }
 
 impl Metrics {
@@ -528,7 +527,6 @@ impl Metrics {
         let activations = rpc_registry.chain_activations();
         let (demotions_idle, demotions_lru, demotions_admin) = rpc_registry.chain_demotions();
         let mut totals = lock(&self.v2_totals);
-        let previous_refresh_timestamp = totals.refresh_timestamp;
         self.chain_activations
             .inc_by(activations.saturating_sub(totals.activations));
         for (reason, current, previous) in [
@@ -545,18 +543,7 @@ impl Metrics {
             demotions_idle,
             demotions_lru,
             demotions_admin,
-            refresh_timestamp: previous_refresh_timestamp,
         };
-        let refresh_ts = rpc_registry.chainlist_last_refresh();
-        if refresh_ts != previous_refresh_timestamp {
-            let source = rpc_registry.chainlist_refresh_source_str();
-            if !source.is_empty() {
-                self.chainlist_refresh_total
-                    .with_label_values(&[&source])
-                    .inc();
-            }
-            totals.refresh_timestamp = refresh_ts;
-        }
     }
 
     async fn sync_endpoints(&self, rpc_registry: &Registry) {
@@ -633,8 +620,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        chainlist::{ChainEndpoints, ChainlistSnapshot},
-        config::Config,
+        chainlist::{Catalog, CatalogChain, CatalogEndpoint, ChainEndpoints, ChainlistSnapshot},
+        config::{Config, DiscoveryConfig},
     };
 
     use super::*;
@@ -666,5 +653,47 @@ mod tests {
         assert!(encoded.contains("rpcrouter_cache_hit_ratio{chain_id=\"1\"} 1"));
         assert!(encoded.contains("rpcrouter_endpoint_state"));
         assert!(encoded.contains("endpoint=\"http://upstream\""));
+        assert!(encoded.contains("rpcrouter_chain_pinned{chain_id=\"1\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn syncs_lifecycle_counter_deltas() {
+        let config = Config {
+            chains: vec![],
+            discovery: DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 42,
+                    name: "Dynamic".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "http://upstream".to_owned(),
+                        tracking: None,
+                    }],
+                }],
+                by_id: HashMap::from([(42, 0)]),
+            }))
+            .await;
+        registry.resolve_for_request(42).await.expect("activate");
+        registry.demote(42, "lru").await;
+        let metrics = Metrics::new().expect("metrics");
+        let encoded = metrics.encode(&registry).await.expect("encode");
+        assert!(encoded.contains("rpcrouter_chain_activations_total 1"));
+        assert!(encoded.contains("rpcrouter_chain_demotions_total{reason=\"lru\"} 1"));
+        assert!(encoded.contains("rpcrouter_chains{state=\"dormant\"} 1"));
     }
 }

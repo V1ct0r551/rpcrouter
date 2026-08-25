@@ -824,4 +824,118 @@ mod tests {
         assert!(encoded.contains("rpcrouter_ingress_rejected_total{reason=\"no_endpoints\"}"));
         assert!(encoded.contains("rpcrouter_ingress_rejected_total{reason=\"chain_disabled\"}"));
     }
+
+    #[tokio::test]
+    async fn dormant_chain_cold_start_serves_and_becomes_hot() {
+        let (base, calls) = spawn_mock().await;
+        let config = Config {
+            chains: vec![],
+            discovery: DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            upstream: UpstreamConfig {
+                request_timeout_ms: 100,
+                slow_threshold_ms: 50,
+                deadline_ms: 500,
+                max_attempts: 2,
+                default_rps: 100,
+                default_concurrency: 8,
+            },
+            ..Config::default()
+        };
+        let registry = Arc::new(Registry::new(&config));
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 777,
+                    name: "Dynamic".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: format!("{base}/rpc"),
+                        tracking: None,
+                    }],
+                }],
+                by_id: std::collections::HashMap::from([(777, 0)]),
+            }))
+            .await;
+        assert_eq!(registry.chain_counts().await.dormant, 1);
+        let forwarder =
+            Arc::new(Forwarder::new(Arc::clone(&registry), &config).expect("forwarder"));
+        let app = router(AppState::new(
+            Arc::clone(&registry),
+            forwarder,
+            config.server.batch_limit,
+        ));
+        let (status, body) = post_json_status(
+            app,
+            "/rpc/777",
+            json!({"jsonrpc":"2.0", "id":1, "method":"eth_blockNumber", "params":[]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"], "eth_blockNumber");
+        assert_eq!(registry.chain_counts().await.hot, 1);
+        assert_eq!(registry.user_visible_errors(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_semantic_rejection_resolves_chain_once() {
+        let config = Config {
+            chains: vec![],
+            discovery: DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Arc::new(Registry::new(&config));
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 127,
+                    name: "Empty".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![],
+                }],
+                by_id: std::collections::HashMap::from([(127, 0)]),
+            }))
+            .await;
+        let forwarder =
+            Arc::new(Forwarder::new(Arc::clone(&registry), &config).expect("forwarder"));
+        let metrics = forwarder.metrics();
+        let app = router(AppState::new(
+            registry.clone(),
+            forwarder,
+            config.server.batch_limit,
+        ));
+        let (status, _) = post_json_status(app.clone(), "/rpc/999", json!([{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]},{"jsonrpc":"2.0","id":2,"method":"eth_blockNumber","params":[]}])).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = post_json_status(
+            app,
+            "/rpc/127",
+            json!([{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let encoded = metrics.encode(&registry).await.expect("metrics");
+        assert!(encoded.contains("reason=\"unknown_chain\"} 1"));
+        assert!(encoded.contains("reason=\"no_endpoints\"} 1"));
+        assert_eq!(registry.user_visible_errors(), 0);
+    }
 }
