@@ -65,3 +65,7 @@ v1 已交付（2026-07-26 验收）。后续任务规划统一沉淀在 `docs/RO
 - [ ] ROADMAP P3 动态全链目录 + 状态控制 Dashboard（2026-08-25 立项；W5 → W6 → W7 串行
       推进，见 docs/TASKS-v2.md）。前端为独立 React 工程 `dashboard/`，前端门槛：
       `npm run lint && npm run typecheck && npm test && npm run build`。
+  - [x] W5 动态目录 + 链生命周期（2026-08-25 合入：目录 2887 链 / 5562 端点，pinned/hot/dormant/
+        disabled 生命周期，未知链 404 / 无端点 503 / 禁用 403 不计 UVE，冷启动失败单独计数，
+        有界探针池；10k 压测 p99 1.5ms、UVE 0，见 docs/reports/loadtest-w5.md）。
+  - [ ] W6a Redis 状态存储层 → W6b Admin REST API → W7 React dashboard。

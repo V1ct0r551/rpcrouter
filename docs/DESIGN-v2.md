@@ -222,6 +222,8 @@ default）。另有状态管理接口：`GET /admin/api/state`（后端/连通�
   `rpcrouter_catalog_chains`、`rpcrouter_catalog_endpoints`、`rpcrouter_probe_queue_depth`、
   `rpcrouter_probe_in_flight`、`rpcrouter_chainlist_last_refresh_timestamp_seconds`、
   `rpcrouter_chainlist_refresh_total{source}`、`rpcrouter_chain_activations_total`、
+  `rpcrouter_catalog_records_skipped_total`（逐记录容错解析跳过数）、
+  `rpcrouter_cold_start_failures_total{chain_id}`（无 Active 端点时的冷启动失败，不计 UVE）、
   `rpcrouter_chain_demotions_total{reason="idle|lru|admin"}`；`ingress_rejected` 新增
   reason `unknown_chain|no_endpoints|chain_disabled`。
 - 端点级指标只覆盖 materialized 链（基数受 `max_hot_chains` 约束）。
@@ -340,3 +342,11 @@ Phase B 各项仅作为 P5 备选，按需再立项。** 不用轮询：轮询�
 ### 容量与告警
 - 每实例 `rpcrouter_in_flight_requests`、`ingress_rejected{overload}` 是扩容信号；
   `rpcrouter_chains{state="hot"}` 与探针队列深度反映分片是否失衡。
+
+## 13. 实现偏差记录（W5，maker 回写）
+
+- Catalog 的 `by_id` 使用 `HashMap<u64, usize>`，使目录热路径查找为 O(1)；其余目录元数据与过滤规则保持不变。
+- 探针调度使用固定并发的 `JoinSet` 工作池和有界 channel，并在端点级去重；不再为每个排队项创建等待信号量的任务。
+- 刷新周期通过 `ChainlistLoader::refresh()` 与手动刷新共享互斥状态；Memory/Disk/Fixture 回退不会伪造新鲜刷新时间。
+- `discovery.enabled=false` 在 registry 路由层拒绝非 pinned 目录链，保持 v1 语义；deny 与 pinned 的冲突在配置校验阶段拒绝。
+- 已知限制：`rpcrouter_chain_pinned` 标签数最坏为 materialized 链数；极端 `Retry-After` 仍可能触发 `Instant` 加法边界；墙钟向后跳可能延迟/集中一次 idle 降级；未知链 Classifier 仍使用默认 TTL，而配置中 1/143 有专用值；RPC 条目自身仍要求字符串或含字符串 `url` 的对象。上述项不影响 W5 的动态目录、生命周期边界与离线验收，留待后续独立加固。

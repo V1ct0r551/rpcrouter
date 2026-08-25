@@ -1,9 +1,10 @@
+use std::ops::Deref;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     num::NonZeroU32,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,12 +14,12 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use rand::Rng;
 use serde::Serialize;
 use tokio::{
-    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, broadcast},
     time::{Duration, Instant},
 };
 
 use crate::{
-    chainlist::{ChainEndpoints, ChainlistSnapshot},
+    chainlist::{Catalog, ChainEndpoints, ChainlistSnapshot},
     config::Config,
     signals::{FailureSignal, FaultKind},
 };
@@ -28,11 +29,46 @@ const STRIKE_DECAY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const FAULTS_BEFORE_COOLING: u8 = 3;
 const PROBATION_PASSES_REQUIRED: u8 = 2;
 
+// ── 端点状态机（v1 不变） ──
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum EndpointState {
     Active,
     Cooling { until: Instant, strikes: u32 },
     Probation { passes: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolKind {
+    Active,
+    Probation,
+    Empty,
+}
+
+pub struct CandidateSet {
+    pub endpoints: Vec<Arc<Endpoint>>,
+    pub kind: PoolKind,
+}
+
+struct ActivationLockCleanup<'a> {
+    locks: &'a DashMap<u64, Arc<tokio::sync::Mutex<()>>>,
+    chain_id: u64,
+}
+
+impl Drop for ActivationLockCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .locks
+            .remove_if(&self.chain_id, |_, lock| Arc::strong_count(lock) <= 2);
+    }
+}
+
+impl Deref for CandidateSet {
+    type Target = [Arc<Endpoint>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.endpoints
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +191,8 @@ pub struct Endpoint {
     lag: AtomicU64,
     height_observation: Mutex<Option<(u64, Instant)>>,
     stats: EndpointStats,
+    /// 同一端点同一时刻至多一个在飞探针（防止 kick 与周期调度重复入队）。
+    probing: AtomicBool,
 }
 
 impl Endpoint {
@@ -174,6 +212,7 @@ impl Endpoint {
             lag: AtomicU64::new(0),
             height_observation: Mutex::new(None),
             stats: EndpointStats::default(),
+            probing: AtomicBool::new(false),
         }
     }
 
@@ -211,10 +250,17 @@ impl Endpoint {
     }
 
     pub fn begin_probe(&self, now: Instant) -> bool {
+        // 同一端点同一时刻至多一个在飞探针。
+        if self.probing.swap(true, Ordering::AcqRel) {
+            return false;
+        }
         let mut health = lock(&self.health);
         health.decay_strikes(now);
         match health.status {
-            HealthStatus::Cooling { until } if now < until => false,
+            HealthStatus::Cooling { until } if now < until => {
+                self.probing.store(false, Ordering::Release);
+                false
+            }
             HealthStatus::Cooling { .. } => {
                 health.status = HealthStatus::Probation { passes: 0 };
                 health.consecutive_faults = 0;
@@ -223,6 +269,11 @@ impl Endpoint {
             }
             HealthStatus::Active | HealthStatus::Probation { .. } => true,
         }
+    }
+
+    /// 标记探针结束（探测者必须在探针完成/跳过后调用，释放 per-endpoint 探针位）。
+    pub fn end_probe(&self) {
+        self.probing.store(false, Ordering::Release);
     }
 
     pub fn try_acquire(self: &Arc<Self>) -> Option<EndpointLease> {
@@ -394,42 +445,325 @@ impl EndpointLease {
     }
 }
 
-struct ChainState {
+// ── 链状态（v2：增加生命周期字段） ──
+
+/// 链的可见状态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChainStateLabel {
+    Pinned,
+    Hot,
+    Dormant,
+    Disabled,
+}
+
+pub(crate) struct ChainState {
     chain_id: u64,
     name: RwLock<String>,
     endpoints: RwLock<Vec<Arc<Endpoint>>>,
     rejected: RwLock<HashSet<String>>,
     head: AtomicU64,
+    /// pinned 链永不降级，启动即 materialize。
+    pinned: AtomicBool,
+    /// disabled 链拒绝流量（403）。
+    disabled: AtomicBool,
+    /// 最后一次入口请求的 Unix 秒时间戳（粗粒度，仅秒值变化时写入）。
+    last_ingress: AtomicU64,
 }
 
 impl ChainState {
-    fn new(chain_id: u64, name: String) -> Self {
+    fn new(chain_id: u64, name: String, pinned: bool) -> Self {
         Self {
             chain_id,
             name: RwLock::new(name),
             endpoints: RwLock::new(Vec::new()),
             rejected: RwLock::new(HashSet::new()),
             head: AtomicU64::new(0),
+            pinned: AtomicBool::new(pinned),
+            disabled: AtomicBool::new(false),
+            last_ingress: AtomicU64::new(0),
+        }
+    }
+
+    pub fn state_label(&self) -> ChainStateLabel {
+        if self.disabled.load(Ordering::Relaxed) {
+            ChainStateLabel::Disabled
+        } else if self.pinned.load(Ordering::Relaxed) {
+            ChainStateLabel::Pinned
+        } else if self.last_ingress.load(Ordering::Relaxed) > 0 {
+            ChainStateLabel::Hot
+        } else {
+            ChainStateLabel::Dormant
         }
     }
 }
 
+// ── Registry（v2） ──
+
+/// 激活通知：新链被 materialize 时发送 chain_id。
+pub type ActivationKick = broadcast::Sender<u64>;
+
 pub struct Registry {
     chains: DashMap<u64, Arc<ChainState>>,
+    activation_locks: DashMap<u64, Arc<tokio::sync::Mutex<()>>>,
+    runtime_pinned: DashMap<u64, bool>,
+    catalog: RwLock<Option<Arc<Catalog>>>,
     config: Config,
     user_visible_errors: AtomicU64,
+    /// 链激活计数器。
+    chain_activations: AtomicU64,
+    /// 链降级计数器，按 reason。
+    chain_demotions_idle: AtomicU64,
+    chain_demotions_lru: AtomicU64,
+    chain_demotions_admin: AtomicU64,
+    /// 激活通知通道（探针调度器订阅）。
+    activation_tx: broadcast::Sender<u64>,
+    /// v2 指标快照：目录链/端点数量（由 set_catalog 更新）。
+    catalog_chains_count: AtomicU64,
+    catalog_endpoints_count: AtomicU64,
+    /// v2 指标快照：chainlist 最近刷新时间戳（由 main 刷新循环更新）。
+    chainlist_last_refresh_unix: AtomicU64,
+    /// v2 指标快照：chainlist 最近刷新来源（由 main 刷新循环更新）。
+    chainlist_refresh_source: Mutex<String>,
+    /// v2 指标快照：探针在飞/队列深度（由 ProbeManager 共享更新）。
+    pub probe_in_flight: Arc<AtomicU64>,
+    pub probe_queue_depth: Arc<AtomicU64>,
 }
 
 impl Registry {
     pub fn new(config: &Config) -> Self {
+        let (activation_tx, _) = broadcast::channel(256);
         Self {
             chains: DashMap::new(),
+            activation_locks: DashMap::new(),
+            runtime_pinned: DashMap::new(),
+            catalog: RwLock::new(None),
             config: config.clone(),
             user_visible_errors: AtomicU64::new(0),
+            chain_activations: AtomicU64::new(0),
+            chain_demotions_idle: AtomicU64::new(0),
+            chain_demotions_lru: AtomicU64::new(0),
+            chain_demotions_admin: AtomicU64::new(0),
+            activation_tx,
+            catalog_chains_count: AtomicU64::new(0),
+            catalog_endpoints_count: AtomicU64::new(0),
+            chainlist_last_refresh_unix: AtomicU64::new(0),
+            chainlist_refresh_source: Mutex::new(String::new()),
+            probe_in_flight: Arc::new(AtomicU64::new(0)),
+            probe_queue_depth: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    /// 设置目录（每次 chainlist 刷新整体替换）。
+    pub async fn set_catalog(&self, catalog: Arc<Catalog>) {
+        let chain_count = catalog.chains.len() as u64;
+        let endpoint_count: u64 = catalog
+            .chains
+            .iter()
+            .map(|ch| ch.endpoints.len() as u64)
+            .sum();
+        self.catalog_chains_count
+            .store(chain_count, Ordering::Relaxed);
+        self.catalog_endpoints_count
+            .store(endpoint_count, Ordering::Relaxed);
+        *self.catalog.write().await = Some(catalog);
+    }
+
+    /// 获取当前目录（只读）。
+    pub async fn catalog(&self) -> Option<Arc<Catalog>> {
+        self.catalog.read().await.clone()
+    }
+
+    /// 激活通知通道（探针订阅）。
+    pub fn activation_channel(&self) -> broadcast::Sender<u64> {
+        self.activation_tx.clone()
+    }
+
+    // ── 热路径：resolve_for_request ──
+
+    /// 热路径：解析 chain_id 并触达 ChainState。
+    /// DashMap get + 原子读；dormant 时才走慢路径 materialize。
+    /// 返回 `None` 表示未知链（不在目录也不在 pinned）。
+    pub(crate) async fn resolve_for_request(&self, chain_id: u64) -> Option<Arc<ChainState>> {
+        // 路由层用这个做语义判定：未知链 / 0端点 / disabled。
+        // 先查 DashMap（已 materialized 的链）。
+        if let Some(state) = self.chain(chain_id) {
+            let label = state.state_label();
+            // disabled 链直接返回，由 server 层返回 403。
+            if label == ChainStateLabel::Disabled {
+                return Some(state);
+            }
+            // dormant 链（已降级，端点运行态已丢弃）需要重新 materialize。
+            if label == ChainStateLabel::Dormant {
+                // Dormant 状态由锁内慢路径统一替换，避免并发请求删除新建状态。
+            } else {
+                // pinned / hot：更新 last_ingress 并返回。
+                let now_sec = unix_seconds();
+                let last = state.last_ingress.load(Ordering::Relaxed);
+                if now_sec != last {
+                    state.last_ingress.store(now_sec, Ordering::Relaxed);
+                }
+                return Some(state);
+            }
+        }
+
+        // 未知链不得污染 activation_locks：先完成目录/配置判定，再建立锁。
+        let pinned = self.config.chains.contains(&chain_id)
+            || self
+                .runtime_pinned
+                .get(&chain_id)
+                .is_some_and(|value| *value);
+        let denied = self.config.discovery.deny.contains(&chain_id);
+        let catalog = self.catalog.read().await;
+        let catalog_entry = catalog.as_ref().and_then(|c| c.lookup(chain_id));
+        if !denied
+            && ((!self.config.discovery.enabled && !pinned) || (catalog_entry.is_none() && !pinned))
+        {
+            return None;
+        }
+        drop(catalog);
+
+        // 串行化同一链的首次 materialize，避免重复激活/kick。
+        let activation_lock = self
+            .activation_locks
+            .entry(chain_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _cleanup = ActivationLockCleanup {
+            locks: &self.activation_locks,
+            chain_id,
+        };
+        let _activation_guard = activation_lock.lock().await;
+        if let Some(state) = self.chain(chain_id) {
+            if state.state_label() != ChainStateLabel::Dormant {
+                let now_sec = unix_seconds();
+                if now_sec != state.last_ingress.load(Ordering::Relaxed) {
+                    state.last_ingress.store(now_sec, Ordering::Relaxed);
+                }
+                return Some(state);
+            }
+            self.chains.remove(&chain_id);
+        }
+
+        // 未 materialized → 查目录。
+        let catalog = self.catalog.read().await;
+        let catalog_entry = catalog.as_ref().and_then(|c| c.lookup(chain_id));
+
+        // discovery disabled 等价 v1：目录只用于 pinned 链，其他链视为未知。
+        if !denied
+            && ((!self.config.discovery.enabled && !pinned) || (catalog_entry.is_none() && !pinned))
+        {
+            return None;
+        }
+
+        // discovery.deny 链：只建 disabled 空状态（不 materialize 端点、不发激活 kick，
+        // 避免对被禁链做任何外呼/探针）。
+        if self.config.discovery.deny.contains(&chain_id) {
+            let name = catalog_entry
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("Chain {chain_id}"));
+            drop(catalog);
+            let state = Arc::new(ChainState::new(chain_id, name, pinned));
+            state.disabled.store(true, Ordering::Relaxed);
+            self.chains.insert(chain_id, Arc::clone(&state));
+            return Some(state);
+        }
+
+        // 慢路径：materialize。
+        drop(catalog);
+        let state = self.materialize(chain_id, pinned).await?;
+
+        Some(state)
+    }
+
+    #[cfg(test)]
+    fn activation_lock_count(&self) -> usize {
+        self.activation_locks.len()
+    }
+
+    /// 慢路径：materialize 链（从 Catalog 取端点 + 配置叠加）。
+    async fn materialize(&self, chain_id: u64, pinned: bool) -> Option<Arc<ChainState>> {
+        let catalog = self.catalog.read().await;
+        let catalog_entry = catalog.as_ref().and_then(|c| c.lookup(chain_id));
+
+        let name = catalog_entry
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| format!("Chain {chain_id}"));
+        let state = Arc::new(ChainState::new(chain_id, name, pinned));
+
+        // 构建端点池：目录端点 + extra_endpoints - disabled_endpoints - rejected。
+        let mut desired_urls: Vec<String> = Vec::new();
+        if let Some(entry) = catalog_entry {
+            desired_urls.extend(entry.endpoints.iter().map(|e| e.url.clone()));
+        }
+        if let Some(chain_override) = self.config.chain_override(chain_id) {
+            desired_urls.extend(chain_override.extra_endpoints.iter().cloned());
+        }
+
+        let chain_override = self.config.chain_override(chain_id);
+        let disabled: HashSet<&str> = chain_override
+            .into_iter()
+            .flat_map(|chain| chain.disabled_endpoints.iter().map(String::as_str))
+            .collect();
+
+        let now = unix_seconds();
+        let mut seen = HashSet::new();
+        let mut endpoints = Vec::new();
+        for url in desired_urls {
+            if disabled.contains(url.as_str()) || !seen.insert(url.clone()) {
+                continue;
+            }
+            let (rps, concurrency) = self.config.endpoint_limits(chain_id, &url);
+            endpoints.push(Arc::new(Endpoint::new(url, rps, concurrency, now)));
+        }
+        *state.endpoints.write().await = endpoints;
+
+        // 插入 DashMap。
+        self.chains.insert(chain_id, Arc::clone(&state));
+        self.chain_activations.fetch_add(1, Ordering::Relaxed);
+
+        // 更新 last_ingress。
+        state.last_ingress.store(now, Ordering::Relaxed);
+
+        // 激活路径同步执行软上限检查，避免短时间冷启动扫过整份目录。
+        let hot_count = self
+            .chains
+            .iter()
+            .filter(|entry| entry.value().state_label() == ChainStateLabel::Hot)
+            .count();
+        let mut kick_probes = true;
+        if hot_count > self.config.discovery.max_hot_chains {
+            let candidate = self
+                .chains
+                .iter()
+                .filter_map(|entry| {
+                    let value = entry.value();
+                    let last = value.last_ingress.load(Ordering::Relaxed);
+                    (!value.pinned.load(Ordering::Relaxed)
+                        && *entry.key() != chain_id
+                        && now.saturating_sub(last) >= 5)
+                        .then_some((*entry.key(), last))
+                })
+                .min_by_key(|(_, last)| *last);
+            kick_probes = if let Some((evict_id, last)) = candidate {
+                self.demote_if_unchanged(evict_id, "lru", last).await
+            } else {
+                false
+            };
+        }
+
+        // 通知探针调度器。
+        if kick_probes {
+            let _ = self.activation_tx.send(chain_id);
+        }
+
+        Some(state)
+    }
+
+    // ── 兼容旧接口：apply_snapshot ──
+
     /// 刷新时复用同 URL 的端点对象，避免丢失健康与出站限流状态。
+    /// 新端点从 Probation 起步，消失端点宽限 24h。
     pub async fn apply_snapshot(&self, snapshot: &ChainlistSnapshot) {
         let source_by_chain: HashMap<_, _> = snapshot
             .chains
@@ -438,18 +772,40 @@ impl Registry {
             .collect();
         let now = unix_seconds();
 
-        for &chain_id in &self.config.chains {
+        // pinned 链始终合并；动态发现模式下，已 materialized 的 hot 链也必须在刷新时
+        // 保留健康运行态并合并新增/消失端点。dormant 链保持零成本，不创建端点对象。
+        let mut materialized_ids: HashSet<u64> = self.config.chains.iter().copied().collect();
+        materialized_ids.extend(self.chains.iter().filter_map(|entry| {
+            matches!(
+                entry.value().state_label(),
+                ChainStateLabel::Pinned | ChainStateLabel::Hot
+            )
+            .then_some(*entry.key())
+        }));
+
+        for chain_id in materialized_ids {
             let source = source_by_chain.get(&chain_id).copied();
             let name = source
                 .map(|chain| chain.name.clone())
                 .unwrap_or_else(|| format!("Chain {chain_id}"));
+            let pinned = self.config.chains.contains(&chain_id)
+                || self
+                    .runtime_pinned
+                    .get(&chain_id)
+                    .is_some_and(|value| *value);
             let state = self
                 .chains
                 .entry(chain_id)
-                .or_insert_with(|| Arc::new(ChainState::new(chain_id, name.clone())))
+                .or_insert_with(|| Arc::new(ChainState::new(chain_id, name.clone(), pinned)))
                 .clone();
+            state.pinned.store(pinned, Ordering::Relaxed);
             if source.is_some() {
                 *state.name.write().await = name;
+            }
+            if self.config.discovery.deny.contains(&chain_id) {
+                state.disabled.store(true, Ordering::Relaxed);
+                *state.endpoints.write().await = Vec::new();
+                continue;
             }
             self.merge_chain(&state, source, now).await;
         }
@@ -512,20 +868,158 @@ impl Registry {
         *state.endpoints.write().await = merged;
     }
 
+    // ── 生命周期控制 ──
+
+    /// demote：将 hot 链降级为 dormant（丢弃端点运行态）。
+    pub async fn demote(&self, chain_id: u64, reason: &str) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        let expected_last = state.last_ingress.load(Ordering::Relaxed);
+        self.demote_if_unchanged(chain_id, reason, expected_last)
+            .await
+    }
+
+    async fn demote_if_unchanged(&self, chain_id: u64, reason: &str, expected_last: u64) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        if state.pinned.load(Ordering::Relaxed) {
+            return false; // pinned 不降级
+        }
+        // 先标记为 dormant（清 last_ingress）。
+        if state
+            .last_ingress
+            .compare_exchange(expected_last, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        // 丢弃端点运行态。
+        *state.endpoints.write().await = Vec::new();
+        match reason {
+            "idle" => self.chain_demotions_idle.fetch_add(1, Ordering::Relaxed),
+            "lru" => self.chain_demotions_lru.fetch_add(1, Ordering::Relaxed),
+            _ => self.chain_demotions_admin.fetch_add(1, Ordering::Relaxed),
+        };
+        true
+    }
+
+    /// 设置 disabled 状态。
+    pub async fn set_disabled(&self, chain_id: u64, disabled: bool) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        state.disabled.store(disabled, Ordering::Relaxed);
+        true
+    }
+
+    /// 设置 pinned 状态。
+    pub async fn set_pinned(&self, chain_id: u64, pinned: bool) -> bool {
+        let Some(state) = self.chain(chain_id) else {
+            return false;
+        };
+        self.runtime_pinned.insert(chain_id, pinned);
+        state.pinned.store(pinned, Ordering::Relaxed);
+        if !pinned {
+            state.last_ingress.store(unix_seconds(), Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// 已 materialized 的热链 id 列表（pinned + hot）。
+    pub fn hot_chain_ids(&self) -> Vec<u64> {
+        self.chains
+            .iter()
+            .filter(|entry| {
+                let state = entry.value();
+                let label = state.state_label();
+                matches!(label, ChainStateLabel::Pinned | ChainStateLabel::Hot)
+            })
+            .map(|entry| *entry.key())
+            .collect()
+    }
+
+    /// housekeeping：idle 降级 + LRU 淘汰。
+    pub async fn housekeeping(&self) {
+        self.housekeeping_at(unix_seconds()).await;
+    }
+
+    async fn housekeeping_at(&self, now_sec: u64) {
+        let idle_seconds = self.config.discovery.idle_seconds;
+        let max_hot = self.config.discovery.max_hot_chains;
+
+        // 收集 hot 链（非 pinned、非 disabled）。
+        let mut hot_entries: Vec<(u64, u64)> = self
+            .chains
+            .iter()
+            .filter(|entry| {
+                let state = entry.value();
+                !state.pinned.load(Ordering::Relaxed)
+                    && !state.disabled.load(Ordering::Relaxed)
+                    && state.last_ingress.load(Ordering::Relaxed) > 0
+            })
+            .map(|entry| {
+                let last = entry.value().last_ingress.load(Ordering::Relaxed);
+                (*entry.key(), last)
+            })
+            .collect();
+
+        // idle 降级：last_ingress 超过 idle_seconds 的链。
+        for (chain_id, last) in &hot_entries {
+            if now_sec.saturating_sub(*last) > idle_seconds {
+                self.demote_if_unchanged(*chain_id, "idle", *last).await;
+            }
+        }
+
+        // 重新收集（idle 降级后）。
+        hot_entries.retain(|(chain_id, _)| {
+            self.chains
+                .get(chain_id)
+                .is_some_and(|state| state.last_ingress.load(Ordering::Relaxed) > 0)
+        });
+
+        // LRU 淘汰：超过 max_hot 时按 last_ingress 升序淘汰最久未用的。
+        if hot_entries.len() > max_hot {
+            hot_entries.sort_by_key(|(_, last)| *last);
+            let mut remaining = hot_entries.len();
+            for (chain_id, last) in hot_entries {
+                if remaining <= max_hot {
+                    break;
+                }
+                if now_sec.saturating_sub(last) < 5 {
+                    continue;
+                }
+                if self.demote_if_unchanged(chain_id, "lru", last).await {
+                    remaining -= 1;
+                }
+            }
+        }
+    }
+
+    // ── 查询接口 ──
+
     /// 优先对 Active 集执行 P2C；冷启动无 Active 时回退到 Probation 集。
-    pub async fn candidates(&self, chain_id: u64) -> Vec<Arc<Endpoint>> {
+    pub async fn candidates(&self, chain_id: u64) -> CandidateSet {
         let endpoints = self.all_endpoints(chain_id).await;
         let mut pool: Vec<_> = endpoints
             .iter()
             .filter(|endpoint| endpoint.is_active())
             .cloned()
             .collect();
-        if pool.is_empty() {
+        let kind = if !pool.is_empty() {
+            PoolKind::Active
+        } else {
             pool = endpoints
                 .into_iter()
                 .filter(|endpoint| endpoint.is_probation())
                 .collect();
-        }
+            if pool.is_empty() {
+                PoolKind::Empty
+            } else {
+                PoolKind::Probation
+            }
+        };
         let now = Instant::now();
         let mut ordered = Vec::with_capacity(pool.len());
         let mut rng = rand::rng();
@@ -543,7 +1037,10 @@ impl Registry {
             ordered.push(pool.swap_remove(selected));
         }
         ordered.extend(pool);
-        ordered
+        CandidateSet {
+            endpoints: ordered,
+            kind,
+        }
     }
 
     pub async fn all_endpoints(&self, chain_id: u64) -> Vec<Arc<Endpoint>> {
@@ -551,6 +1048,29 @@ impl Registry {
             return Vec::new();
         };
         state.endpoints.read().await.clone()
+    }
+
+    /// 端点数量（materialized 链）。
+    pub async fn endpoint_count(&self, chain_id: u64) -> usize {
+        let Some(state) = self.chain(chain_id) else {
+            return 0;
+        };
+        state.endpoints.read().await.len()
+    }
+
+    /// 链是否为 disabled。
+    pub fn is_disabled(&self, chain_id: u64) -> bool {
+        self.chain(chain_id)
+            .is_some_and(|state| state.disabled.load(Ordering::Relaxed))
+    }
+
+    /// 链是否在目录中。
+    pub async fn chain_in_catalog(&self, chain_id: u64) -> bool {
+        self.catalog
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|c| c.by_id.contains_key(&chain_id))
     }
 
     pub async fn healthy_for_hedging(&self, chain_id: u64, minimum_active: usize) -> bool {
@@ -626,6 +1146,54 @@ impl Registry {
         self.user_visible_errors.load(Ordering::Relaxed)
     }
 
+    pub fn chain_activations(&self) -> u64 {
+        self.chain_activations.load(Ordering::Relaxed)
+    }
+
+    pub fn chain_demotions(&self) -> (u64, u64, u64) {
+        (
+            self.chain_demotions_idle.load(Ordering::Relaxed),
+            self.chain_demotions_lru.load(Ordering::Relaxed),
+            self.chain_demotions_admin.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn materialized_chain_pinned(&self) -> Vec<(u64, bool)> {
+        self.chains
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().pinned.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// v2 指标：目录链数量。
+    pub fn catalog_chain_count(&self) -> u64 {
+        self.catalog_chains_count.load(Ordering::Relaxed)
+    }
+
+    /// v2 指标：目录端点总数。
+    pub fn catalog_endpoint_count(&self) -> u64 {
+        self.catalog_endpoints_count.load(Ordering::Relaxed)
+    }
+
+    /// v2 指标：chainlist 最近刷新时间戳。
+    pub fn chainlist_last_refresh(&self) -> u64 {
+        self.chainlist_last_refresh_unix.load(Ordering::Relaxed)
+    }
+
+    /// v2 指标：设置 chainlist 刷新信息（由 main 刷新循环调用）。
+    pub fn record_chainlist_refresh(&self, unix_ts: u64, source: &str) {
+        self.chainlist_last_refresh_unix
+            .store(unix_ts, Ordering::Relaxed);
+        *lock(&self.chainlist_refresh_source) = source.to_owned();
+    }
+
+    /// v2 指标：chainlist 最近刷新来源。
+    pub fn chainlist_refresh_source_str(&self) -> String {
+        lock(&self.chainlist_refresh_source).clone()
+    }
+
+    // ── summaries（v2：增加 state 字段） ──
+
     pub async fn summaries(&self) -> Vec<ChainSummary> {
         let mut states: Vec<_> = self
             .chains
@@ -657,9 +1225,50 @@ impl Registry {
                 cooling,
                 probation,
                 head: state.head.load(Ordering::Relaxed),
+                state: state.state_label(),
             });
         }
         summaries
+    }
+
+    /// 链数量统计（按状态）。
+    pub async fn chain_counts(&self) -> ChainCounts {
+        let mut pinned = 0u64;
+        let mut hot = 0u64;
+        let mut dormant = 0u64;
+        let mut disabled = 0u64;
+        for entry in self.chains.iter() {
+            match entry.value().state_label() {
+                ChainStateLabel::Pinned => pinned += 1,
+                ChainStateLabel::Hot => hot += 1,
+                ChainStateLabel::Dormant => dormant += 1,
+                ChainStateLabel::Disabled => disabled += 1,
+            }
+        }
+        let catalog = self.catalog.read().await;
+        let catalog_count = catalog.as_ref().map_or(0, |c| c.chains.len() as u64);
+        if let Some(catalog) = catalog.as_ref() {
+            for chain in &catalog.chains {
+                if self.chains.contains_key(&chain.chain_id) {
+                    continue;
+                }
+                if !self.config.discovery.enabled && !self.config.chains.contains(&chain.chain_id) {
+                    continue;
+                }
+                if self.config.discovery.deny.contains(&chain.chain_id) {
+                    disabled += 1;
+                } else {
+                    dormant += 1;
+                }
+            }
+        }
+        ChainCounts {
+            catalog: catalog_count,
+            pinned,
+            hot,
+            dormant,
+            disabled,
+        }
     }
 
     pub async fn endpoint_metric_snapshots(&self) -> Vec<EndpointMetricSnapshot> {
@@ -696,6 +1305,8 @@ impl Registry {
     }
 }
 
+// ── 汇总类型 ──
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainSummary {
@@ -706,6 +1317,17 @@ pub struct ChainSummary {
     pub cooling: usize,
     pub probation: usize,
     pub head: u64,
+    /// v2: 链生命周期状态。
+    pub state: ChainStateLabel,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChainCounts {
+    pub catalog: u64,
+    pub pinned: u64,
+    pub hot: u64,
+    pub dormant: u64,
+    pub disabled: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -715,6 +1337,8 @@ pub struct EndpointMetricSnapshot {
     pub state: &'static str,
     pub stats: EndpointStatsSnapshot,
 }
+
+// ── 工具函数 ──
 
 pub fn cooldown_for_strikes(strikes: u32) -> Duration {
     let seconds = match strikes {
@@ -742,7 +1366,7 @@ pub fn trimmed_max(heights: &[u64]) -> Option<u64> {
     heights.get(heights.len() - 1 - trim).copied()
 }
 
-fn unix_seconds() -> u64 {
+pub fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
@@ -756,6 +1380,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::chainlist::{CatalogChain, CatalogEndpoint};
+
     use super::*;
 
     fn snapshot(urls: &[&str]) -> ChainlistSnapshot {
@@ -801,6 +1427,7 @@ mod tests {
             assert!(endpoint.begin_probe(now));
             endpoint.record_success(now, Duration::from_millis(10), true);
             endpoint.record_success(now, Duration::from_millis(10), true);
+            endpoint.end_probe();
         }
     }
 
@@ -814,6 +1441,7 @@ mod tests {
         assert!(endpoint.begin_probe(recovered));
         endpoint.record_success(recovered, Duration::from_millis(10), true);
         endpoint.record_success(recovered, Duration::from_millis(10), true);
+        endpoint.end_probe();
         let later = recovered + STRIKE_DECAY_INTERVAL + Duration::from_secs(1);
         endpoint.record_failure(later, FailureSignal::new(FaultKind::RateLimited));
         let EndpointState::Cooling { until, strikes } = endpoint.state(later) else {
@@ -927,6 +1555,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_merges_materialized_dynamic_chain() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 42,
+                    name: "Dynamic".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "http://old".to_owned(),
+                        tracking: None,
+                    }],
+                }],
+                by_id: HashMap::from([(42, 0)]),
+            }))
+            .await;
+        registry.resolve_for_request(42).await.expect("activate");
+        registry
+            .apply_snapshot(&ChainlistSnapshot {
+                chains: vec![ChainEndpoints {
+                    chain_id: 42,
+                    name: "Dynamic refreshed".to_owned(),
+                    endpoints: vec!["http://new".to_owned()],
+                }],
+            })
+            .await;
+        assert!(registry.endpoint(42, "http://new").await.is_some());
+        assert_eq!(registry.chain_activations(), 1);
+    }
+
+    #[tokio::test]
     async fn tracks_trimmed_head_and_penalizes_lag_or_high_outliers() {
         let config = Config {
             chains: vec![1],
@@ -963,5 +1637,715 @@ mod tests {
         assert_eq!(trimmed_max(&[10, 11]), Some(11));
         assert_eq!(trimmed_max(&[100, 101, 10_000]), Some(101));
         assert_eq!(trimmed_max(&[98, 99, 100, 101, 10_000]), Some(101));
+    }
+
+    // ── v2 生命周期测试 ──
+
+    #[tokio::test]
+    async fn resolve_for_request_returns_none_for_unknown_chain() {
+        let config = Config {
+            chains: vec![1],
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        // 没有 catalog，也没有 pinned 999999。
+        assert!(registry.resolve_for_request(999999).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_chain_ids_do_not_accumulate_activation_locks() {
+        let registry = Registry::new(&Config::default());
+        for chain_id in 10_000..20_000 {
+            assert!(registry.resolve_for_request(chain_id).await.is_none());
+        }
+        assert_eq!(registry.activation_lock_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_activation_materializes_once_and_returns_one_state() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Arc::new(Registry::new(&config));
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 42,
+                    name: "Concurrent".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "http://concurrent".to_owned(),
+                        tracking: None,
+                    }],
+                }],
+                by_id: HashMap::from([(42, 0)]),
+            }))
+            .await;
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..100 {
+            let registry = Arc::clone(&registry);
+            tasks.spawn(async move { registry.resolve_for_request(42).await.expect("state") });
+        }
+        let first = tasks.join_next().await.expect("task").expect("join");
+        while let Some(result) = tasks.join_next().await {
+            assert!(Arc::ptr_eq(&first, &result.expect("join")));
+        }
+        assert_eq!(registry.chain_activations(), 1);
+        assert_eq!(registry.activation_lock_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_demotion_sample_cannot_clear_recent_ingress() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 77,
+                    name: "Race".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "http://race".to_owned(),
+                        tracking: None,
+                    }],
+                }],
+                by_id: HashMap::from([(77, 0)]),
+            }))
+            .await;
+        let state = registry.resolve_for_request(77).await.expect("state");
+        let sampled = unix_seconds().saturating_sub(10);
+        state.last_ingress.store(sampled, Ordering::Relaxed);
+        registry
+            .resolve_for_request(77)
+            .await
+            .expect("recent ingress");
+        assert!(!registry.demote_if_unchanged(77, "lru", sampled).await);
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.user_visible_errors(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_pin_state_survives_snapshot_refresh_and_unpin_stays_hot() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        registry
+            .set_catalog(Arc::new(Catalog {
+                chains: vec![CatalogChain {
+                    chain_id: 1,
+                    name: "Runtime".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "http://runtime".to_owned(),
+                        tracking: None,
+                    }],
+                }],
+                by_id: HashMap::from([(1, 0)]),
+            }))
+            .await;
+        let state = registry.resolve_for_request(1).await.expect("state");
+        registry
+            .apply_snapshot(&snapshot(&["http://runtime"]))
+            .await;
+        assert!(registry.set_pinned(1, true).await);
+        registry
+            .apply_snapshot(&snapshot(&["http://runtime"]))
+            .await;
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned);
+        assert!(registry.set_pinned(1, false).await);
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        registry
+            .apply_snapshot(&snapshot(&["http://runtime"]))
+            .await;
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+    }
+
+    #[tokio::test]
+    async fn discovery_disabled_only_serves_pinned_chains() {
+        let config = Config {
+            chains: vec![1],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![
+                CatalogChain {
+                    chain_id: 1,
+                    name: "Pinned".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "https://pinned.example".to_owned(),
+                        tracking: None,
+                    }],
+                },
+                CatalogChain {
+                    chain_id: 2,
+                    name: "Dynamic".to_owned(),
+                    short_name: None,
+                    chain: None,
+                    slug: None,
+                    is_testnet: false,
+                    native_symbol: None,
+                    explorer_url: None,
+                    status: None,
+                    tvl: None,
+                    endpoints: vec![CatalogEndpoint {
+                        url: "https://dynamic.example".to_owned(),
+                        tracking: None,
+                    }],
+                },
+            ],
+            by_id: HashMap::from([(1, 0), (2, 1)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+        assert!(registry.resolve_for_request(1).await.is_some());
+        assert!(registry.resolve_for_request(2).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_for_request_materializes_dormant_chain() {
+        let config = Config {
+            chains: vec![1],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        // 设置 catalog（含 chain 1）。
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 1,
+                name: "Test".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashMap::from([(1, 0)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        let state = registry.resolve_for_request(1).await.expect("chain 1");
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned); // pinned because in config.chains
+        assert_eq!(registry.all_endpoints(1).await.len(), 1);
+        assert_eq!(registry.chain_activations(), 1);
+    }
+
+    // ── acceptance b: lifecycle ──
+
+    #[tokio::test]
+    async fn dormant_chain_activates_on_first_request_and_becomes_hot() {
+        // 使用 discovery 模式（chains 为空），链在 catalog 中但未 pinned → dormant。
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 42,
+                name: "DynamicChain".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.dynamic.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashMap::from([(42, 0)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        // 激活前：不在 hot_chain_ids 中。
+        assert!(registry.hot_chain_ids().is_empty());
+
+        // 首次请求触发 materialize。
+        let state = registry.resolve_for_request(42).await.expect("chain 42");
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.all_endpoints(42).await.len(), 1);
+        assert_eq!(registry.chain_activations(), 1);
+
+        // 激活后：在 hot_chain_ids 中。
+        assert!(registry.hot_chain_ids().contains(&42));
+
+        // 再次请求复用已有 state。
+        let state2 = registry
+            .resolve_for_request(42)
+            .await
+            .expect("chain 42 again");
+        assert!(Arc::ptr_eq(&state, &state2));
+        assert_eq!(registry.chain_activations(), 1); // 不重复计数。
+    }
+
+    #[tokio::test]
+    async fn idle_chain_is_demoted_to_dormant() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                idle_seconds: 1, // 1 秒后降级
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 7,
+                name: "FastIdle".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.fast.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashMap::from([(7, 0)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        // 激活链。
+        let _ = registry.resolve_for_request(7).await.expect("chain 7");
+        assert_eq!(registry.all_endpoints(7).await.len(), 1);
+        assert_eq!(registry.chain_counts().await.hot, 1);
+
+        let last_ingress = registry
+            .chain(7)
+            .expect("chain state")
+            .last_ingress
+            .load(Ordering::Relaxed);
+        registry.housekeeping_at(last_ingress + 2).await;
+
+        // 验证已降级。
+        let counts = registry.chain_counts().await;
+        assert_eq!(counts.hot, 0);
+        assert_eq!(counts.dormant, 1);
+        assert_eq!(registry.all_endpoints(7).await.len(), 0); // 端点运行态丢弃。
+        let (idle, lru, admin) = registry.chain_demotions();
+        assert_eq!(idle, 1);
+        assert_eq!(lru, 0);
+        assert_eq!(admin, 0);
+    }
+
+    #[tokio::test]
+    async fn pinned_chain_is_never_demoted_by_idle_or_lru() {
+        let config = Config {
+            chains: vec![1], // pinned
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                idle_seconds: 1,
+                max_hot_chains: 0, // 容不下任何 hot 链
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 1,
+                name: "Pinned".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.pinned.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashMap::from([(1, 0)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        let _ = registry.resolve_for_request(1).await.expect("chain 1");
+        assert_eq!(registry.chain_counts().await.pinned, 1);
+
+        let last_ingress = registry
+            .chain(1)
+            .expect("chain state")
+            .last_ingress
+            .load(Ordering::Relaxed);
+        registry.housekeeping_at(last_ingress + 2).await;
+
+        // pinned 不降级。
+        let counts = registry.chain_counts().await;
+        assert_eq!(counts.pinned, 1);
+        assert_eq!(counts.dormant, 0);
+        assert_eq!(registry.all_endpoints(1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn demote_clears_endpoints_and_chain_can_reactivate() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                max_hot_chains: 256,
+                idle_seconds: 86_400,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 1,
+                name: "Test".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc1.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashMap::from([(1, 0)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        let _ = registry.resolve_for_request(1).await.expect("chain 1");
+        assert_eq!(registry.all_endpoints(1).await.len(), 1);
+
+        // 手动 demote（模拟 LRU）。
+        assert!(registry.demote(1, "lru").await);
+        assert_eq!(registry.all_endpoints(1).await.len(), 0);
+        assert_eq!(registry.chain_counts().await.dormant, 1);
+
+        // 重新激活。
+        let state = registry
+            .resolve_for_request(1)
+            .await
+            .expect("chain 1 re-activate");
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.all_endpoints(1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn housekeeping_lru_evicts_when_over_max_hot_chains() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                max_hot_chains: 2,
+                idle_seconds: 86_400, // 极大，不会 idle 降级
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+
+        // 在目录中放入 3 条链。
+        let mut chains = Vec::new();
+        let mut ids = HashMap::new();
+        for i in 1..=3u64 {
+            ids.insert(i, chains.len());
+            chains.push(CatalogChain {
+                chain_id: i,
+                name: format!("Chain{i}"),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: format!("https://rpc{i}.example"),
+                    tracking: None,
+                }],
+            });
+        }
+        registry
+            .set_catalog(Arc::new(Catalog { chains, by_id: ids }))
+            .await;
+
+        // 激活全部 3 条链。
+        let _ = registry.resolve_for_request(1).await.expect("chain 1");
+        let _ = registry.resolve_for_request(2).await.expect("chain 2");
+        let _ = registry.resolve_for_request(3).await.expect("chain 3");
+        assert_eq!(registry.chain_counts().await.hot, 3);
+
+        let base = unix_seconds();
+        registry
+            .chain(1)
+            .expect("chain 1")
+            .last_ingress
+            .store(base, Ordering::Relaxed);
+        registry
+            .chain(2)
+            .expect("chain 2")
+            .last_ingress
+            .store(base + 1, Ordering::Relaxed);
+        registry
+            .chain(3)
+            .expect("chain 3")
+            .last_ingress
+            .store(base + 2, Ordering::Relaxed);
+
+        // housekeeping: max_hot_chains=2，应淘汰 1 条链。
+        registry.housekeeping_at(base + 7).await;
+
+        let counts = registry.chain_counts().await;
+        assert_eq!(counts.hot, 2);
+        assert_eq!(counts.dormant, 1);
+
+        // 恰好 1 条链被淘汰（端点清空）。
+        let mut evicted = Vec::new();
+        for id in [1u64, 2, 3] {
+            if registry.all_endpoints(id).await.is_empty() {
+                evicted.push(id);
+            }
+        }
+        assert_eq!(evicted.len(), 1, "exactly one chain should be evicted");
+        assert_eq!(
+            evicted,
+            vec![1],
+            "least recently used chain must be evicted"
+        );
+
+        let (idle, lru, _) = registry.chain_demotions();
+        assert_eq!(idle, 0);
+        assert_eq!(lru, 1);
+
+        // 被淘汰的链可重新激活。
+        let evicted_id = evicted[0];
+        let state = registry
+            .resolve_for_request(evicted_id)
+            .await
+            .expect("chain re-activate");
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.all_endpoints(evicted_id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn demoted_chain_can_be_re_activated() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                idle_seconds: 1,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 99,
+                name: "Phantom".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.phantom.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashMap::from([(99, 0)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        // 激活。
+        let s1 = registry.resolve_for_request(99).await.expect("chain 99");
+        assert_eq!(s1.state_label(), ChainStateLabel::Hot);
+
+        let last_ingress = s1.last_ingress.load(Ordering::Relaxed);
+        registry.housekeeping_at(last_ingress + 2).await;
+        assert_eq!(registry.chain_counts().await.hot, 0);
+
+        // 重新激活。
+        let s2 = registry
+            .resolve_for_request(99)
+            .await
+            .expect("chain 99 again");
+        assert_eq!(s2.state_label(), ChainStateLabel::Hot);
+        assert_eq!(registry.all_endpoints(99).await.len(), 1);
+        // 激活计数为 2（两次 materialize）。
+        assert_eq!(registry.chain_activations(), 2);
+    }
+
+    #[tokio::test]
+    async fn deny_chain_is_marked_disabled_on_materialize() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                deny: vec![13],
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 13,
+                name: "Blocked".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![crate::chainlist::CatalogEndpoint {
+                    url: "https://rpc.blocked.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashMap::from([(13, 0)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        let state = registry.resolve_for_request(13).await.expect("chain 13");
+        assert_eq!(state.state_label(), ChainStateLabel::Disabled);
+    }
+
+    #[tokio::test]
+    async fn chainstate_label_reflects_current_state() {
+        let config = Config {
+            chains: vec![100],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let registry = Registry::new(&config);
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 100,
+                name: "LabelTest".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![],
+            }],
+            by_id: HashMap::from([(100, 0)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+
+        // pinned。
+        let state = registry.resolve_for_request(100).await.expect("chain 100");
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned);
+
+        // unpin → hot。
+        registry.set_pinned(100, false).await;
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+
+        // disable。
+        registry.set_disabled(100, true).await;
+        assert_eq!(state.state_label(), ChainStateLabel::Disabled);
+
+        // re-enable → hot。
+        registry.set_disabled(100, false).await;
+        assert_eq!(state.state_label(), ChainStateLabel::Hot);
+
+        // demote → dormant。
+        assert!(registry.demote(100, "admin").await);
+        assert_eq!(state.state_label(), ChainStateLabel::Dormant);
+
+        // pinned 不降级。
+        registry.set_pinned(100, true).await;
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned);
+        assert!(!registry.demote(100, "idle").await);
+        assert_eq!(state.state_label(), ChainStateLabel::Pinned);
     }
 }

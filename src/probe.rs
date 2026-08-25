@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -9,7 +12,8 @@ use rand::Rng;
 use reqwest::{Client, header::CONTENT_TYPE};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, mpsc},
+    task::JoinSet,
     time::{Instant, sleep, timeout},
 };
 use tracing::{debug, info, warn};
@@ -23,6 +27,24 @@ use crate::{
 const PROBE_BODY_LIMIT: usize = 1024 * 1024;
 const SCHEDULER_TICK: Duration = Duration::from_millis(250);
 
+type ProbeQueueRx = mpsc::Receiver<(u64, Arc<Endpoint>)>;
+
+struct ProbeGuard<'a>(&'a Endpoint);
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.end_probe();
+    }
+}
+
+struct InFlightGuard<'a>(&'a AtomicU64);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeOutcome {
     Passed,
@@ -34,13 +56,24 @@ pub enum ProbeOutcome {
 pub struct ProbeManager {
     registry: Arc<Registry>,
     client: Client,
-    chains: Vec<u64>,
-    global_slots: Arc<Semaphore>,
     schedules: Mutex<HashMap<(u64, String), Instant>>,
     min_interval: Duration,
     max_interval: Duration,
     request_timeout: Duration,
     slow_threshold: Duration,
+    /// 有界工作池：due 端点入队，worker 消费。
+    queue_tx: mpsc::Sender<(u64, Arc<Endpoint>)>,
+    /// 工作池接收端（在 start_workers 中取出）。
+    queue_rx: Mutex<Option<ProbeQueueRx>>,
+    /// 激活 kick 通道。
+    kick_rx: Mutex<tokio::sync::broadcast::Receiver<u64>>,
+    /// 在飞探针计数。
+    in_flight: Arc<AtomicU64>,
+    /// 队列深度（近似，由 channel 长度估算）。
+    queue_depth: Arc<AtomicU64>,
+    queued: StdMutex<HashSet<(u64, String)>>,
+    /// 工作池并发数。
+    max_concurrency: usize,
 }
 
 impl ProbeManager {
@@ -49,30 +82,95 @@ impl ProbeManager {
             .user_agent(concat!("rpcrouter/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to build probe HTTP client")?;
+        let (queue_tx, queue_rx) = mpsc::channel(4096);
+        let kick_rx = registry.activation_channel().subscribe();
+        // 共享 Registry 的原子计数器，使 metrics encode 能读到最新值。
+        let in_flight = Arc::clone(&registry.probe_in_flight);
+        let queue_depth = Arc::clone(&registry.probe_queue_depth);
         Ok(Self {
             registry,
             client,
-            chains: config.chains.clone(),
-            global_slots: Arc::new(Semaphore::new(config.probe.max_concurrency)),
             schedules: Mutex::new(HashMap::new()),
             min_interval: Duration::from_secs(config.probe.min_interval_seconds),
             max_interval: Duration::from_secs(config.probe.max_interval_seconds),
             request_timeout: Duration::from_millis(config.probe.request_timeout_ms),
             slow_threshold: Duration::from_millis(config.upstream.slow_threshold_ms),
+            queue_tx,
+            queue_rx: Mutex::new(Some(queue_rx)),
+            kick_rx: Mutex::new(kick_rx),
+            in_flight,
+            queue_depth,
+            queued: StdMutex::new(HashSet::new()),
+            max_concurrency: config.probe.max_concurrency,
         })
+    }
+
+    /// 取出并启动有界工作池（必须在 manager 被 Arc 包装后调用，仅一次）。
+    fn take_worker_pool(self: &Arc<Self>) -> ProbeQueueRx {
+        self.queue_rx
+            .try_lock()
+            .expect("queue_rx lock")
+            .take()
+            .expect("workers already started")
     }
 
     pub async fn run(self: Arc<Self>) {
         loop {
             self.schedule_due_probes().await;
+            self.process_kicks().await;
             sleep(SCHEDULER_TICK).await;
         }
     }
 
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    pub fn queue_depth(&self) -> u64 {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    fn enqueue(&self, chain_id: u64, endpoint: Arc<Endpoint>) {
+        let key = (chain_id, endpoint.url().to_owned());
+        let mut queued = self
+            .queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !queued.insert(key.clone()) {
+            return;
+        }
+        if self.queue_tx.try_send((chain_id, endpoint)).is_ok() {
+            self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        } else {
+            queued.remove(&key);
+        }
+    }
+
+    fn mark_received(&self) {
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn complete(&self, chain_id: u64, endpoint: &Endpoint) {
+        let mut queued = self
+            .queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queued.remove(&(chain_id, endpoint.url().to_owned()));
+    }
+
+    async fn schedule_after_completion(&self, chain_id: u64, endpoint: &Endpoint) {
+        self.schedules.lock().await.insert(
+            (chain_id, endpoint.url().to_owned()),
+            Instant::now() + self.jittered_interval(),
+        );
+    }
+
     async fn schedule_due_probes(self: &Arc<Self>) {
         let now = Instant::now();
+        let hot_chains = self.registry.hot_chain_ids();
+
         let mut listed = Vec::new();
-        for &chain_id in &self.chains {
+        for chain_id in hot_chains {
             listed.extend(
                 self.registry
                     .all_endpoints(chain_id)
@@ -81,6 +179,7 @@ impl ProbeManager {
                     .map(|endpoint| (chain_id, endpoint)),
             );
         }
+
         let present: HashSet<_> = listed
             .iter()
             .map(|(chain_id, endpoint)| (*chain_id, endpoint.url().to_owned()))
@@ -106,10 +205,37 @@ impl ProbeManager {
         }
 
         for (chain_id, endpoint) in due {
-            let manager = Arc::clone(self);
-            tokio::spawn(async move {
-                manager.probe_endpoint(chain_id, endpoint).await;
-            });
+            self.enqueue(chain_id, endpoint);
+        }
+    }
+
+    /// 处理激活 kick：收到 kick 后立即将该链全部端点入队。
+    async fn process_kicks(self: &Arc<Self>) {
+        let mut rx = self.kick_rx.lock().await;
+        loop {
+            let chain_id = match rx.try_recv() {
+                Ok(chain_id) => chain_id,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            };
+            let now = Instant::now();
+            let endpoints = self.registry.all_endpoints(chain_id).await;
+            let mut schedules = self.schedules.lock().await;
+            for endpoint in endpoints {
+                let key = (chain_id, endpoint.url().to_owned());
+                if let EndpointState::Cooling { until, .. } = endpoint.state(now)
+                    && now < until
+                {
+                    schedules.insert(key, until);
+                    continue;
+                }
+                let should_kick = schedules.get(&key).is_none_or(|next| *next <= now);
+                schedules.insert(key, now + self.jittered_interval());
+                if should_kick {
+                    self.enqueue(chain_id, endpoint);
+                }
+            }
         }
     }
 
@@ -128,9 +254,9 @@ impl ProbeManager {
         if !endpoint.begin_probe(now) {
             return ProbeOutcome::Skipped;
         }
-        let Ok(_global_slot) = Arc::clone(&self.global_slots).acquire_owned().await else {
-            return ProbeOutcome::Skipped;
-        };
+        let _probe_guard = ProbeGuard(&endpoint);
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let _in_flight_guard = InFlightGuard(&self.in_flight);
         let started = Instant::now();
 
         let chain_id_response = match self
@@ -260,6 +386,46 @@ impl ProbeManager {
     }
 }
 
+/// 有界工作池：最多 N 个探针任务同时运行；不会为每个排队项创建等待信号量的任务。
+async fn worker_pool(manager: Arc<ProbeManager>, mut rx: ProbeQueueRx) {
+    let mut active = JoinSet::new();
+    loop {
+        while active.len() >= manager.max_concurrency {
+            let _ = active.join_next().await;
+        }
+        tokio::select! {
+            item = rx.recv() => {
+                let Some((chain_id, endpoint)) = item else { break };
+                manager.mark_received();
+                let manager = Arc::clone(&manager);
+                active.spawn(async move {
+                    struct CompletionGuard {
+                        manager: Arc<ProbeManager>,
+                        chain_id: u64,
+                        endpoint: Arc<Endpoint>,
+                    }
+                    impl Drop for CompletionGuard {
+                        fn drop(&mut self) {
+                            self.manager.complete(self.chain_id, &self.endpoint);
+                        }
+                    }
+                    let _guard = CompletionGuard {
+                        manager: Arc::clone(&manager),
+                        chain_id,
+                        endpoint: Arc::clone(&endpoint),
+                    };
+                    manager.probe_endpoint(chain_id, Arc::clone(&endpoint)).await;
+                    manager.schedule_after_completion(chain_id, &endpoint).await;
+                });
+            }
+            joined = active.join_next(), if !active.is_empty() => {
+                let _ = joined;
+            }
+        }
+    }
+    while active.join_next().await.is_some() {}
+}
+
 fn parse_hex_result(response: &Value) -> Option<u64> {
     let value = response.get("result")?.as_str()?;
     let digits = value
@@ -269,6 +435,8 @@ fn parse_hex_result(response: &Value) -> Option<u64> {
 }
 
 pub fn spawn(manager: Arc<ProbeManager>) {
+    let rx = manager.take_worker_pool();
+    tokio::spawn(worker_pool(Arc::clone(&manager), rx));
     tokio::spawn(async move {
         info!("health probe scheduler started");
         manager.run().await;
@@ -280,7 +448,7 @@ mod tests {
     use axum::{Json, Router, body::Bytes, extract::State, routing::post};
 
     use crate::{
-        chainlist::{ChainEndpoints, ChainlistSnapshot},
+        chainlist::{Catalog, CatalogChain, CatalogEndpoint, ChainEndpoints, ChainlistSnapshot},
         config::{ProbeConfig, UpstreamConfig},
     };
 
@@ -384,8 +552,8 @@ mod tests {
         assert!(registry.all_endpoints(1).await.is_empty());
     }
 
-    #[test]
-    fn jitter_is_uniformly_bounded() {
+    #[tokio::test]
+    async fn jitter_is_uniformly_bounded() {
         let config = test_config();
         let manager =
             ProbeManager::new(Arc::new(Registry::new(&config)), &config).expect("probe manager");
@@ -397,5 +565,41 @@ mod tests {
             distinct.insert(interval);
         }
         assert!(distinct.len() > 1);
+    }
+
+    #[tokio::test]
+    async fn dormant_chain_not_in_hot_chain_ids() {
+        let config = Config {
+            chains: vec![],
+            discovery: crate::config::DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..test_config()
+        };
+        let registry = Arc::new(Registry::new(&config));
+        // 设置 catalog 含 chain 1（dormant，因为没有 pinned）。
+        let catalog = Catalog {
+            chains: vec![CatalogChain {
+                chain_id: 1,
+                name: "DormantChain".to_owned(),
+                short_name: None,
+                chain: None,
+                slug: None,
+                is_testnet: false,
+                native_symbol: None,
+                explorer_url: None,
+                status: None,
+                tvl: None,
+                endpoints: vec![CatalogEndpoint {
+                    url: "https://rpc.example".to_owned(),
+                    tracking: None,
+                }],
+            }],
+            by_id: HashMap::from([(1, 0)]),
+        };
+        registry.set_catalog(Arc::new(catalog)).await;
+        // dormant 链不在 hot_chain_ids 中。
+        assert!(registry.hot_chain_ids().is_empty());
     }
 }

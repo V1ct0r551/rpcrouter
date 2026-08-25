@@ -50,7 +50,7 @@
 > （2877 条），并提供状态控制 Dashboard（独立 React 工程 `dashboard/`，经 REST API 与
 > 网关通信）。方案见 `docs/DESIGN-v2.md`，任务拆解与验收见 `docs/TASKS-v2.md`。
 
-1. **W5 动态目录与链生命周期**：Catalog 全量解析；链 pinned/hot/dormant/disabled 生命周期
+1. **W5 动态目录与链生命周期**（✅ 2026-08-25 合入）：Catalog 全量解析；链 pinned/hot/dormant/disabled 生命周期
    （按需激活、idle 降级、LRU 上限）；未知链 404 / 无端点 503 / 禁用 403 且不计
    `user_visible_errors`；探针有界工作池只覆盖激活链；chainlist 刷新 1h + 状态可观测。
 2. **W6 状态存储层（Redis）+ Admin REST API**：`StateStore`（Redis / file / memory）持久化运行时

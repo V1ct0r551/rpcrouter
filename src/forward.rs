@@ -13,7 +13,7 @@ use crate::{
     config::Config,
     hedge::HedgeGate,
     metrics::Metrics,
-    registry::{Endpoint, EndpointLease, Registry},
+    registry::{Endpoint, EndpointLease, PoolKind, Registry},
     signals::{FailureSignal, FaultKind, ResponseClassification, classify_response},
 };
 
@@ -84,7 +84,7 @@ impl Forwarder {
                 let request_id = request.get("id").cloned().unwrap_or(Value::Null);
                 debug!(chain_id, error = %error, "JSON-RPC request serialization failed");
                 self.metrics.record_ingress(chain_id);
-                return self.exhausted(chain_id, request_id);
+                return self.exhausted(chain_id, request_id, PoolKind::Active);
             }
         };
         let raw = match RawValue::from_string(serialized) {
@@ -93,7 +93,7 @@ impl Forwarder {
                 let request_id = request.get("id").cloned().unwrap_or(Value::Null);
                 debug!(chain_id, error = %error, "JSON-RPC RawValue conversion failed");
                 self.metrics.record_ingress(chain_id);
-                return self.exhausted(chain_id, request_id);
+                return self.exhausted(chain_id, request_id, PoolKind::Active);
             }
         };
         self.execute_raw(chain_id, &raw).await
@@ -101,12 +101,13 @@ impl Forwarder {
 
     pub async fn execute_raw(&self, chain_id: u64, request: &RawValue) -> Value {
         self.metrics.record_ingress(chain_id);
+
         let started = Instant::now();
         let metadata: RawRequestMetadata<'_> = match serde_json::from_str(request.get()) {
             Ok(metadata) => metadata,
             Err(error) => {
                 debug!(chain_id, error = %error, "JSON-RPC metadata parsing failed");
-                let response = self.exhausted(chain_id, Value::Null);
+                let response = self.exhausted(chain_id, Value::Null, PoolKind::Active);
                 self.metrics.record_latency(chain_id, started.elapsed());
                 return response;
             }
@@ -189,7 +190,13 @@ impl Forwarder {
         read_only: bool,
     ) -> Value {
         let expires_at = Instant::now() + self.deadline;
-        let candidates = self.registry.candidates(chain_id).await;
+        let mut candidate_set = self.registry.candidates(chain_id).await;
+        if candidate_set.is_empty() {
+            let _ = self.registry.resolve_for_request(chain_id).await;
+            candidate_set = self.registry.candidates(chain_id).await;
+        }
+        let pool_kind = candidate_set.kind;
+        let candidates = candidate_set.endpoints;
         let mut next_candidate = 0;
         let mut started_attempts = 0;
         let mut failures = 0;
@@ -305,7 +312,7 @@ impl Forwarder {
         }
 
         self.metrics.record_failover_depth(chain_id, failures);
-        self.exhausted(chain_id, request_id.clone())
+        self.exhausted(chain_id, request_id.clone(), pool_kind)
     }
 
     async fn perform_attempt(
@@ -432,10 +439,14 @@ impl Forwarder {
         }
     }
 
-    fn exhausted(&self, chain_id: u64, request_id: Value) -> Value {
-        self.registry.record_user_visible_error();
-        self.metrics.record_user_visible_error(chain_id);
-        all_endpoints_exhausted(chain_id, request_id)
+    fn exhausted(&self, chain_id: u64, request_id: Value, pool_kind: PoolKind) -> Value {
+        if pool_kind == PoolKind::Active {
+            self.registry.record_user_visible_error();
+            self.metrics.record_user_visible_error(chain_id);
+        } else {
+            self.metrics.record_cold_start_failure(chain_id);
+        }
+        all_endpoints_exhausted_for_pool(chain_id, request_id, pool_kind)
     }
 }
 
@@ -463,12 +474,24 @@ struct AttemptCompletion {
 }
 
 pub fn all_endpoints_exhausted(chain_id: u64, request_id: Value) -> Value {
+    all_endpoints_exhausted_for_pool(chain_id, request_id, PoolKind::Active)
+}
+
+fn all_endpoints_exhausted_for_pool(
+    chain_id: u64,
+    request_id: Value,
+    pool_kind: PoolKind,
+) -> Value {
+    let mut error = json!({
+        "code": -32000,
+        "message": format!("rpcrouter: all upstream endpoints exhausted for chain {chain_id}")
+    });
+    if pool_kind != PoolKind::Active {
+        error["data"] = json!({"reason": "cold_start"});
+    }
     json!({
         "jsonrpc": "2.0",
         "id": request_id,
-        "error": {
-            "code": -32000,
-            "message": format!("rpcrouter: all upstream endpoints exhausted for chain {chain_id}")
-        }
+        "error": error
     })
 }

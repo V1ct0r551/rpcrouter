@@ -44,12 +44,19 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 | 配置段 | 用途 |
 |---|---|
 | `server` | JSON-RPC batch 上限（最大 100） |
-| `chainlist` | 数据源、6 小时刷新、陈旧宽限和磁盘缓存路径 |
+| `chainlist` | 数据源、1 小时刷新、陈旧宽限和磁盘缓存路径 |
+| `discovery` | 动态目录、测试网、deny、热链上限与 idle 降级；关闭时仅服务 pinned 链 |
 | `upstream` | 单次/总超时、重试次数、默认端点 rps 与并发限制 |
 | `probe` | 15–30 秒探针抖动、全局并发和允许块高滞后 |
 | `cache` | 按响应字节加权的容量（默认 512 MiB）和不可变 TTL |
 | `hedging` | 只读请求第二发延迟、全局占比和健康池门槛 |
-| `chain_overrides` | 每链块时间、确认深度 K、tip TTL、附加/屏蔽端点及端点限额 |
+| `chain_overrides` | 每链块时间、确认深度 K、tip TTL、附加/屏蔽端点及端点限额；可用于非 pinned 链 |
+
+`chains` 是 pinned 链列表：启动即激活且永不因 idle/LRU 降级。动态目录链首个请求才激活，
+随后无流量自动降级为 dormant；`discovery.deny` 链返回 403。
+
+容器部署可用 `RPCROUTER_DISCOVERY_ENABLED`、`RPCROUTER_DISCOVERY_MAX_HOT_CHAINS` 和
+`RPCROUTER_DISCOVERY_IDLE_SECONDS` 覆写动态目录策略。
 
 仓库配置使用偏保守的缓存确认深度。BSC 按 Maxwell 升级后的约 750ms 出块配置；Polygon
 约 2s、Arbitrum 约 250ms，Base、OP 与 Avalanche 约 2s。tip TTL 不超过对应块时间和 2s。
@@ -58,13 +65,17 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 ## HTTP 接口
 
 - `POST /rpc/{chainId}`：接收 JSON-RPC 2.0 单请求或 batch；batch 拆分并发执行后按输入保序。
-- `GET /chains`：返回各链端点总数、Active/Cooling/Probation 数量及跟踪到的 head。
+- `GET /chains`：返回各链端点总数、Active/Cooling/Probation 数量、生命周期 `state` 及 head。
 - `GET /healthz`：进程存活时返回 `{"status":"ok"}`；不代表任一上游当前可用。
 - `GET /metrics`：Prometheus 文本指标；`metrics_enabled = false` 时返回 404。
 
 `/metrics` 包含按链的入口、缓存命中/折叠、上游、用户可见错误、延迟、failover 和 hedge
 指标，以及按端点的请求、429、冷却事件与状态。JSON-RPC 上游耗尽仍使用 HTTP 200，响应体为
 code `-32000` 的标准 JSON-RPC error。
+冷启动时若尚无 Active 端点，耗尽错误会在同一错误体中附带 `data.reason="cold_start"`，且不计入用户可见错误承诺指标。
+
+未知链返回 HTTP 404，目录中无公开端点的已知链返回 HTTP 503，deny/disabled 链返回 HTTP
+403；这些入口拒绝计入 `ingress_rejected{reason}`，不计入 `user_visible_errors`。
 
 ## 性能验证
 

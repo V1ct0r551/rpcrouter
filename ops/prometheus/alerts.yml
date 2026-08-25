@@ -1,6 +1,6 @@
 # rpcrouter 生产告警规则
 #
-# 指标名必须与 src/metrics.rs 实际导出完全一致：
+# Metric names must match src/metrics.rs exports:
 #   - rpcrouter_user_visible_errors_total{chain_id}
 #   - rpcrouter_ingress_rejected_total{reason}
 #   - rpcrouter_endpoint_state{chain_id,endpoint,state}  (one-hot gauge)
@@ -8,58 +8,59 @@
 #   - rpcrouter_cache_lookups_total{chain_id}
 #   - rpcrouter_endpoint_rate_limited_total{chain_id,endpoint}
 #   - rpcrouter_chain_upstream_requests_total{chain_id,endpoint}
+#   - rpcrouter_chain_pinned{chain_id}  (v2: 1=pinned)
+#   - rpcrouter_chains{state}  (v2: chain lifecycle counts)
+#   - rpcrouter_catalog_chains  (v2)
+#   - rpcrouter_probe_queue_depth  (v2)
+#   - rpcrouter_probe_in_flight  (v2)
+#   - rpcrouter_chainlist_last_refresh_timestamp_seconds  (v2)
+#   - rpcrouter_chainlist_refresh_total{source}  (v2)
+#   - rpcrouter_chain_activations_total  (v2)
+#   - rpcrouter_chain_demotions_total{reason}  (v2)
 #
-# 语义边界（见 guard.rs 与 metrics.rs 注释）：
-#   - user_visible_errors 是“上游承诺”指标：请求已进入数据面转发但所有上游端点耗尽。
-#   - ingress_rejected 是“入口侧防护”指标：请求在转发前被拒绝（过载/请求体过大/每 IP 限速），
-#     与 user_visible_errors 完全独立，二者不得混算。
+# Semantic boundary (see guard.rs and metrics.rs):
+#   - user_visible_errors: upstream promise metric; request entered data plane but all endpoints exhausted.
+#   - ingress_rejected: ingress guard metric; request rejected before forwarding
+#     (overload/body_too_large/rate_limited/unknown_chain/no_endpoints/chain_disabled).
+#     Independent of user_visible_errors.
 groups:
   - name: rpcrouter-availability
     rules:
-      # 任一用户可见错误即告警。这是本项目对调用方唯一的“硬承诺”，出现即为事故。
-      # 默认用 rate()>0 且持续 2 分钟，避免单次抖动误报，同时保证任何持续性错误立刻被发现。
+      # 任一上游承诺失败都告警；这是项目对调用方的唯一硬承诺。
       - alert: RpcrouterUserVisibleErrors
         expr: sum by (chain_id) (rate(rpcrouter_user_visible_errors_total[2m])) > 0
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "chain {{ $labels.chain_id }} 出现用户可见错误（所有上游端点耗尽）"
-          description: "rpcrouter 对 chain_id={{ $labels.chain_id }} 的全部公开端点均不可用（耗尽重试与探针兜底），调用方将收到 -32000。请立即排查该链端点池状态。"
+          summary: "chain {{ $labels.chain_id }} user-visible errors (all upstream endpoints exhausted)"
+          description: "rpcrouter has no available endpoints for chain_id={{ $labels.chain_id }}. Callers receive -32000. Investigate endpoint pool immediately."
 
-      # 每链 active 端点数低水位。端点池一次只能有一个概率：probe(20s) → probation(30s) 等。
-      # 阈值取 active < 2：少于 2 个 active 端点意味着几乎无冗余，任一故障即可能触发
-      # user_visible_errors，因此提前预警；对公开池来说 2 个是维持透明 failover 的最低冗余。
+      # Active 端点低水位；v2 仅观察 pinned 链。
       - alert: RpcrouterChainActiveEndpointsLow
-        expr: sum by (chain_id) (rpcrouter_endpoint_state{state="active"}) < 2
+        expr: rpcrouter_chain_pinned == 1 unless on(chain_id) (sum by (chain_id) (rpcrouter_endpoint_state{state="active"}) >= 2)
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "chain {{ $labels.chain_id }} active 端点不足 2 个"
-          description: "chain_id={{ $labels.chain_id }} 当前 active 端点 {{ $value }} 个，冗余已不足以支撑透明 failover/hedging。可能原因：上游大规模 429/超时、或 chainlist 刷新后端点池锐减。持续 5 分钟以排除冷却/回池过程中的瞬时低值。"
+          summary: "pinned chain {{ $labels.chain_id }} has fewer than 2 active endpoints"
+          description: "pinned chain_id={{ $labels.chain_id }} has only {{ $value }} active endpoints, insufficient for transparent failover/hedging. Possible causes: mass upstream 429/timeout, or chainlist refresh reduced endpoint pool."
 
   - name: rpcrouter-performance
     rules:
-      # cache 命中率骤降。缓存是本项目 10k QPS 的核心支撑；命中率从长期高位骤降说明
-      # 工作负载特征突变（如批量读取冷数据）或缓存失效，会成倍放大数据面上游压力。
-      # 用 max_over_time 抑制采样噪声：1 分钟内最大值低于 80% 才告警，避免单次 miss 波动。
-      # 80% 是偏保守的下界——正常读多场景命中率应远高于此。
+      # 缓存命中率下降。
       - alert: RpcrouterCacheHitRatioDropped
         expr: max_over_time(rpcrouter_cache_hit_ratio[1m]) < 0.8
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "chain {{ $labels.chain_id }} 缓存命中率骤降"
-          description: "chain_id={{ $labels.chain_id }} 缓存命中率跌至 {{ $value | humanizePercentage }}（1 分钟窗口最大值）。请确认是否涌入非幂等/冷数据请求，或配置的 immutable TTL 生效异常，导致数据面上游请求突增。"
+          summary: "chain {{ $labels.chain_id }} cache hit ratio dropped"
+          description: "chain_id={{ $labels.chain_id }} cache hit ratio fell to {{ $value | humanizePercentage }} (1-min window max). Confirm whether non-idempotent/cold data requests are flooding in, or immutable TTL is misconfigured."
 
   - name: rpcrouter-upstream-health
     rules:
-      # 上游 429 率突增。endpoint_rate_limited 统计端点收到的限频响应；429 占比过高说明
-      # 网关正在撞上游限频，会导致端点进入 Cooling 并损害可用性。
-      # 用 429 与数据面上游请求的比值 rate 判突增：连续 5 分钟超过 10% 即告警。
-      # 10% 是合理默认——健康公开池上 429 应当接近 0。
+      # Upstream 429 rate spike.
       - alert: RpcrouterUpstreamRateLimitedSpike
         expr: |
           (
@@ -71,18 +72,37 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "上游 429 率突增（{{ $value | humanizePercentage }}）"
-          description: "过去 5 分钟内端点限频响应占比 {{ $value | humanizePercentage }}，超过 10%。网关可能正在频繁撞上游限频，端点被批量冷却。请核查是否同时出现 active 端点低水位，并考虑下调 default_rps 或屏蔽热点端点。"
+          summary: "upstream 429 rate spike ({{ $value | humanizePercentage }})"
+          description: "Endpoint rate-limited responses at {{ $value | humanizePercentage }} over 5 minutes, exceeding 10%. Gateway may be hitting upstream rate limits. Check for active endpoint low water mark and consider lowering default_rps or blocking hot endpoints."
 
-      # 入口拒绝率突增（过载信号）。ingress_rejected 是入口防护拒绝（overload/body_too_large/
-      # rate_limited），与 user_visible_errors 语义独立。任何 reason 的拒绝率持续上升都说明
-      # 网关在主动丢请求，通常是过载或配置过紧。用 rate()>0 持续 3 分钟告警；
-      # reason 标签可在通知里区分是哪一类防护在拦截。
+      # Ingress rejection spike (overload signal).
       - alert: RpcrouterIngressRejectionsSpiking
         expr: sum by (reason) (rate(rpcrouter_ingress_rejected_total[3m])) > 0
         for: 3m
         labels:
           severity: warning
         annotations:
-          summary: "入口拒绝率突增（reason={{ $labels.reason }}）"
-          description: "入口防护在持续拒绝请求：reason={{ $labels.reason }}，近 3 分钟拒绝速率 {{ $value }} req/s。overload=全局并发超限（默认 1024 在飞），body_too_large=请求体超 256KiB，rate_limited=每 IP 限速。注意：此计数独立于 user_visible_errors，代表网关层主动丢请求而非上游耗尽。"
+          summary: "ingress rejection spike (reason={{ $labels.reason }})"
+          description: "Ingress guard is rejecting requests: reason={{ $labels.reason }}, rate {{ $value }} req/s over 3 minutes. overload=concurrency exceeded, body_too_large=request >256KiB, rate_limited=per-IP limit, unknown_chain=chain not in catalog, no_endpoints=chain has no public endpoints, chain_disabled=chain is denied/disabled. Note: this counter is independent of user_visible_errors."
+
+  - name: rpcrouter-directory
+    rules:
+      # Chainlist refresh staleness: warn if last successful refresh > 2h ago.
+      - alert: RpcrouterChainlistRefreshStale
+        expr: (time() - rpcrouter_chainlist_last_refresh_timestamp_seconds) > 7200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "chainlist refresh is stale (>2h since last success)"
+          description: "Last successful chainlist refresh was {{ $value | humanizeDuration }} ago. The catalog may be outdated. Check network connectivity to chainlist.org and disk cache path."
+
+      # Probe queue backing up: warn if queue depth > max_concurrency * 4.
+      - alert: RpcrouterProbeQueueBackingUp
+        expr: rpcrouter_probe_queue_depth > 128
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "probe queue depth {{ $value }} exceeds threshold"
+          description: "Probe queue depth is {{ $value }}, exceeding 128. This may indicate slow upstream responses or too many hot chains. Check rpcrouter_probe_in_flight and upstream timeouts."

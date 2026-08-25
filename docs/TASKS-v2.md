@@ -9,7 +9,8 @@
 > 流程：maker 在独立 worktree 分支实现 → checker 单轮对抗审查 → maker 修 must-fix →
 > 主会话合入 main。提交英文 conventional 风格，粒度按逻辑步骤。
 
-## W5 — 动态目录与链生命周期（分支 `w5-dynamic-chains`）
+## W5 — 动态目录与链生命周期（分支 `w5-dynamic-chains`）✅ 2026-08-25 合入 main（25 commit，
+112 用例 + 3 ignored；验收 a–g 全过；真实网络 80 链 smoke 见 docs/reports/loadtest-w5.md）
 
 范围（DESIGN-v2 §1–§5、§8）：
 1. `chainlist`：`parse_and_filter` 升级为解析**全部链**为 `Catalog`（保留 name/shortName/
@@ -60,6 +61,10 @@
 > `docker run -d --name rpcrouter-redis -p 127.0.0.1:6379:6379 redis:7-alpine`（用完可停）。
 
 ### W6a 状态存储层（DESIGN-v2 §11）
+0. **后台任务监督器**（W5 checker S5 遗留，前置）：chainlist 刷新 / housekeeping / 探针调度 /
+   probe worker / 状态 flush 统一由 supervisor 管理，任务 panic 或退出时 error 日志 + 指数退避
+   自动重启，指标 `rpcrouter_background_task_restarts_total{task}`；测试：注入 panic 的任务被
+   重启且计数 +1。
 1. `state` 模块：`StateStore` trait + `MemoryStore` / `FileStore`（`data/state.json` 原子写）/
    `RedisStore`（`redis` crate，tokio-comp + connection-manager，pipeline/MULTI）；`[state]` 配置 +
    环境变量；`required` 语义；断连降级与后台重连、恢复后全量 flush。

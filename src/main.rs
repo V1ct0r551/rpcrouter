@@ -7,7 +7,7 @@ use rpcrouter::{
     config::Config,
     forward::Forwarder,
     probe::{ProbeManager, spawn as spawn_probes},
-    registry::Registry,
+    registry::{Registry, unix_seconds},
     server::{AppState, guarded_service_from_state},
 };
 use tracing::{error, info};
@@ -31,18 +31,36 @@ async fn main() -> Result<()> {
     let chainlist = Arc::new(ChainlistLoader::new(&config)?);
     let registry = Arc::new(Registry::new(&config));
     let initial = chainlist.load().await?;
-    info!(source = ?initial.source, chains = initial.snapshot.chains.len(), "chainlist loaded");
+    info!(source = ?initial.source, chains = initial.catalog.chains.len(), "chainlist loaded");
+    registry.set_catalog(initial.catalog).await;
     registry.apply_snapshot(&initial.snapshot).await;
-
-    spawn_chainlist_refresh(
-        Arc::clone(&chainlist),
-        Arc::clone(&registry),
-        Duration::from_secs(config.chainlist.refresh_seconds),
+    let initial_is_fresh = matches!(
+        initial.source,
+        rpcrouter::chainlist::RefreshSource::Network
+            | rpcrouter::chainlist::RefreshSource::NotModified
     );
+    if initial_is_fresh {
+        registry.record_chainlist_refresh(unix_seconds(), initial.source.label());
+    }
     let probes = Arc::new(ProbeManager::new(Arc::clone(&registry), &config)?);
     spawn_probes(probes);
 
+    // 启动 housekeeping 后台任务（每 30s 一次）。
+    spawn_housekeeping(Arc::clone(&registry));
+
     let forwarder = Arc::new(Forwarder::new(Arc::clone(&registry), &config)?);
+    let metrics = forwarder.metrics();
+    metrics.record_chainlist_refresh(initial.source.label());
+    if initial.rejected_network_snapshot {
+        metrics.record_chainlist_refresh("rejected");
+    }
+    metrics.record_catalog_records_skipped(initial.records_skipped);
+    spawn_chainlist_refresh(
+        Arc::clone(&chainlist),
+        Arc::clone(&registry),
+        metrics,
+        Duration::from_secs(config.chainlist.refresh_seconds),
+    );
     let per_ip = if config.server.per_ip_rate_limit.enabled {
         Some((
             config.server.per_ip_rate_limit.requests_per_second,
@@ -97,6 +115,7 @@ fn forced_shutdown_exit_code() -> i32 {
 fn spawn_chainlist_refresh(
     chainlist: Arc<ChainlistLoader>,
     registry: Arc<Registry>,
+    metrics: Arc<rpcrouter::metrics::Metrics>,
     refresh_interval: Duration,
 ) {
     tokio::spawn(async move {
@@ -104,13 +123,39 @@ fn spawn_chainlist_refresh(
         interval.tick().await;
         loop {
             interval.tick().await;
-            match chainlist.load().await {
-                Ok(result) => {
+            match chainlist.refresh().await {
+                Ok(Some(result)) => {
+                    registry.set_catalog(result.catalog).await;
                     registry.apply_snapshot(&result.snapshot).await;
+                    if matches!(
+                        result.source,
+                        rpcrouter::chainlist::RefreshSource::Network
+                            | rpcrouter::chainlist::RefreshSource::NotModified
+                    ) {
+                        registry.record_chainlist_refresh(unix_seconds(), result.source.label());
+                    }
+                    metrics.record_chainlist_refresh(result.source.label());
+                    if result.rejected_network_snapshot {
+                        metrics.record_chainlist_refresh("rejected");
+                    }
+                    metrics.record_catalog_records_skipped(result.records_skipped);
                     info!(source = ?result.source, "chainlist refresh completed");
                 }
+                Ok(None) => info!("chainlist refresh skipped because another refresh is running"),
                 Err(error) => error!(error = %error, "chainlist refresh exhausted all fallbacks"),
             }
+        }
+    });
+}
+
+/// 后台 housekeeping：每 30 秒执行一次 idle 降级 + LRU 淘汰。
+fn spawn_housekeeping(registry: Arc<Registry>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await; // 跳过第一次立即触发。
+        loop {
+            interval.tick().await;
+            registry.housekeeping().await;
         }
     });
 }
