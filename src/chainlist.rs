@@ -129,6 +129,8 @@ pub struct LoadResult {
     /// 旧兼容字段。
     pub snapshot: Arc<ChainlistSnapshot>,
     pub records_skipped: usize,
+    /// 本次加载是否拒绝过异常缩水的网络快照并执行了回退。
+    pub rejected_network_snapshot: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -212,13 +214,15 @@ impl ChainlistLoader {
 
     /// 优先联网刷新；失败后依次回退到进程内快照、磁盘缓存和内置样例。
     pub async fn load(&self) -> Result<LoadResult> {
-        match self.fetch_network().await {
+        let rejected_network_snapshot = match self.fetch_network().await {
             Ok(result) => return Ok(result),
             Err(error) => {
+                let rejected = error.to_string().contains("catalog sanity check");
                 warn!(error = %error, "chainlist network refresh failed");
                 self.state.lock().await.last_error = Some(error.to_string());
+                rejected
             }
-        }
+        };
 
         {
             let mut state = self.state.lock().await;
@@ -231,6 +235,7 @@ impl ChainlistLoader {
                     snapshot,
                     source: RefreshSource::Memory,
                     records_skipped: 0,
+                    rejected_network_snapshot,
                 });
             }
         }
@@ -244,7 +249,13 @@ impl ChainlistLoader {
             ) {
                 Ok((catalog, snapshot, stats)) => {
                     return Ok(self
-                        .remember(catalog, snapshot, stats, RefreshSource::Disk)
+                        .remember(
+                            catalog,
+                            snapshot,
+                            stats,
+                            RefreshSource::Disk,
+                            rejected_network_snapshot,
+                        )
                         .await);
                 }
                 Err(error) => warn!(
@@ -269,7 +280,13 @@ impl ChainlistLoader {
         )
         .context("built-in chainlist fixture is invalid")?;
         Ok(self
-            .remember(catalog, snapshot, stats, RefreshSource::Fixture)
+            .remember(
+                catalog,
+                snapshot,
+                stats,
+                RefreshSource::Fixture,
+                rejected_network_snapshot,
+            )
             .await)
     }
 
@@ -348,6 +365,7 @@ impl ChainlistLoader {
                 snapshot,
                 source: RefreshSource::NotModified,
                 records_skipped: 0,
+                rejected_network_snapshot: false,
             });
         }
         if !response.status().is_success() {
@@ -404,6 +422,7 @@ impl ChainlistLoader {
             snapshot,
             source: RefreshSource::Network,
             records_skipped: stats.records_skipped,
+            rejected_network_snapshot: false,
         })
     }
 
@@ -413,6 +432,7 @@ impl ChainlistLoader {
         snapshot: ChainlistSnapshot,
         stats: CatalogParseStats,
         source: RefreshSource,
+        rejected_network_snapshot: bool,
     ) -> LoadResult {
         let catalog = Arc::new(catalog);
         let snapshot = Arc::new(snapshot);
@@ -425,6 +445,7 @@ impl ChainlistLoader {
             snapshot,
             source,
             records_skipped: stats.records_skipped,
+            rejected_network_snapshot,
         }
     }
 }

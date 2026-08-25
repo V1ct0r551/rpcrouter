@@ -58,7 +58,7 @@ Grafana 默认登录：`admin / admin`（compose 内 `GF_SECURITY_ADMIN_PASSWORD
 | `rpcrouter_probe_queue_depth` | Gauge | — | 等待探测的有界队列深度 |
 | `rpcrouter_probe_in_flight` | Gauge | — | 当前在飞探针数 |
 | `rpcrouter_chainlist_last_refresh_timestamp_seconds` | Gauge | — | 最近一次新鲜 chainlist 刷新 Unix 时间 |
-| `rpcrouter_chainlist_refresh_total` | Counter | `source` | network/not_modified/memory/disk/fixture 刷新次数 |
+| `rpcrouter_chainlist_refresh_total` | Counter | `source` | network/not_modified/memory/disk/fixture/rejected 刷新次数 |
 | `rpcrouter_chain_activations_total` | Counter | — | dormant → hot 激活次数 |
 | `rpcrouter_chain_demotions_total` | Counter | `reason` | idle/lru/admin 降级次数 |
 

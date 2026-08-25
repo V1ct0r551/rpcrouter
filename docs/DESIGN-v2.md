@@ -211,6 +211,7 @@ POST/PUT/DELETE 一律 403 `admin_disabled`。`[admin].enabled=false` → 整个
   `rpcrouter_probe_in_flight`、`rpcrouter_chainlist_last_refresh_timestamp_seconds`、
   `rpcrouter_chainlist_refresh_total{source}`、`rpcrouter_chain_activations_total`、
   `rpcrouter_catalog_records_skipped_total`（逐记录容错解析跳过数）、
+  `rpcrouter_cold_start_failures_total{chain_id}`（无 Active 端点时的冷启动失败，不计 UVE）、
   `rpcrouter_chain_demotions_total{reason="idle|lru|admin"}`；`ingress_rejected` 新增
   reason `unknown_chain|no_endpoints|chain_disabled`。
 - 端点级指标只覆盖 materialized 链（基数受 `max_hot_chains` 约束）。
