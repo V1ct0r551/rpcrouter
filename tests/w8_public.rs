@@ -6,7 +6,7 @@ use axum::{
     http::{Request, StatusCode, header::AUTHORIZATION},
 };
 use rpcrouter::{
-    admin::AdminState,
+    admin::{AdminState, PublicCache},
     chainlist::{Catalog, CatalogChain, CatalogEndpoint, ChainEndpoints, ChainlistSnapshot},
     config::Config,
     forward::Forwarder,
@@ -53,7 +53,12 @@ async fn app(
     token: Option<&str>,
     public_site: bool,
     static_dir: Option<PathBuf>,
-) -> (Router, PathBuf) {
+) -> (
+    Router,
+    PathBuf,
+    Arc<Registry>,
+    Arc<tokio::sync::Mutex<Option<PublicCache>>>,
+) {
     let (url, _controller) = mock().await;
     let mut config = Config {
         chains: Vec::new(),
@@ -116,6 +121,7 @@ async fn app(
     let forwarder = Arc::new(Forwarder::new(registry.clone(), &config).unwrap());
     let store = Arc::new(MemoryStore::new());
     store.bootstrap().await.unwrap();
+    let public_cache = Arc::new(tokio::sync::Mutex::new(None));
     let admin = AdminState {
         registry: registry.clone(),
         forwarder: forwarder.clone(),
@@ -126,10 +132,13 @@ async fn app(
         config,
         started: std::time::Instant::now(),
         state_runtime: StateRuntimeSnapshot::new("memory", "test", "test-1"),
+        public_cache: Arc::clone(&public_cache),
     };
     (
-        app_router(AppState::new(registry, forwarder, 10).with_admin(admin)),
+        app_router(AppState::new(registry.clone(), forwarder, 10).with_admin(admin)),
         static_dir.unwrap_or_default(),
+        registry,
+        public_cache,
     )
 }
 
@@ -151,7 +160,7 @@ async fn json_body(response: axum::response::Response) -> Value {
 
 #[tokio::test]
 async fn public_api_ignores_admin_authorization_and_sets_cache_header() {
-    let (service, _) = app(Some("secret"), true, None).await;
+    let (service, _, _, _) = app(Some("secret"), true, None).await;
     for path in [
         "/api/public/overview",
         "/api/public/chains",
@@ -166,8 +175,86 @@ async fn public_api_ignores_admin_authorization_and_sets_cache_header() {
 }
 
 #[tokio::test]
+async fn public_overview_and_list_values_sort_and_validate_queries() {
+    let (service, _, _, _) = app(None, true, None).await;
+    let overview = json_body(response(&service, "/api/public/overview", None).await).await;
+    assert_eq!(overview["chains"]["catalog"], 2);
+    assert_eq!(overview["chains"]["serving"], 1);
+    assert_eq!(overview["endpoints"]["active"], 1);
+    let list = json_body(response(&service, "/api/public/chains?sort=priority", None).await).await;
+    assert_eq!(list["items"][0]["chainId"], 1);
+    assert!(list["items"].as_array().unwrap().len() <= 200);
+    assert_eq!(response(&service, "/api/public/chains?q=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", None).await.status(), StatusCode::BAD_REQUEST);
+    let limited = json_body(response(&service, "/api/public/chains?limit=1000", None).await).await;
+    assert!(limited["items"].as_array().unwrap().len() <= 200);
+}
+
+#[tokio::test]
+async fn public_large_catalog_is_memoized_and_bounded() {
+    let (service, _, registry, public_cache) = app(None, true, None).await;
+    let mut catalog = (*registry.catalog().await.unwrap()).clone();
+    for chain_id in 3..=3000 {
+        catalog.by_id.insert(chain_id, catalog.chains.len());
+        catalog.chains.push(CatalogChain {
+            chain_id,
+            name: format!("Chain {chain_id}"),
+            short_name: None,
+            chain: None,
+            slug: None,
+            is_testnet: false,
+            native_symbol: None,
+            explorer_url: Some("javascript:alert(1)".into()),
+            status: Some("active".into()),
+            tvl: None,
+            endpoints: Vec::new(),
+        });
+    }
+    registry.set_catalog(Arc::new(catalog)).await;
+    let started = std::time::Instant::now();
+    assert_eq!(
+        response(&service, "/api/public/overview", None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let first_built_at = public_cache.lock().await.as_ref().unwrap().built_at;
+    for _ in 0..19 {
+        assert_eq!(
+            response(&service, "/api/public/overview", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            response(&service, "/api/public/chains?limit=200", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        response(&service, "/api/public/chains?limit=200", None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        public_cache.lock().await.as_ref().unwrap().built_at,
+        first_built_at
+    );
+    let elapsed = started.elapsed();
+    eprintln!("3000-chain public memo regression: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "large public catalog took {elapsed:?}"
+    );
+    let overview = json_body(response(&service, "/api/public/overview", None).await).await;
+    assert_eq!(overview["chains"]["catalog"], 3000);
+}
+
+#[tokio::test]
 async fn public_rows_are_redacted_and_disabled_chains_are_hidden() {
-    let (service, _) = app(Some("secret"), true, None).await;
+    let (service, _, _, _) = app(Some("secret"), true, None).await;
     let body = json_body(response(&service, "/api/public/chains", None).await).await;
     let serialized = body.to_string();
     for forbidden in [
@@ -243,7 +330,7 @@ async fn public_rows_are_redacted_and_disabled_chains_are_hidden() {
 #[tokio::test]
 async fn public_spa_routes_are_safe_and_obey_configuration() {
     let dir = static_dir();
-    let (service, cleanup) = app(None, true, Some(dir.clone())).await;
+    let (service, cleanup, _, _) = app(None, true, Some(dir.clone())).await;
     for path in ["/", "/chain/1", "/chain/1/"] {
         let response = response(&service, path, None).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
@@ -262,7 +349,7 @@ async fn public_spa_routes_are_safe_and_obey_configuration() {
             StatusCode::NOT_FOUND
         );
     }
-    let (disabled, _) = app(None, false, Some(dir)).await;
+    let (disabled, _, _, _) = app(None, false, Some(dir)).await;
     for path in [
         "/",
         "/chain/1",
@@ -280,7 +367,7 @@ async fn public_spa_routes_are_safe_and_obey_configuration() {
         response(&disabled, "/dashboard/", None).await.status(),
         StatusCode::OK
     );
-    let (no_static, _) = app(None, true, None).await;
+    let (no_static, _, _, _) = app(None, true, None).await;
     assert_eq!(
         response(&no_static, "/", None).await.status(),
         StatusCode::NOT_FOUND
@@ -290,7 +377,7 @@ async fn public_spa_routes_are_safe_and_obey_configuration() {
 
 #[tokio::test]
 async fn legacy_and_admin_routes_keep_their_contracts() {
-    let (service, _) = app(Some("secret"), true, None).await;
+    let (service, _, _, _) = app(Some("secret"), true, None).await;
     assert_eq!(
         response(&service, "/chains", None).await.status(),
         StatusCode::OK
