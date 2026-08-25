@@ -6,3 +6,5 @@ export function filterSortChains(rows: ChainRow[], q: string, sort: 'traffic'|'c
   const needle=q.toLowerCase(); const filtered=rows.filter(r=>!needle||r.name.toLowerCase().includes(needle)||r.shortName?.toLowerCase().includes(needle)||String(r.chainId).includes(needle));
   return [...filtered].sort((a,b)=>sort==='traffic'?b.ingressTotal-a.ingressTotal:sort==='name'?a.name.localeCompare(b.name):a.chainId-b.chainId);
 }
+export const rpcUrl = (origin: string, chainId: string | number) => `${origin.replace(/\/+$/, '')}/rpc/${chainId}`;
+export const curlExample = (origin: string, chainId: string | number, method = 'eth_blockNumber', params: unknown[] = []) => `curl -sS ${rpcUrl(origin, chainId)} \\\n  -H 'content-type: application/json' \\\n  --data '${JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })}'`;
