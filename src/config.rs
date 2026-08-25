@@ -869,4 +869,15 @@ mod tests {
             assert!(error.to_string().contains("RPCROUTER_CACHE_MAX_BYTES"));
         });
     }
+
+    #[test]
+    fn invalid_public_site_env_is_rejected() {
+        with_env(&[("RPCROUTER_ADMIN_PUBLIC_SITE", "maybe")], || {
+            let mut config = Config::default();
+            let error = config
+                .apply_env_overrides()
+                .expect_err("invalid public site boolean");
+            assert!(error.to_string().contains("RPCROUTER_ADMIN_PUBLIC_SITE"));
+        });
+    }
 }

@@ -76,7 +76,7 @@ curl -sS http://127.0.0.1:8545/rpc/1 \
 - `GET /healthz`：进程存活时返回 `{"status":"ok"}`；不代表任一上游当前可用。
 - `GET /metrics`：Prometheus 文本指标；`metrics_enabled = false` 时返回 404。
 - `GET /api/public/overview`：无需登录的公共运行概览，返回服务链数、活跃端点和流量摘要。
-- `GET /api/public/chains`：无需登录的只读链目录，支持 `q`、`testnet`、`sort`、`limit`、`offset`；disabled 链不可见。
+- `GET /api/public/chains`：无需登录的只读链目录，支持 `q`、`testnet`、`state`、`sort`、`limit`、`offset`；disabled 链不可见。
 - `GET /api/public/chains/{id}`：无需登录的单链接入信息；未知或 disabled 链返回 404。公共响应只含裁剪后的链摘要，且带 `Cache-Control: public, max-age=5`。
 
 `/metrics` 包含按链的入口、缓存命中/折叠、上游、用户可见错误、延迟、failover 和 hedge
@@ -123,6 +123,8 @@ Dashboard 是 `dashboard/` 下的独立 React/Vite 工程。开发时运行 `npm
 并以 `RPCROUTER_ADMIN_STATIC_DIR=/app/dashboard` 默认由网关托管 `/dashboard/`，也可将
 静态目录交给任意 Web 服务器并反代 `/admin/api`。在 Settings 页面输入 Bearer token；
 token 只存浏览器 localStorage，并仅通过 Authorization 请求头发送。
+由于 Vite `base=/dashboard/`，`vite dev` 访问根路径会重定向到 `/dashboard/`；公共页本地预览请使用
+`vite preview` 配合网关，或直接连接已构建的后端静态托管入口。
 
 ## 部署
 
