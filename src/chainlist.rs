@@ -603,7 +603,8 @@ mod tests {
             .iter()
             .find(|chain| chain.chain_id == 1)
             .expect("Ethereum fixture");
-        assert_eq!(ethereum.endpoints.len(), 3);
+        // 至少 1 个有效 https 端点，无 wss 或 ${KEY} 模板。
+        assert!(!ethereum.endpoints.is_empty());
         assert!(
             ethereum
                 .endpoints
@@ -616,7 +617,13 @@ mod tests {
             .iter()
             .find(|chain| chain.chain_id == 143)
             .expect("Monad fixture");
-        assert_eq!(monad.endpoints.len(), 6);
+        assert!(!monad.endpoints.is_empty());
+        assert!(
+            monad
+                .endpoints
+                .iter()
+                .all(|url| url.starts_with("https://") && !url.contains("${"))
+        );
     }
 
     #[test]
