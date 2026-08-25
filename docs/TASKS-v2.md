@@ -156,6 +156,37 @@ W6b 验收（离线，axum `oneshot` + 进程内 mock 上游 + MemoryStore）：
      实际生效（截图或录屏路径写进交付说明）；
 - c) `docker build` 成功且镜像内 `/dashboard/` 可打开。
 
+## W8 — 公共只读主页（分支 `w8-public-site`，worktree `../rpcrouter-w8`）
+
+> 2026-08-26 用户决策：对外默认页面改为无需登录的只读公共主页，dashboard 退为运维后台。
+> 方案见 DESIGN-v2 §14；本工作流一轮 checker。
+
+范围：
+1. `admin.rs`（或拆 `src/public_api.rs`）：`GET /api/public/overview`、`GET /api/public/chains`、
+   `GET /api/public/chains/{id}` 无鉴权只读接口，字段严格按 §14.1 的 `PublicChainRow`（复用
+   `build_rows` 后**映射裁剪**，禁止直接序列化 `ChainRow`）；disabled 链不出现在列表且详情 404；
+   `sort` 复用 `priority_key` 等既有排序；响应带 `Cache-Control: public, max-age=5`。
+2. 静态托管：`GET /`、`GET /chain/{id}` 返回 index.html；`admin.public_site`（默认 true）+
+   环境变量 `RPCROUTER_ADMIN_PUBLIC_SITE` 关闭开关；`config.toml` 样例与 README 配置表同步。
+3. 前端：`publicFetch`（无 token）；`PublicLayout` / `PublicHomePage` / `PublicChainPage`；
+   路由树按 §14.2；dashboard 顶栏加「Public site」链接；`CurlExample` 抽成可复用组件（支持传
+   method/params）；vite dev proxy 增加 `/api`。
+4. 文档：README「HTTP 接口」补公共 API 三条 + 「Dashboard」段说明公共页 / 后台分工；
+   DESIGN-v2 §13 追加「W8 偏差记录」（如有）。
+
+验收（全部离线）：
+- a) `auth_token` 已配置时，三个公共接口**不带** Authorization 仍 200；带错误 token 也 200（忽略）；
+- b) 公共 chains 响应体不含 `endpointRows`/`settings`/`userVisibleErrorsTotal`/端点 URL 字符串；
+     disabled 链（用 `/admin/api/chains/{id}/disable` 制造）不在列表、详情 404；未知链 404；
+- c) `/`、`/chain/1`、`/chain/1/` 返回 index.html（200，`text/html`），`/chain/../x` 与
+     `/%2e%2e` 类路径 404；`public_site=false` 时三者与 `/api/public/*` 均 404，`/dashboard/` 仍可用；
+     `static_dir` 未配置时 `/` 404；
+- d) `/chains`（v1 JSON）与 `/admin/api/*` 行为不变（现有测试全绿）；
+- e) 前端：`PublicHomePage` 渲染测试（mock fetch 返回 overview + 2 条链，断言 tiles 与表格行、
+     不含 Authorization 头）；`PublicChainPage` 渲染测试（断言 curl 文本含 `/rpc/<id>`）；
+     四门槛全绿；`npm run build` 产物在 `/` 与 `/dashboard/` 两个入口都能加载（手动 `vite preview`
+     或 curl 断言 index.html 引用的 asset 路径为 `/dashboard/assets/...`）。
+
 ## 交付说明模板（maker 每轮结束时用）
 
 ```

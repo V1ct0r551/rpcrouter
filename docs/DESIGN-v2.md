@@ -405,3 +405,50 @@ Phase B 各项仅作为 P5 备选，按需再立项。** 不用轮询：轮询�
 - 端点 `probe` 在无 ProbeManager 的进程内测试环境返回 503；生产主进程始终注入探针管理器。
 - 最近 flush 时间在 Admin state 摘要中暂以 0 表示，详细时间仍可由 Prometheus flush 指标
   查询；后续可在 StateStore 接口增加只读元数据 getter。
+
+## 14. 公共只读主页（Public Site，2026-08-26 增补）
+
+用户决策：对外默认页面（`https://rpc.cryptostack.ai/`）是**无需登录的只读公共主页**，供普通开发者
+浏览可用链与接入方式；`/dashboard/*` 保持为运维后台（bearer 鉴权、控制操作）。
+
+### 14.1 路由与托管
+
+| 路径 | 说明 |
+|---|---|
+| `GET /`、`GET /chain/{id}` | 公共 SPA 入口，返回 `admin.static_dir/index.html`（与 `/dashboard/*` 同一构建产物；vite `base` 仍为 `/dashboard/`，资源路径绝对，故根路径也能加载）。未配置 `static_dir` 时保持 404。 |
+| `GET /api/public/overview` | 无鉴权。`{process:{version,uptimeSeconds}, chains:{catalog,pinned,hot,dormant,disabled,serving}, endpoints:{materialized,active}, traffic:{ingressTotal,cacheHitsTotal,cacheLookupsTotal,upstreamTotal}, rpc:{pathTemplate:"/rpc/{chainId}"}}`。`serving` = pinned+hot 中 `active>0` 的链数。 |
+| `GET /api/public/chains?q=&testnet=&sort=&limit=&offset=` | 无鉴权。参数语义与 `/admin/api/chains` 相同（`sort` 默认 `priority`，`limit` 上限 200），但**不含 `state` 过滤中的 disabled 链**（disabled 链对外不可见），items 为 `PublicChainRow`。 |
+| `GET /api/public/chains/{id}` | 无鉴权。单链 `PublicChainRow`；未知或 disabled → 404。 |
+| `GET /chains` | v1 遗留公共 JSON，保留不动。 |
+
+`PublicChainRow` = `chainId, name, shortName, isTestnet, nativeSymbol, explorerUrl, status, state,
+catalogEndpoints, endpoints, active, head, ingressTotal, cacheHitsTotal, cacheLookupsTotal`。
+**明确不暴露**：端点 URL / 健康明细 / strikes / lastFault、settings 与 source、覆写与状态存储信息、
+userVisibleErrors、审计。公共 API 走与 RPC 相同的入口防护层（body 上限 / 并发背压 / 每 IP 限速），
+且 `Cache-Control: public, max-age=5`，降低刷新压力。CORS 复用 `admin.cors_allow_origins`。
+
+公共 API 与公共页面在 `admin.enabled=true` 时随 admin router 注册（无需 `auth_token`），
+`admin.enabled=false` 时整体不挂载（与 v1 行为一致）。新增 `admin.public_site`（默认 `true`），
+置 `false` 时 `/`、`/chain/*`、`/api/public/*` 全部 404（只想暴露运维后台的部署形态）。
+
+### 14.2 前端
+
+同一 React 工程（`dashboard/`），路由拆两棵：
+
+- `PublicLayout`（`/`）：顶栏 brand + 「Dashboard」入口链接；**不读 localStorage token、不发
+  `Authorization`、不触发 `rpcrouter:unauthorized`**（独立 `publicFetch`）。
+  - `/` 首页：hero（一句话说明 + 端点模板 `https://<origin>/rpc/{chainId}` + 通用 curl 示例）；
+    统计 tiles（Chains serving / Active endpoints / Requests served / Cache hit rate）；链表
+    （搜索、主网/测试网筛选、priority 默认排序、分页 50）：Chain（名称+shortName）、Chain ID、
+    Status、Endpoints（active/total）、Head、RPC URL（带 Copy）。行点击进入 `/chain/:id`。
+  - `/chain/:id`：名称 / chainId / 状态 / 原生币 / 区块浏览器链接 / 端点数 / head / 接入 URL +
+    复用 `CurlExample` 代码块（`eth_blockNumber` 与 `eth_chainId` 两例）。
+  - 轮询 10s；dormant 链显示「Available（on demand）」文案说明首个请求会冷启动。
+- `/dashboard/*` 保持现状，顶栏加「Public site」链接回 `/`。
+- 主题与样式复用现有变量（亮暗自适应）；移动端单列。
+
+### 14.3 安全边界
+
+- 公共页不含任何控制入口；公共 API 只 GET，不接受 token（带了也忽略）。
+- 输入校验与 `/admin/api/chains` 一致（`limit`/`offset` 数值、`q` 长度 ≤ 64）。
+- 静态托管路径校验复用 `static_file`（不新增文件系统读取入口，根路径仅返回 index.html）。
